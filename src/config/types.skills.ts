@@ -1,0 +1,272 @@
+export type SkillConfig = {
+  enabled?: boolean;
+  apiKey?: string;
+  env?: Record<string, string>;
+  config?: Record<string, unknown>;
+};
+
+export type SkillsLoadConfig = {
+  /**
+   * Additional skill folders to scan (lowest precedence).
+   * Each directory should contain skill subfolders with `SKILL.md`.
+   */
+  extraDirs?: string[];
+  /** Watch skill folders for changes and refresh the skills snapshot. */
+  watch?: boolean;
+  /** Debounce for the skills watcher (ms). */
+  watchDebounceMs?: number;
+};
+
+export type SkillsInstallConfig = {
+  preferBrew?: boolean;
+  nodeManager?: "npm" | "pnpm" | "yarn" | "bun";
+};
+
+export type SkillsP2pConfig = {
+  /** Ingestion policy for skills received via P2P. Default: "review" (quarantine for operator review). */
+  ingestPolicy?: "auto" | "review" | "deny";
+  /** Trusted peer public keys (base64 Ed25519) that bypass quarantine in auto mode. */
+  trustList?: string[];
+  /** Directory for quarantined incoming skills. */
+  quarantineDir?: string;
+  /** Maximum skills ingested per hour. Default: 20. */
+  maxIngestedPerHour?: number;
+  /**
+   * PLAN-13 Phase A: prompt-injection scanner mode for inbound skill content.
+   * - "regex" (default): rule-based scan; force-quarantines on critical hits.
+   * - "off": skip scanning (not recommended; transport-layer crypto only).
+   * The "classifier" mode is reserved for Phase C.
+   */
+  injectionScanner?: "regex" | "off";
+  /**
+   * PLAN-13 Phase C: TTL in days for quarantined skills. After this
+   * window, the sweeper auto-rejects without operator action. Default 30.
+   * Set to 0 to disable auto-rejection (skills accumulate forever).
+   */
+  quarantineTtlDays?: number;
+  /**
+   * PLAN-42: auto-reject unvalidated machine-generated crystals from the
+   * legacy auto-publish pipeline instead of quarantining them for review.
+   * Skills carrying wiki-evolution validation evidence still quarantine
+   * normally. Default: true.
+   */
+  rejectLegacyCrystals?: boolean;
+  /**
+   * PLAN-29 Phase 0.3: load-time capability gate for P2P-ingested skills.
+   * When true (default), workspace skill snapshots exclude P2P skills whose
+   * declared capabilities exceed their publisher's trust tier plus operator
+   * grants (PLAN-13 Phase B machinery). Runtime dispatch enforcement is a
+   * separate concern and remains off. Set false to restore ungated loading.
+   */
+  loadTimeCapabilityGate?: boolean;
+};
+
+export type SkillsAgentskillsConfig = {
+  /** Enable the agentskills.io import bridge. Default: false (opt-in). */
+  enabled?: boolean;
+  /** Base URL for slug resolution. Default: "https://agentskills.io". */
+  registryBaseUrl?: string;
+  /** Trust level for imported skills. Default: "review" (quarantine first). */
+  defaultTrust?: "auto" | "review";
+  /** Minimum transformScore (0-1) required before an origin-derived crystal may be published to the paid marketplace. Default: 0.5. */
+  transformThreshold?: number;
+  /** Royalty split (basis points) retained for the upstream registry. Default: 0. */
+  royaltyBps?: number;
+  /** Wallet the registry royalty pays to; unset = shares accrue in the queue, unpaid. */
+  royaltyWallet?: string;
+  /** Maximum bytes for an imported SKILL.md or tarball. Default: 1 MB. */
+  maxBytes?: number;
+  /** API key for upload (uses agentskills.io's API). Read at upload time only. */
+  apiKey?: string;
+};
+
+import type { SkillSeekersConfig } from "./types.skill-seekers.js";
+
+/**
+ * PLAN-42: WikiSkill-style skill evolution — consolidates execution traces
+ * into a persistent wiki (CONFIG_DIR/skill-wiki/) and proposes gated skill
+ * improvements. ON BY DEFAULT; the loop no-ops cleanly when no usable
+ * background model is available and never touches the runtime prompt path.
+ */
+export type SkillsEvolutionConfig = {
+  /** Master kill switch for the evolution loop. Default: true. */
+  enabled?: boolean;
+  /** Minimum hours between evolution iterations. Default: 24. */
+  cadenceHours?: number;
+  /** Max ReAct turns for the Skill Proposer agent. Default: 24. */
+  maxProposerTurns?: number;
+  /** Cap on concurrently-active evolved skills. Default: 5. */
+  maxActiveEvolved?: number;
+  /**
+   * Validation gate mode. "tasks" (the gate): real rollouts over the seeded
+   * canonical regression + capability suites plus the node's grown
+   * capability suite, exact sign test with alpha spending. "records" is
+   * DEPRECATED (PLAN-45 D-7): the LLM-scored paired comparison over held-out
+   * traces is kept only as a diagnostic and can neither promote nor reject.
+   * Default: "tasks" (a fresh node reaches it with the canonical capability
+   * families, no operator input needed).
+   */
+  validationMode?: "records" | "tasks";
+  /**
+   * Tasks-mode trials per task per arm; per-task scores are fractional
+   * pass rates. Agent runs are nondeterministic, so repeated trials cut
+   * gate variance (~1/3 at K=3) and un-degenerate near-ceiling tasks.
+   * Minimum 2 (the regression rule tolerates one flaky trial only for
+   * K >= 2). Default: 3.
+   */
+  trialsPerTask?: number;
+  /**
+   * PLAN-45 2.5: a candidate whose capability-suite tokens exceed the
+   * incumbent's by more than this ratio (candidate/incumbent - 1) is held
+   * as cost-exceeded even when it wins. Default: 0.5.
+   */
+  maxTokenDelta?: number;
+  /** Model spec "provider/model" for maintainer/labeler calls. Default: cheap-model resolution. */
+  judgeModel?: string;
+  /**
+   * Model spec for the Skill Proposer ReAct agent. Default: judgeModel, else
+   * the dream model, else the cheap lane (token-efficiency pass 2026-09-19;
+   * previously the agent's primary model). Set explicitly for a stronger
+   * model when the cheap lane fails the ReAct JSON protocol.
+   */
+  proposerModel?: string;
+  /**
+   * Skip the proposer when an iteration sampled fewer failing traces than
+   * this (a window of clean PASSes gives it nothing to fix). Default: 1.
+   */
+  minFailsForProposer?: number;
+  /** Wiki pattern-page count that triggers the lint/archive pass. Default: 100. */
+  wikiMaxPatterns?: number;
+  /** Minimum days between semantic (LLM) wiki lint passes. Default: 7. */
+  semanticLintCadenceDays?: number;
+  /**
+   * Publish validated + matured evolved skills to the P2P network with
+   * their validation evidence (the flywheel's outbound leg). Default: true.
+   */
+  propagate?: boolean;
+  /** Days a validated skill must survive locally before P2P publish. Default: 3. */
+  maturityDays?: number;
+  /**
+   * PLAN-45 5.4: publish over P2P only a skill validated on at least two
+   * models. Default false: a single-model skill publishes with
+   * `singleModel: true` on its provenance trailer and receivers treat it
+   * with the strict canary.
+   */
+  requireCrossModel?: boolean;
+  /**
+   * PLAN-58: the skill applicability profile. Each housekeeping pass
+   * rebuilds `<skill>/.applicability.json` (models, platform, declared
+   * requirements, run shape, outcome depth; names, hashes and counts only)
+   * and the P2P publisher ships it inside the signed provenance trailer.
+   * Receivers compute a fit that orders evaluation and can tighten the
+   * canary; it never admits or rejects a skill.
+   */
+  applicabilityProfile?: {
+    /** Build the profile in housekeeping. Default: true. */
+    enabled?: boolean;
+    /** Ship it in the trailer when publishing. Default: true. */
+    publish?: boolean;
+    /** Read window in days. Default: 14. */
+    windowDays?: number;
+  };
+  /**
+   * PLAN-44 Phase 2: wall-clock budget for one tasks-mode validation run.
+   * When exceeded the gate stops issuing rollouts and HOLDs the proposal
+   * (`budget-exhausted`); the incumbent memo makes the retry cheap.
+   * Default: 45.
+   */
+  validationBudgetMinutes?: number;
+  /**
+   * PLAN-44 Phase 4a: when the tasks-mode gate holds a proposal as
+   * `never-triggered`, reword its description (contract-compliant variants
+   * ranked by a routing proxy) and re-measure on the next pass. Capped at
+   * 2 repairs per proposal. Default: true.
+   */
+  descriptionRepair?: boolean;
+  /**
+   * PLAN-44 Phase 5c: rewrite the description of harvested / received live
+   * skills that fail the description contract (repository taglines) into a
+   * contract-compliant "use when … not for …" form, through the staging
+   * gate, up to 5 per housekeeping pass. Default: true.
+   */
+  routingRepair?: boolean;
+  /**
+   * PLAN-44 Phase 2 (D-4): extra tools granted to validation rollouts on
+   * top of the built-in workspace-scoped allow-list (read/write/edit/
+   * apply_patch/exec/process). Network, messaging, memory, skill and wallet
+   * tools can never be granted here.
+   */
+  validationTools?: {
+    alsoAllow?: string[];
+    /**
+     * Grant `exec`/`process` to validation rollouts (approvals off, scrubbed
+     * env with HOME/TMPDIR in the scratch workspace, workdir confined to it,
+     * a validation-specific binary allowlist, no network clients). ON by
+     * default since PLAN-45 D-2 so the gate measures the shell-bearing
+     * pathway the runtime uses; set false to keep validation shell-less.
+     */
+    exec?: boolean;
+  };
+};
+
+/**
+ * Experience-guided skill prior: an outcome-gated, per-context-cell
+ * Beta-Bernoulli posterior per skill that orders the `<available_skills>`
+ * index and annotates verified outcomes (never removes an entry or grants a
+ * tool). Default on; with no ledger every skill ties and nothing
+ * changes. The gateway verified-outcome writer ships in shadow mode;
+ * enabling it records attributed task checks and explicit owner feedback. See docs/memory/skills-pipeline.md.
+ */
+export type SkillsPriorConfig = {
+  /** Apply the prior to the live skills index. Default: true. */
+  enabled?: boolean;
+  /** Verified live outcome recording. Shadow journals proposals without changing the ledger. Default: "shadow". */
+  writer?: "shadow" | "on" | "off";
+  /** "mean" orders by posterior mean (frozen); "thompson" samples (learning). Default: "mean". */
+  mode?: "mean" | "thompson";
+  /** Where the top-ranked skill is listed. Models favour the later of near-equivalent entries. Default: "first". */
+  placement?: "first" | "last";
+  /** Verified per-cell outcome wording; "off" keeps ordering only. Default: "verbal". */
+  evidence?: "verbal" | "counts" | "verdict" | "off";
+  /** Geometric forgetting per gated observation in a cell. Default: 0.98. */
+  discount?: number;
+  /** Pseudo-count carried from a skill's global posterior into a new cell. Default: 4. */
+  pseudoCount?: number;
+  /** Ledger file (JSON). Default: CONFIG_DIR/skill-prior.json. */
+  ledgerPath?: string;
+};
+
+export type SkillsConfig = {
+  /** Optional bundled-skill allowlist (only affects bundled skills). */
+  allowBundled?: string[];
+  load?: SkillsLoadConfig;
+  install?: SkillsInstallConfig;
+  entries?: Record<string, SkillConfig>;
+  /** P2P skill ingestion settings. */
+  p2p?: SkillsP2pConfig;
+  /** agentskills.io import bridge. */
+  agentskills?: SkillsAgentskillsConfig;
+  /** External skill generation via Skill Seekers. */
+  skillSeekers?: SkillSeekersConfig;
+  /** PLAN-42: WikiSkill evolution loop (on by default). */
+  evolution?: SkillsEvolutionConfig;
+  /** Experience-guided skill prior (index ordering and evidence). Default: on. */
+  prior?: SkillsPriorConfig;
+  /** PLAN-11 Gap 4: LLM-based marketability prediction (opt-in). */
+  marketability?: {
+    predictor?: {
+      /** Enable the predictor. Default: false. */
+      enabled?: boolean;
+      /** Max predictions per dream cycle. Default: 10. */
+      maxPerCycle?: number;
+      /** Days to cache predictions before re-predicting. Default: 30. */
+      predictionTtlDays?: number;
+      /** Max influence on skill pricing as a multiplier (0-1). Default: 0.2. */
+      pricingInfluence?: number;
+      /** Blending weight in refiner scores (0-1). Default: 0.2. */
+      refinerBlendWeight?: number;
+      /** Model spec "provider/model" for prediction. */
+      model?: string;
+    };
+  };
+};

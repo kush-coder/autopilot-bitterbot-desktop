@@ -1,0 +1,386 @@
+/**
+ * Resolve the current endocrine state for system prompt injection.
+ * Reads hormonal levels from the memory manager singleton and
+ * phenotype summary from MEMORY.md.
+ */
+
+import { randomUUID } from "node:crypto";
+import type { BitterbotConfig } from "../config/config.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+
+const log = createSubsystemLogger("endocrine");
+
+export type EndocrineStateForPrompt = {
+  dopamine: number;
+  cortisol: number;
+  oxytocin: number;
+  briefing: string;
+  /**
+   * False when the hormonal subsystem returned no state. Memory recall no
+   * longer depends on it — hormone display lines are skipped, but proactive
+   * memories, the handover brief, and coherence still render. (Previously a
+   * null hormonal state dropped the ENTIRE memory block from the prompt.)
+   */
+  hormonesAvailable?: boolean;
+  phenotypeSummary?: string;
+  maturity?: number;
+  /** Compact 1-line summary from the latest session handover brief */
+  lastSessionBrief?: string;
+  /** Proactive memory facts for involuntary recall (Plan 7, Phase 1) */
+  proactiveMemories?: string;
+  /** Called only when the full prompt renderer includes proactiveMemories. */
+  onProactiveRecallInjected?: () => void;
+  /** Intra-session coherence context (Plan 7, Phase 2+9) */
+  sessionCoherence?: string;
+  /**
+   * PLAN-50 Phase 6: spend pressure from the usage budgets (0 = none, 1 = at the limit). Feeds
+   * the prompt so the agent paces itself, the way cortisol shapes urgency.
+   */
+  budgetPressure?: number;
+  budgetLabel?: string;
+};
+
+export async function resolveEndocrineState(params: {
+  config?: BitterbotConfig;
+  agentId: string;
+  workspaceDir: string;
+  /**
+   * The live user message for this turn. When provided, proactive recall
+   * embeds it and surfaces semantically-matched directive/world_fact/
+   * mental_model crystals (not just identity facts), and prospective-memory
+   * triggers are checked against it. Omit for non-turn contexts (status
+   * probes, compaction) where only identity-level recall is wanted.
+   */
+  userMessage?: string;
+  /**
+   * Conversation identity for proactive-recall cooldown scoping: when it
+   * changes, the manager clears its (process-singleton) cooldown map so a
+   * fresh conversation is not suppressed by the previous session's window.
+   */
+  sessionKey?: string;
+  /** Stable run/turn identity for retry-safe exposure accounting. */
+  deliveryId?: string;
+  /**
+   * PLAN-40 funnel: the caller's prompt mode. Dream-artifact consumption is
+   * stamped ONLY when "full" — minimal-mode assembly discards the proactive
+   * block after selection, and compaction/status callers omit this entirely,
+   * so neither ever stamps (adversarial F3: no stamps for discarded facts).
+   */
+  promptMode?: "full" | "minimal";
+  /**
+   * Token-efficiency pass (2026-09-19): true for heartbeat prompt builds.
+   * Skips every paid call — proactive recall (an embed), the continuity gate
+   * (an embed), live hormonal stimulation and the turn counter — and renders
+   * the free parts (hormone lines, phenotype summary, brief, coherence) only.
+   */
+  isHeartbeat?: boolean;
+}): Promise<EndocrineStateForPrompt | undefined> {
+  try {
+    const { MemoryIndexManager } = await import("../memory/manager.js");
+    const manager = await MemoryIndexManager.get({
+      cfg: params.config ?? {},
+      agentId: params.agentId,
+      purpose: "status",
+    });
+    if (!manager) {
+      return undefined;
+    }
+
+    // Get hormonal state via the public hormonalState() method. A null state
+    // (hormonal subsystem off or not yet initialized) must NOT abort memory
+    // resolution — proactive recall, the handover brief, and coherence do not
+    // depend on hormones. Hormone display is skipped via hormonesAvailable.
+    const hormones = manager.hormonalState();
+
+    // Get response modulation briefing via the hormonal manager
+    const hormonalMgr = (manager as Record<string, unknown>).hormonalManager as {
+      responseModulation(): { briefing: string };
+    } | null;
+    const briefing = hormonalMgr?.responseModulation().briefing ?? "";
+
+    // Get maturity from GCCRF
+    const diagnostics = manager.gccrfDiagnostics?.();
+    const maturity = diagnostics?.maturity as number | undefined;
+
+    // Get phenotype summary from MEMORY.md (extract first line of Phenotype section)
+    let phenotypeSummary: string | undefined;
+    try {
+      const fsPromises = await import("node:fs/promises");
+      const pathMod = await import("node:path");
+      const memoryMd = await fsPromises.readFile(
+        pathMod.join(params.workspaceDir, "MEMORY.md"),
+        "utf-8",
+      );
+      const phenoMatch = memoryMd.match(/## The Phenotype[^\n]*\n\*[^\n]*\*\n([^\n]+)/);
+      if (phenoMatch?.[1]) {
+        phenotypeSummary = phenoMatch[1].slice(0, 200).trim();
+      }
+    } catch {
+      // No MEMORY.md or no Phenotype section yet — that's fine
+    }
+
+    // Plan 7, Phase 1: Proactive memory surfacing — involuntary recall of
+    // identity facts plus, when we have the live user message, semantically
+    // matched directive/world_fact/mental_model crystals. This is what lets the
+    // agent answer already knowing what it has stored about a topic.
+    let proactiveMemories: string | undefined;
+    let onProactiveRecallInjected: (() => void) | undefined;
+    let userMessageEmbedding: number[] | null = null;
+    const liveTurn = Boolean(params.userMessage) && !params.isHeartbeat;
+    try {
+      const recallManager = manager as unknown as {
+        recallForUserTurn(
+          text: string,
+          opts?: { scopeKey?: string },
+        ): Promise<{
+          facts: string | undefined;
+          embedding: number[] | null;
+          renderedDreamChunkIds?: string[];
+          renderedChunkIds?: string[];
+        }>;
+        markDreamArtifactsConsumed?(ids: readonly string[], kind: "retrieved"): void;
+        recordProactiveRecallDelivery?(
+          ids: readonly string[],
+          delivery: { id: string; sessionKey?: string },
+        ): void;
+      };
+      if (liveTurn && typeof recallManager.recallForUserTurn === "function") {
+        const recall = await recallManager.recallForUserTurn(params.userMessage!, {
+          scopeKey: params.sessionKey,
+        });
+        proactiveMemories = recall.facts;
+        userMessageEmbedding = recall.embedding;
+        // Selection may be discarded. The renderer, not the resolver, acknowledges
+        // prompt inclusion. A stable id deduplicates rebuilds of the same turn.
+        if (params.promptMode === "full" && proactiveMemories) {
+          const delivery = { id: params.deliveryId ?? randomUUID(), sessionKey: params.sessionKey };
+          onProactiveRecallInjected = () => {
+            try {
+              if (recall.renderedDreamChunkIds?.length) {
+                recallManager.markDreamArtifactsConsumed?.(
+                  recall.renderedDreamChunkIds,
+                  "retrieved",
+                );
+              }
+              if (recall.renderedChunkIds?.length) {
+                recallManager.recordProactiveRecallDelivery?.(recall.renderedChunkIds, delivery);
+              }
+            } catch (err) {
+              log.debug(`proactive recall inclusion evidence skipped: ${String(err)}`);
+            }
+          };
+        }
+      } else {
+        // No live message (status/compaction) or a heartbeat — identity-only
+        // recall (SQL only, no embedding).
+        const { proactiveRecall, formatProactiveFacts } =
+          await import("../memory/proactive-recall.js");
+        const result = proactiveRecall({
+          userMessage: "",
+          queryEmbedding: null,
+          db: (manager as Record<string, unknown>).db as import("node:sqlite").DatabaseSync,
+          userModelManager: (manager as Record<string, unknown>).userModelManager as
+            | import("../memory/user-model.js").UserModelManager
+            | null,
+          recentlySurfaced:
+            ((manager as Record<string, unknown>).proactiveRecallCooldown as Map<string, number>) ??
+            new Map(),
+          currentTurn: 0,
+          hormonalModulation: hormonalMgr
+            ? (
+                hormonalMgr as unknown as {
+                  getRetrievalModulation(): { importanceBoost: number; recencyBias: number };
+                }
+              ).getRetrievalModulation()
+            : null,
+        });
+        if (result.facts.length > 0) {
+          proactiveMemories = formatProactiveFacts(result.facts);
+        }
+      }
+    } catch {
+      // Proactive recall not available — non-critical
+    }
+
+    // Load latest session handover brief for cross-session continuity.
+    // Session Continuity Gate (token-efficiency pass 2026-09-19): the brief
+    // embedding is cached by content hash (memory + disk) and compared with
+    // the live USER MESSAGE — the previous code compared the brief with its
+    // own nextSteps, always passed, and paid two embeds per prompt build.
+    // The user-message embedding from proactive recall is reused, so a turn
+    // costs at most one embed here and usually none. Heartbeats and no-message
+    // callers skip the gate (fail-open, zero cost).
+    let lastSessionBrief: string | undefined;
+    try {
+      const { loadLatestHandoverBrief, formatCompactSummary } =
+        await import("../memory/session-handover.js");
+      const brief = await loadLatestHandoverBrief(params.workspaceDir);
+      if (brief) {
+        let gatePass = true;
+        if (liveTurn) {
+          const memManager = manager as Record<string, unknown>;
+          const provider = memManager.provider as
+            | { embedQuery?: (text: string, opts?: { feature?: string }) => Promise<number[]> }
+            | undefined;
+          if (provider?.embedQuery) {
+            const { evaluateContinuityGate } = await import("../memory/continuity-gate.js");
+            const embedQuery = provider.embedQuery.bind(provider);
+            const gate = await evaluateContinuityGate({
+              workspaceDir: params.workspaceDir,
+              brief,
+              userMessage: params.userMessage,
+              userMessageEmbedding,
+              // PLAN-50: attributed to the continuity gate.
+              embed: (text) => embedQuery(text, { feature: "agent/continuity-gate" }),
+            });
+            gatePass = gate.pass;
+            if (!gate.pass) {
+              log.debug("session continuity gate: brief skipped (fresh start)", {
+                similarity: gate.similarity?.toFixed(3),
+                briefPurpose: brief.purpose.slice(0, 60),
+              });
+            }
+          }
+        }
+
+        if (gatePass) {
+          lastSessionBrief = formatCompactSummary(brief);
+
+          // Staleness annotation for old briefs
+          const ageHours = (Date.now() - brief.timestamp) / (60 * 60 * 1000);
+          if (ageHours > 48) {
+            lastSessionBrief = `(${Math.floor(ageHours / 24)}d ago) ${lastSessionBrief}`;
+          }
+        }
+      }
+    } catch {
+      // No handover briefs yet — that's fine
+    }
+
+    // PLAN-9: Prospective Memory — check triggers against current context
+    try {
+      const prospectiveEngine = (manager as Record<string, unknown>).prospectiveMemoryEngine as {
+        checkTriggers(params: {
+          messageText: string;
+          messageEmbedding?: number[];
+        }): Array<{ action: string; sourceSession?: string | null }>;
+      } | null;
+      if (prospectiveEngine) {
+        const triggered = prospectiveEngine.checkTriggers({
+          messageText: params.userMessage ?? "",
+          messageEmbedding: userMessageEmbedding ?? undefined,
+        });
+        if (triggered.length > 0) {
+          // PLAN-34 Phase 4 (§6.3): dream-origin rows are voiced as
+          // hypotheses, not reminders — an agent-made prediction must never
+          // masquerade as a user-set intention. Actions are sanitized to a
+          // single line at render time (write-site sanitization exists for
+          // dream rows, but pre-existing reminder rows also flow through
+          // here and a newline in an action could forge extra prompt lines).
+          const { isDreamPredictionSource, sanitizePromptLine } =
+            await import("../memory/prospective-memory.js");
+          const prospectiveLines = triggered.map((t) => {
+            const action = sanitizePromptLine(t.action);
+            return isDreamPredictionSource(t.sourceSession)
+              ? `- [dream prediction] ${action}`
+              : `- [reminder] ${action}`;
+          });
+          proactiveMemories = (proactiveMemories ?? "") + "\n" + prospectiveLines.join("\n");
+        }
+      }
+    } catch {
+      // Prospective memory not available — non-critical
+    }
+
+    // PLAN-9: Epistemic Directives — inject knowledge gap questions.
+    // PLAN-34 Phase 1: questions target the OWNER. Sessions whose key
+    // classifies as non-first-party (subagents, A2A, groups, circles, cron
+    // "cron:<job>" keys resolve to unknown) neither render nor count them —
+    // otherwise background runs burn the maxAsks budget without the owner
+    // ever seeing the question. The session key is passed for counting ONLY
+    // on live first-party turns (userMessage present) — never compaction
+    // rebuilds or status probes, which carry no key.
+    try {
+      const epistemicEngine = (manager as Record<string, unknown>).epistemicDirectiveEngine as {
+        getDirectivesForSession(opts?: { sessionKey?: string }): Array<{ question: string }>;
+      } | null;
+      let firstParty = true;
+      if (params.sessionKey) {
+        const { classifySessionKeyTrust } = await import("../memory/session-trust.js");
+        firstParty = classifySessionKeyTrust(params.sessionKey) === "first_party";
+      }
+      if (epistemicEngine && firstParty) {
+        const directives = epistemicEngine.getDirectivesForSession(
+          liveTurn && params.sessionKey ? { sessionKey: params.sessionKey } : undefined,
+        );
+        if (directives.length > 0) {
+          const directiveLines = directives.map((d) => `- [question] ${d.question}`);
+          proactiveMemories = (proactiveMemories ?? "") + "\n" + directiveLines.join("\n");
+        }
+      }
+    } catch {
+      // Epistemic directives not available — non-critical
+    }
+
+    // Plan 7, Phase 2+9: Session coherence — intra-session thread/intent tracking
+    let sessionCoherence: string | undefined;
+    try {
+      const tracker = (manager as Record<string, unknown>).coherenceTracker as {
+        formatForPrompt(): string | null;
+      } | null;
+      if (tracker) {
+        sessionCoherence = tracker.formatForPrompt() ?? undefined;
+      }
+    } catch {
+      // Coherence tracker not available — non-critical
+    }
+
+    // Without hormones AND without any memory-derived content there is
+    // nothing to render — preserve the old "no section" behavior.
+    if (
+      !hormones &&
+      !proactiveMemories &&
+      !lastSessionBrief &&
+      !sessionCoherence &&
+      !phenotypeSummary
+    ) {
+      return undefined;
+    }
+
+    let budgetPressure: number | undefined;
+    let budgetLabel: string | undefined;
+    try {
+      const { getUsageLedger } = await import("../infra/usage-ledger.js");
+      const { getUsageBudgetPressure } = await import("../infra/usage-budgets.js");
+      const pressure = getUsageBudgetPressure({
+        ledger: getUsageLedger(),
+        cfg: params.config ?? undefined,
+      });
+      if (pressure.pressure > 0) {
+        budgetPressure = pressure.pressure;
+        budgetLabel = pressure.label ?? undefined;
+      }
+    } catch {
+      // budgets unavailable — non-critical
+    }
+
+    return {
+      dopamine: hormones?.dopamine ?? 0,
+      cortisol: hormones?.cortisol ?? 0,
+      oxytocin: hormones?.oxytocin ?? 0,
+      briefing,
+      hormonesAvailable: !!hormones,
+      phenotypeSummary,
+      maturity,
+      lastSessionBrief,
+      proactiveMemories,
+      onProactiveRecallInjected,
+      sessionCoherence,
+      budgetPressure,
+      budgetLabel,
+    };
+  } catch (err) {
+    log.debug(`Failed to resolve endocrine state: ${String(err)}`);
+    return undefined;
+  }
+}

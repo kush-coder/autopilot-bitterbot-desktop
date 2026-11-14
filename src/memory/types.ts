@@ -1,0 +1,218 @@
+export type MemorySource = "memory" | "sessions" | "skills";
+
+export type {
+  KnowledgeCrystal,
+  CrystalLifecycle,
+  CrystalOrigin,
+  CrystalSemanticType,
+  CrystalGovernance,
+  HormonalInfluence,
+} from "./crystal-types.js";
+
+export type MemorySearchResult = {
+  path: string;
+  startLine: number;
+  endLine: number;
+  score: number;
+  snippet: string;
+  source: MemorySource;
+  /**
+   * PLAN-58: which retrieval channels found this result, with each channel's
+   * 1-based rank and native score (vector cosine, BM25-derived, graph). The
+   * fused `score` under RRF is rank-only (max about 0.05 for k = 60), so a
+   * consumer that wants "how similar" must read `channels.vector.score`.
+   * Absent on guest searches.
+   */
+  channels?: import("./hybrid.js").HybridChannels;
+  /** PLAN-58: how `score` was produced. Absent on guest searches. */
+  fusion?: import("./hybrid.js").HybridFusion;
+  citation?: string;
+  crystal?: import("./crystal-types.js").KnowledgeCrystal;
+  /**
+   * PLAN-24 HORMA Phase 0: provenance pointers to the raw source this memory was
+   * synthesized from. Present on extracted facts; resolve with memory_expand.
+   */
+  evidenceRefs?: import("./session-extractor.js").EvidenceRef[];
+  /**
+   * PLAN-55 Phase 2: the chunk states a value the canonical ledger has since
+   * replaced (or the owner retired). Ranked after current results; the
+   * snippet carries a `[superseded]` tag. `currentValue` null = retired.
+   */
+  superseded?: Array<{ key: string; currentValue: string | null }>;
+};
+
+export type MemoryEmbeddingProbeResult = {
+  ok: boolean;
+  error?: string;
+};
+
+export type MemorySyncProgressUpdate = {
+  completed: number;
+  total: number;
+  label?: string;
+};
+
+export type MemoryProviderStatus = {
+  backend: "builtin";
+  provider: string;
+  model?: string;
+  requestedProvider?: string;
+  files?: number;
+  chunks?: number;
+  dirty?: boolean;
+  lastSyncedAt?: number | null;
+  workspaceDir?: string;
+  dbPath?: string;
+  extraPaths?: string[];
+  sources?: MemorySource[];
+  sourceCounts?: Array<{ source: MemorySource; files: number; chunks: number }>;
+  cache?: { enabled: boolean; entries?: number; maxEntries?: number };
+  fts?: { enabled: boolean; available: boolean; error?: string };
+  fallback?: { from: string; reason?: string };
+  vector?: {
+    enabled: boolean;
+    available?: boolean;
+    extensionPath?: string;
+    loadError?: string;
+    dims?: number;
+  };
+  batch?: {
+    enabled: boolean;
+    failures: number;
+    limit: number;
+    wait: boolean;
+    concurrency: number;
+    pollIntervalMs: number;
+    timeoutMs: number;
+    lastError?: string;
+    lastProvider?: string;
+  };
+  custom?: Record<string, unknown>;
+  /** PLAN-57 §4.6: the exact key this index is written under. */
+  embeddingProfile?: {
+    key: string;
+    modelDigest?: string;
+    dimensions?: number;
+    normalise: string;
+  };
+  /** Set when the live profile conflicts with the index and writes are held until `memory migrate-embeddings`. */
+  embeddingHold?: { conflicts: string[] };
+  /** `pool` when memory batches may be routed to compute pools (PLAN-57), else `local`. */
+  computeRouting?: "pool" | "local";
+  crystals?: Record<string, unknown>;
+  /** PLAN-58: which retrieval channels are live and how they are fused. */
+  search?: {
+    fusion: import("./hybrid.js").HybridFusion;
+    channels: { vector: boolean; keyword: boolean; graph: boolean };
+  };
+};
+
+export interface MemorySearchManager {
+  proceduralLearning?(): import("./procedural-learning.js").ProceduralLearning | null;
+  search(
+    query: string,
+    opts?: {
+      maxResults?: number;
+      minScore?: number;
+      sessionKey?: string;
+      /** PLAN-55 Phase 2: tag superseded results with ledger values (owner only; default true). */
+      tagSuperseded?: boolean;
+      /** PLAN-59 Phase 0: short call-site tag for the retrieval evidence row. */
+      caller?: string;
+      /** Exclude guest/internal searches from owner retrieval evidence. Defaults to true. */
+      observe?: boolean;
+    },
+  ): Promise<MemorySearchResult[]>;
+  readFile(params: {
+    relPath: string;
+    from?: number;
+    lines?: number;
+  }): Promise<{ text: string; path: string }>;
+  /** PLAN-24 HORMA Phase 0: resolve an evidence_ref back to verbatim raw source. */
+  expandEvidence?(
+    ref: import("./session-extractor.js").EvidenceRef,
+    window?: number,
+  ): Promise<import("./evidence-expand.js").ExpandedEvidence>;
+  /** PLAN-53 G2: search as a non-owner; only memories safe to show a guest. */
+  guestSearch?(
+    query: string,
+    opts?: { maxResults?: number; minScore?: number; sessionKey?: string },
+  ): Promise<MemorySearchResult[]>;
+  /** PLAN-53 G2: whether a non-owner may read this memory file. */
+  guestMayRead?(relPath: string): boolean;
+  /** PLAN-33: the canonical facts ledger (null when disabled). */
+  canonicalFacts?(): import("./canonical-facts.js").CanonicalFactsStore | null;
+  status(): MemoryProviderStatus;
+  sync?(params?: {
+    reason?: string;
+    force?: boolean;
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void>;
+  /** PLAN-57 §4.6: what `memory migrate-embeddings` would do. */
+  embeddingMigrationPlan?(): {
+    hold: { conflicts: string[]; stored: import("./embedding-profile.js").EmbeddingProfile } | null;
+    current: import("./embedding-profile.js").EmbeddingProfile | null;
+  };
+  /** PLAN-57 §4.6: rebuild the index under the live embedding profile and clear the hold. */
+  migrateEmbeddingProfile?(params?: {
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void>;
+  probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>;
+  probeVectorAvailability(): Promise<boolean>;
+  close?(): Promise<void>;
+  // Working-memory state vector (snapshots, provenance, event-triggered flush)
+  flushWorkingMemory?(reason: string): Promise<boolean>;
+  restoreWorkingMemory?(fileName?: string): Promise<{ restored: string } | { error: string }>;
+  listWorkingMemorySnapshots?(): Promise<Array<{ file: string; savedAt: string; bytes: number }>>;
+  getWorkingMemoryProvenance?(
+    limit?: number,
+  ): Promise<import("./working-memory-snapshots.js").WorkingMemoryProvenance[]>;
+  // Dream Engine
+  dreamSearch?(
+    query: string,
+    opts?: { maxResults?: number; minScore?: number },
+  ): Promise<Array<{ id: string; content: string; score: number; confidence: number }>>;
+  dreamStatus?(): Record<string, unknown>;
+  // Curiosity Engine
+  curiosityState?(): Record<string, unknown> | null;
+  /** True when the owner paused curiosity research (self_state reads this). */
+  curiosityResearchPaused?(): Promise<boolean>;
+  curiosityResolve?(targetId: string): boolean;
+  // Emotional Anchors
+  createEmotionalAnchor?(label: string, description?: string): { id: string; label: string } | null;
+  recallEmotionalAnchor?(anchorId: string, influence?: number): boolean;
+  listEmotionalAnchors?(): Array<{
+    id: string;
+    label: string;
+    description: string;
+    state: { dopamine: number; cortisol: number; oxytocin: number };
+    createdAt: number;
+    recallCount: number;
+  }>;
+  // PLAN-11 Gap 6: Daily digest of autonomous skill-pipeline activity
+  runDigest?(opts?: { deliver?: boolean; lookbackHours?: number }): Promise<{
+    markdown: string;
+    report: unknown;
+  }>;
+  // PLAN-10: Skill Seekers (on-demand external skill ingestion)
+  getSkillSeekersAdapter?(): {
+    isAvailable(): Promise<boolean>;
+    budgetRemaining(): number;
+    ingestFromSource(source: {
+      url: string;
+      type?: "docs" | "github" | "pdf" | "video" | "codebase";
+      name?: string;
+      description?: string;
+    }): Promise<{
+      ok: boolean;
+      error?: string;
+      transport?: "native" | "mcp" | "cli" | "python";
+      elapsedMs: number;
+      ingested: Array<{
+        action: "accepted" | "quarantined" | "rejected" | "retracted" | "staged";
+        skillName?: string;
+      }>;
+      conflicts: Array<{ severity: "low" | "medium" | "high" }>;
+    }>;
+  } | null;
+}

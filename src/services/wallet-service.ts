@@ -1,0 +1,785 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import lockfile from "proper-lockfile";
+import type { WalletConfig } from "../config/types.wallet.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+
+export type BalanceResult = {
+  token: string;
+  balance: string;
+  usdValue?: string;
+};
+
+export type SendResult = {
+  txHash: string;
+  status: string;
+};
+
+export type TransactionRecord = {
+  txHash: string;
+  type: string;
+  amount: string;
+  token: string;
+  timestamp: number;
+};
+
+export type SendUsdcOptions = {
+  /** When provided, use this exact smallest-unit amount instead of converting from USD float. */
+  rawSmallestUnit?: bigint;
+};
+
+export type X402PaymentResult = {
+  success: boolean;
+  statusCode?: number;
+  content?: string;
+  contentType?: string;
+  amountPaid?: number;
+  txHash?: string;
+  error?: string;
+};
+
+export interface WalletService {
+  fundSoapbox?(
+    quote: import("./soapbox-payment.js").SoapboxPaymentQuote,
+  ): Promise<{ status: string; txHash: string | null }>;
+  getAddress(): Promise<string>;
+  getBalance(token?: string): Promise<BalanceResult>;
+  sendUsdc(to: string, amount: number, opts?: SendUsdcOptions): Promise<SendResult>;
+  getTransactionHistory(limit?: number): Promise<TransactionRecord[]>;
+  getFundingUrl(): Promise<string>;
+  getNetwork(): string;
+  payForResource(resourceUrl: string, amountUsdc: number): Promise<X402PaymentResult>;
+  /**
+   * Address of the EOA that x402 payments are sent from (the smart account's
+   * owner). Fund this address with USDC to enable pay_for_resource. Distinct
+   * from getAddress() (the smart account used for send_usdc and receiving).
+   */
+  getX402PayerAddress(): Promise<string>;
+  /**
+   * Sign an arbitrary message with the wallet's signing key (EIP-191 personal_sign).
+   * Used by the A2A client to bind payment proofs to the buyer's wallet so a
+   * leaked txHash cannot be replayed against a different recipient by another agent.
+   */
+  signMessage(message: string): Promise<string>;
+  /**
+   * PLAN-48 Phase 4 scaffold: the smart-account spend-permission parameters the
+   * operator's on-chain upgrade will register (the same allowance
+   * `SpendPermissionPolicy` enforces off-chain). Pure config echo — never touches
+   * the chain or creates an account. `enabled` gates whether the operator has
+   * opted into routing; the live create + routing cutover is a Victor-run step.
+   */
+  getSmartAccountConfig(): SmartAccountConfigView;
+}
+
+/** The intended CDP Smart Account spend-permission parameters (config echo). */
+export interface SmartAccountConfigView {
+  /** Whether smart-account routing is opted into (wallet.smartAccount.enabled). */
+  enabled: boolean;
+  /** Per-period allowance in USD the on-chain permission would enforce. */
+  allowanceUsd?: number;
+  /** Allowance period in seconds (default daily). */
+  periodSeconds: number;
+  /** Sponsor gas via user operations (paymaster) rather than requiring ETH. */
+  sponsorGas: boolean;
+  /** USDC contract the allowance is denominated in, for `network`. */
+  token?: string;
+  network: string;
+}
+
+const DEFAULT_WALLET_STORE = path.join(os.homedir(), ".bitterbot", "wallet");
+
+const log = createSubsystemLogger("wallet");
+
+/**
+ * Spend bookkeeping shared by every wallet service on the same store: what is
+ * held for sends in flight, the order the history is read and written in, and
+ * spends that went through but could not be written down yet.
+ */
+type StoreLedger = {
+  reservedUsd: number;
+  queue: Promise<void>;
+  unrecorded: TransactionRecord[];
+};
+const ledgers = new Map<string, StoreLedger>();
+
+function ledgerFor(storePath: string): StoreLedger {
+  const key = path.resolve(storePath);
+  let ledger = ledgers.get(key);
+  if (!ledger) {
+    ledger = { reservedUsd: 0, queue: Promise.resolve(), unrecorded: [] };
+    ledgers.set(key, ledger);
+  }
+  return ledger;
+}
+
+/** Test seam: forget holds and unwritten spends for every store. */
+export function resetWalletLedgersForTest(): void {
+  ledgers.clear();
+}
+
+// Persistence shape. v1 stored an encrypted blob; v2 only needs the
+// smart-account name and addresses — CDP holds the wallet state server-side,
+// authenticated by the Wallet Secret.
+type PersistedWallet = {
+  name?: string;
+  address: string;
+  ownerAddress: string;
+};
+
+const TOKEN_CONTRACTS: Record<string, Record<string, string>> = {
+  base: { USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" },
+  "base-sepolia": { USDC: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" },
+};
+
+// Derived from TOKEN_CONTRACTS — single source of truth
+const USDC_CONTRACTS: Record<string, string> = Object.fromEntries(
+  Object.entries(TOKEN_CONTRACTS)
+    .filter(([, tokens]) => tokens.USDC)
+    .map(([net, tokens]) => [net, tokens.USDC]),
+);
+
+const TOKEN_DECIMALS: Record<string, number> = {
+  USDC: 6,
+  USDT: 6,
+  DAI: 18,
+};
+
+const ERC20_BALANCE_ABI = [
+  {
+    inputs: [{ name: "account", type: "address" }],
+    name: "balanceOf",
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+] as const;
+
+export function createWalletService(
+  config: WalletConfig,
+  authentication?: {
+    walletSecret: string;
+    rpcUrl?: string;
+    accountName?: string;
+    expectedAddress?: string;
+  },
+): WalletService {
+  const network = config.network ?? "base-sepolia";
+  // AgentKit's CDP wallet providers expect CDP network IDs ("base-mainnet",
+  // "base-sepolia"), NOT the short "base" alias we use everywhere else for
+  // USDC contracts, account names, and funding URLs. Passing "base" straight
+  // through makes the provider throw "Unsupported network ...: base". The x402
+  // protocol's SUPPORTED_NETWORKS keys off "base-mainnet" too, so this mapping
+  // also unblocks pay_for_resource.
+  const networkId = network === "base" ? "base-mainnet" : network;
+  const storePath = config.walletStorePath ?? DEFAULT_WALLET_STORE;
+  const perTxCap = config.perTransactionCapUsd ?? 25;
+  const dailyLimit = config.dailySpendLimitUsd ?? 50;
+
+  // The wallet is a single CDP Server Wallet (MPC EOA) — CDP's intended agent
+  // wallet. It signs x402's EIP-3009 authorizations with a standard ECDSA
+  // signature, which USDC settles via ecrecover (no smart-account/ERC-1271
+  // edge cases) while the facilitator sponsors gas. Direct USDC sends are
+  // normal EOA transactions, so the account needs a small ETH balance for gas
+  // (gasless sends would require EIP-7702 delegation, deferred).
+  let walletProviderPromise: Promise<import("@coinbase/agentkit").CdpEvmWalletProvider> | null =
+    null;
+
+  async function ensureStoreDir(): Promise<void> {
+    await fs.mkdir(storePath, { recursive: true });
+  }
+
+  async function savePersistedWallet(data: PersistedWallet): Promise<void> {
+    await ensureStoreDir();
+    const filePath = path.join(storePath, "wallet-data.json");
+    await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
+  }
+
+  async function getProvider(): Promise<import("@coinbase/agentkit").CdpEvmWalletProvider> {
+    if (!walletProviderPromise) {
+      walletProviderPromise = initProvider();
+    }
+    return walletProviderPromise;
+  }
+
+  async function initProvider(): Promise<import("@coinbase/agentkit").CdpEvmWalletProvider> {
+    const { CdpEvmWalletProvider } = await import("@coinbase/agentkit");
+    const { CdpClient } = await import("@coinbase/cdp-sdk");
+
+    const apiKeyId = config.cdpApiKeyId ?? process.env.CDP_API_KEY_ID;
+    const apiKeySecret = config.cdpApiKeySecret ?? process.env.CDP_API_KEY_SECRET;
+    const walletSecret = authentication?.walletSecret ?? process.env.CDP_WALLET_SECRET;
+    if (!apiKeyId || !apiKeySecret || !walletSecret) {
+      throw new Error(
+        "Missing required CDP credentials. Set CDP_API_KEY_ID, CDP_API_KEY_SECRET, " +
+          "and CDP_WALLET_SECRET in your environment.",
+      );
+    }
+
+    // Resolve (or create) the single server account (MPC EOA) for this network.
+    // This is the one wallet for receiving, send_usdc, and x402.
+    const cdp = new CdpClient({ apiKeyId, apiKeySecret, walletSecret });
+    const accountName = authentication?.accountName ?? `bitterbot-owner-${network}`;
+    const account = await cdp.evm.getOrCreateAccount({ name: accountName });
+    if (
+      authentication?.expectedAddress &&
+      account.address.toLowerCase() !== authentication.expectedAddress.toLowerCase()
+    )
+      throw new Error("Wallet account does not match the stored identity");
+
+    const provider = await CdpEvmWalletProvider.configureWithWallet({
+      apiKeyId,
+      apiKeySecret,
+      walletSecret,
+      rpcUrl: authentication?.rpcUrl,
+      networkId,
+      address: account.address as `0x${string}`,
+    });
+
+    await savePersistedWallet({
+      name: accountName,
+      address: account.address,
+      ownerAddress: account.address,
+    });
+
+    return provider;
+  }
+
+  function validateTransactionAmount(amount: number): void {
+    if (amount <= 0) {
+      throw new Error("Transaction amount must be positive");
+    }
+    if (amount > perTxCap) {
+      throw new Error(`Transaction amount $${amount} exceeds per-transaction cap of $${perTxCap}`);
+    }
+  }
+
+  /**
+   * Enforce the rolling 24h spend cap across ALL outbound paths. This is the
+   * single choke point: sendUsdc and payForResource both call it, so A2A
+   * hires, revenue dispatch, and direct sends draw from one budget. Sums the
+   * persisted tx history (send + x402_payment rows), so the cap survives
+   * restarts — unlike per-session counters.
+   */
+  //
+  // The check also holds the amount until the spend is recorded (or abandoned).
+  // Concurrent spends otherwise all read the same history before any of them is
+  // written, and all pass the cap (#157).
+  //
+  // The hold, and the order history is read and written in, belong to the
+  // wallet store, not to this instance: the app builds a wallet service per
+  // agent run, per paid A2A task, per payout tick and for the gateway RPC, and
+  // they all spend from the same budget. Holds are in-process only; the
+  // history file is what survives restarts.
+  const ledger = ledgerFor(storePath);
+
+  /** One thing at a time per store: a cap check never reads around a write. */
+  function inOrder<T>(work: () => Promise<T>): Promise<T> {
+    const run = ledger.queue.then(work);
+    ledger.queue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  function reserveDailyLimit(amount: number, strictHistory = false): Promise<() => void> {
+    return inOrder(async () => {
+      const historyPath = path.join(storePath, "tx-history.json");
+      let history: TransactionRecord[] = [];
+      try {
+        history = JSON.parse(await fs.readFile(historyPath, "utf-8"));
+      } catch (error) {
+        if (strictHistory && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // no history yet — nothing spent
+      }
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      const isSpend = (r: TransactionRecord) =>
+        r.timestamp >= cutoff && (r.type === "send" || r.type === "x402_payment");
+      const sum = (rows: TransactionRecord[]) =>
+        rows.filter(isSpend).reduce((total, r) => total + (Number(r.amount) || 0), 0);
+      // Money that left but could not be written down still counts.
+      const spent = sum(history) + sum(ledger.unrecorded);
+      if (spent + ledger.reservedUsd + amount > dailyLimit) {
+        const inFlight =
+          ledger.reservedUsd > 0 ? ` plus $${ledger.reservedUsd.toFixed(2)} in flight` : "";
+        throw new Error(
+          `Daily spend limit would be exceeded: $${spent.toFixed(2)} spent in the last 24h${inFlight}, ` +
+            `$${amount.toFixed(2)} requested, cap is $${dailyLimit} ` +
+            `(tools.wallet.dailySpendLimitUsd)`,
+        );
+      }
+      ledger.reservedUsd += amount;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        ledger.reservedUsd -= amount;
+      };
+    });
+  }
+
+  // History writes run one at a time per store, so concurrent spends don't
+  // fail on our own lockfile after the money has already moved. The lockfile
+  // still guards against other processes.
+
+  /**
+   * Write down a spend that has ALREADY happened. This never throws: by the
+   * time it is called the money has moved, and a caller told "failed" will
+   * pay again (an agent retries; the payout queue re-sends next tick). If the
+   * history cannot be written the spend is kept in memory, still counted
+   * against the cap, and written with the next record that succeeds.
+   */
+  async function recordSpend(record: TransactionRecord): Promise<void> {
+    try {
+      await persistSpend(record);
+    } catch (err) {
+      ledger.unrecorded.push(record);
+      log.error(
+        `spend ${record.txHash} ($${record.amount} ${record.type}) went through but could not be written to the wallet history: ` +
+          `${err instanceof Error ? err.message : String(err)}. It still counts against the daily limit.`,
+      );
+    }
+  }
+
+  /** Persist this row and recover prior sends whose history writes failed. */
+  function persistSpend(record: TransactionRecord): Promise<void> {
+    return inOrder(async () => {
+      const pending = ledger.unrecorded.splice(0);
+      try {
+        await writeTransactions([...pending, record]);
+      } catch (err) {
+        ledger.unrecorded.push(...pending);
+        throw err;
+      }
+    });
+  }
+
+  async function writeTransactions(records: TransactionRecord[]): Promise<void> {
+    await ensureStoreDir();
+    const historyPath = path.join(storePath, "tx-history.json");
+
+    // Ensure the file exists before locking (proper-lockfile requires it)
+    try {
+      await fs.access(historyPath);
+    } catch {
+      await fs.writeFile(historyPath, "[]", "utf-8");
+    }
+
+    const release = await lockfile.lock(historyPath, {
+      retries: { retries: 3, minTimeout: 100, maxTimeout: 1000 },
+      stale: 10_000,
+    });
+    try {
+      let history: TransactionRecord[] = [];
+      try {
+        history = JSON.parse(await fs.readFile(historyPath, "utf-8"));
+      } catch {}
+      history.push(...records);
+      // Keep every spend inside the daily-limit window, even for high-volume micropayments.
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      history = history.filter(
+        (entry, index) => entry.timestamp >= cutoff || index >= history.length - 500,
+      );
+      await fs.writeFile(historyPath, JSON.stringify(history, null, 2), "utf-8");
+    } finally {
+      await release();
+    }
+  }
+
+  function formatBalance(raw: bigint, decimals: number): string {
+    if (raw < 0n) {
+      return "-" + formatBalance(-raw, decimals);
+    }
+    const divisor = 10n ** BigInt(decimals);
+    const whole = raw / divisor;
+    const frac = raw % divisor;
+    if (frac === 0n) {
+      return whole.toString();
+    }
+    const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+    return `${whole}.${fracStr}`;
+  }
+
+  return {
+    async fundSoapbox(quote) {
+      const { fundSoapboxEscrow, validateSoapboxQuote } = await import("./soapbox-payment.js");
+      if (network !== "base-sepolia")
+        throw new Error("Soapbox funding requires the Base Sepolia wallet");
+      // Funding needs only CDP signing, without loading AgentKit's action integrations.
+      const { CdpClient } = await import("@coinbase/cdp-sdk");
+      const apiKeyId = config.cdpApiKeyId ?? process.env.CDP_API_KEY_ID;
+      const apiKeySecret = config.cdpApiKeySecret ?? process.env.CDP_API_KEY_SECRET;
+      const walletSecret = authentication?.walletSecret ?? process.env.CDP_WALLET_SECRET;
+      if (!apiKeyId || !apiKeySecret || !walletSecret)
+        throw new Error("Missing required CDP credentials");
+      const cdp = new CdpClient({ apiKeyId, apiKeySecret, walletSecret });
+      const name = authentication?.accountName ?? `bitterbot-owner-${network}`;
+      const account = await cdp.evm.getOrCreateAccount({ name });
+      if (
+        authentication?.expectedAddress &&
+        account.address.toLowerCase() !== authentication.expectedAddress.toLowerCase()
+      )
+        throw new Error("Wallet account does not match the stored identity");
+      validateSoapboxQuote(quote, account.address, network);
+      validateTransactionAmount(quote.amount_microusdc / 1e6);
+      await savePersistedWallet({ name, address: account.address, ownerAddress: account.address });
+      await ensureStoreDir();
+      const guardPath = path.join(storePath, "soapbox-funding");
+      await fs.writeFile(guardPath, "", { flag: "a" });
+      const release = await lockfile.lock(guardPath, { retries: 0, stale: 120_000 });
+      try {
+        return await fundSoapboxEscrow({
+          quote,
+          buyer: account.address,
+          network,
+          send: async (transaction) =>
+            (
+              await cdp.evm.sendTransaction({
+                address: account.address,
+                network: "base-sepolia",
+                transaction,
+              })
+            ).transactionHash,
+          reserve: async () => {
+            const reference = `soapbox:${quote.chain_id}:${quote.escrow.toLowerCase()}:${quote.key}`;
+            let history: TransactionRecord[] = [];
+            try {
+              history = JSON.parse(
+                await fs.readFile(path.join(storePath, "tx-history.json"), "utf8"),
+              );
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            }
+            if (history.some((record) => record.txHash === reference)) return;
+            const releaseHold = await reserveDailyLimit(quote.amount_microusdc / 1e6, true);
+            try {
+              // Persist before signing. A failed or ambiguous send keeps this
+              // reservation; a retry of the same escrow cannot spend twice.
+              await persistSpend({
+                txHash: reference,
+                type: "send",
+                amount: String(quote.amount_microusdc / 1e6),
+                token: "USDC",
+                timestamp: Date.now(),
+              });
+            } finally {
+              releaseHold();
+            }
+          },
+        });
+      } finally {
+        await release();
+      }
+    },
+    async getAddress(): Promise<string> {
+      const provider = await getProvider();
+      return provider.getAddress();
+    },
+
+    async getX402PayerAddress(): Promise<string> {
+      // Single-wallet model: x402 pays from the main wallet address.
+      const provider = await getProvider();
+      return provider.getAddress();
+    },
+
+    async signMessage(message: string): Promise<string> {
+      const provider = await getProvider();
+      return provider.signMessage(message);
+    },
+
+    // PLAN-48 Phase 4 scaffold. Surfaces the spend-permission parameters the
+    // operator's on-chain upgrade will register; pure config, no CDP call.
+    //
+    // LIVE CUTOVER (operator / Victor, testnet first — deliberately NOT built
+    // here to avoid shipping unverifiable money-movement code): create the CDP
+    // Smart Account owned by this EOA (`cdp.evm.getOrCreateSmartAccount`),
+    // register a spend permission from `buildSpendPermission(...)` in
+    // src/payments/wallet/smart-account.ts, persist a SmartAccountRecord to
+    // `<storePath>/smart-account.json`, verify I5 via `assertAddressContinuity`
+    // (also checked by doctor-wallet), then route sendUsdc / payForResource
+    // through the smart account with sponsored-gas user operations.
+    getSmartAccountConfig(): SmartAccountConfigView {
+      const sa = config.smartAccount;
+      return {
+        enabled: sa?.enabled === true,
+        allowanceUsd: sa?.allowanceUsd,
+        periodSeconds: sa?.periodSeconds ?? 86_400,
+        sponsorGas: sa?.sponsorGas === true,
+        token: USDC_CONTRACTS[network],
+        network,
+      };
+    },
+
+    async getBalance(token?: string): Promise<BalanceResult> {
+      const provider = await getProvider();
+      const tokenSymbol = (token ?? "ETH").toUpperCase();
+
+      try {
+        if (tokenSymbol === "ETH") {
+          const balance = await provider.getBalance();
+          return {
+            token: tokenSymbol,
+            balance: formatBalance(balance, 18),
+          };
+        }
+
+        // ERC-20 token balance via readContract
+        const contracts = TOKEN_CONTRACTS[network];
+        const contractAddress = contracts?.[tokenSymbol];
+        if (!contractAddress) {
+          throw new Error(`No contract address for ${tokenSymbol} on ${network}`);
+        }
+
+        const walletAddress = provider.getAddress();
+        const rawBalance = await provider.readContract({
+          address: contractAddress as `0x${string}`,
+          abi: ERC20_BALANCE_ABI,
+          functionName: "balanceOf",
+          args: [walletAddress as `0x${string}`],
+        });
+
+        const decimals = TOKEN_DECIMALS[tokenSymbol] ?? 18;
+        return {
+          token: tokenSymbol,
+          balance: formatBalance(BigInt(rawBalance), decimals),
+        };
+      } catch (err) {
+        throw new Error(
+          `Failed to get balance for ${tokenSymbol}: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
+    },
+
+    async sendUsdc(to: string, amount: number, opts?: SendUsdcOptions): Promise<SendResult> {
+      validateTransactionAmount(amount);
+      const releaseHold = await reserveDailyLimit(amount);
+      let provider: Awaited<ReturnType<typeof getProvider>>;
+      try {
+        provider = await getProvider();
+      } catch (err) {
+        releaseHold();
+        throw err;
+      }
+
+      const usdcContract = USDC_CONTRACTS[network];
+      if (!usdcContract) {
+        releaseHold();
+        throw new Error(`No USDC contract for network: ${network}`);
+      }
+
+      let tx: string;
+      try {
+        const smallestUnit = opts?.rawSmallestUnit ?? BigInt(Math.round(amount * 1e6));
+        tx = await provider.sendTransaction({
+          to: usdcContract as `0x${string}`,
+          value: BigInt(0),
+          data: encodeSendUsdcData(to, smallestUnit),
+        });
+      } catch (err) {
+        releaseHold();
+        throw new Error(
+          `Failed to send USDC: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
+      // The money has moved. From here on this call reports success whatever
+      // happens to the bookkeeping: saying "failed" now is how a spend gets
+      // made twice.
+      await recordSpend({
+        txHash: tx,
+        type: "send",
+        amount: amount.toString(),
+        token: "USDC",
+        timestamp: Date.now(),
+      });
+      // Recorded (in the history, or held in memory): it counts there now.
+      releaseHold();
+      return {
+        txHash: tx,
+        status: "pending",
+      };
+    },
+
+    async getTransactionHistory(limit?: number): Promise<TransactionRecord[]> {
+      const historyPath = path.join(storePath, "tx-history.json");
+      try {
+        const raw = await fs.readFile(historyPath, "utf-8");
+        const history: TransactionRecord[] = JSON.parse(raw);
+        const maxResults = limit ?? 10;
+        return history.slice(-maxResults);
+      } catch {
+        return [];
+      }
+    },
+
+    async getFundingUrl(): Promise<string> {
+      if (config.stripe?.enabled) {
+        return `/wallet/fund`;
+      }
+      const provider = await getProvider();
+      const address = provider.getAddress();
+      if (network === "base-sepolia") {
+        return `https://portal.cdp.coinbase.com/products/faucet?address=${address}&network=base-sepolia`;
+      }
+      return `https://pay.coinbase.com/buy?appId=bitterbot&addresses={"${address}":["base"]}&assets=["USDC"]`;
+    },
+
+    getNetwork(): string {
+      return network;
+    },
+
+    async payForResource(resourceUrl: string, amountUsdc: number): Promise<X402PaymentResult> {
+      validateTransactionAmount(amountUsdc);
+      // The wallet is an EOA, so its EIP-3009 authorization settles via
+      // ecrecover and the facilitator sponsors gas.
+      const payer = await getProvider();
+
+      // AgentKit's x402 action provider wraps the official @x402 client
+      // (EIP-712 typed-data authorization, settled on-chain by the CDP
+      // facilitator). The EOA payer satisfies the EvmWalletProvider contract
+      // toSigner() needs and shares the same module identity, so the internal
+      // `instanceof` checks pass.
+      const { X402ActionProvider } = await import("@coinbase/agentkit");
+      const x402 = new X402ActionProvider();
+
+      let releaseHold: (() => void) | undefined;
+      try {
+        // Pre-flight: discover the payment requirements WITHOUT paying. The
+        // auto-pay wrapper would settle whatever the server demands; we must
+        // confirm the *actual* price is within the caller's cap first. A
+        // non-402 response means the resource was free — return it directly.
+        const probeRaw = await x402.makeHttpRequest(payer, {
+          url: resourceUrl,
+          method: "GET",
+        });
+        const probe = JSON.parse(probeRaw) as {
+          status?: string;
+          success?: boolean;
+          statusCode?: number;
+          data?: unknown;
+          acceptablePaymentOptions?: Array<{
+            network?: string;
+            asset?: string;
+            maxAmountRequired?: string;
+            amount?: string;
+          }>;
+          message?: string;
+          error?: boolean;
+        };
+
+        if (probe.status !== "error_402_payment_required") {
+          if (probe.success) {
+            // No payment was required; the resource returned content for free.
+            const content =
+              typeof probe.data === "string" ? probe.data : JSON.stringify(probe.data);
+            return {
+              success: true,
+              statusCode: 200,
+              content: content.slice(0, 10_000),
+              amountPaid: 0,
+            };
+          }
+          return {
+            success: false,
+            error:
+              probe.message ?? `Resource did not return a payable 402: ${probeRaw.slice(0, 300)}`,
+          };
+        }
+
+        // Determine the cheapest USDC price the server will accept and enforce
+        // the per-request cap against it. USDC is 6 decimals; maxAmountRequired
+        // is in atomic units.
+        const options = probe.acceptablePaymentOptions ?? [];
+        const prices = options
+          .map((o) => Number(o.maxAmountRequired ?? o.amount))
+          .filter((n) => Number.isFinite(n) && n >= 0)
+          .map((atomic) => atomic / 1e6);
+        if (prices.length === 0) {
+          return {
+            success: false,
+            error: "402 response did not include a parseable payment amount.",
+          };
+        }
+        const requiredUsd = Math.min(...prices);
+        if (requiredUsd > amountUsdc) {
+          return {
+            success: false,
+            statusCode: 402,
+            error:
+              `Resource requires $${requiredUsd.toFixed(4)} USDC, which exceeds the ` +
+              `approved amount of $${amountUsdc.toFixed(4)}. Payment not sent.`,
+          };
+        }
+
+        // Within cap: enforce the daily budget against the ACTUAL price
+        // (the probe above was free), then pay and settle on-chain.
+        releaseHold = await reserveDailyLimit(requiredUsd);
+        const paidRaw = await x402.makeHttpRequestWithX402(payer, {
+          url: resourceUrl,
+          method: "GET",
+        });
+        const paid = JSON.parse(paidRaw) as {
+          success?: boolean;
+          status?: number;
+          data?: unknown;
+          message?: string;
+          paymentProof?: { transaction?: string; txHash?: string } | null;
+          error?: boolean;
+        };
+
+        if (!paid.success) {
+          const payerAddress = payer.getAddress();
+          return {
+            success: false,
+            statusCode: paid.status,
+            error:
+              (paid.message ?? `x402 payment failed: ${paidRaw.slice(0, 300)}`) +
+              ` (paid from wallet ${payerAddress}; ensure it holds enough USDC on ${network}.)`,
+          };
+        }
+
+        const txHash =
+          paid.paymentProof?.transaction ??
+          paid.paymentProof?.txHash ??
+          `x402-${Date.now().toString(36)}`;
+        // Paid: record it without letting a bookkeeping failure turn a
+        // payment that went through into a reported failure.
+        await recordSpend({
+          txHash,
+          type: "x402_payment",
+          amount: requiredUsd.toString(),
+          token: "USDC",
+          timestamp: Date.now(),
+        });
+
+        const content = typeof paid.data === "string" ? paid.data : JSON.stringify(paid.data);
+        return {
+          success: true,
+          statusCode: paid.status ?? 200,
+          content: content.slice(0, 10_000),
+          amountPaid: requiredUsd,
+          txHash,
+        };
+      } catch (err) {
+        return {
+          success: false,
+          error: `x402 payment failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      } finally {
+        releaseHold?.();
+      }
+    },
+  };
+}
+
+function encodeSendUsdcData(to: string, amountSmallestUnit: bigint): `0x${string}` {
+  // ERC-20 transfer(address,uint256) function selector: 0xa9059cbb
+  const recipient = to.toLowerCase().replace("0x", "").padStart(64, "0");
+  const value = amountSmallestUnit.toString(16).padStart(64, "0");
+  return `0xa9059cbb${recipient}${value}` as `0x${string}`;
+}
+
+// Re-export USDC contracts for use by other modules
+export { USDC_CONTRACTS };

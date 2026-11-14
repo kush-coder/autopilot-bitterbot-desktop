@@ -1,0 +1,750 @@
+/**
+ * PLAN-31 C1: the circles store — the pairing/membership foundation of the
+ * collective-agency substrate.
+ *
+ * A circle is a closed, mutually-paired member set (4-15 humans) whose agents
+ * coordinate shared life. This store owns membership only; the shared event
+ * ledger (C2) and the encrypted channel/mailbox (C1 transport) build on top.
+ *
+ * Substrate discipline (PLAN-31 sections 11-12): the tables are
+ * domain-agnostic. `kind` distinguishes expense / care / team / household
+ * circles so the same membership machinery serves every domain, and member
+ * `scopes` are an extensible default-deny set keyed by action class (not
+ * hardcoded to money) so a care-rotation skill grants different scopes than a
+ * settlement skill without a schema change.
+ *
+ * Two invariants this store enforces, both from the mechanics red team:
+ *  - The payout wallet is PINNED at pair time. A settlement to any address
+ *    other than a member's pinned wallet must be refused downstream; changing
+ *    a pinned wallet requires an explicit re-pair (a new call here), never a
+ *    silent update from agent logic.
+ *  - `key_epoch` bumps on member ADD only (`addMember`) — `removeMember`
+ *    does NOT bump it. Its sole consumer today is gossip topic blinding
+ *    (`circleTopicId` = sha256(circleId:keyEpoch)); that is topic naming,
+ *    not encryption, and direct dial + mailbox ignore it entirely, so the
+ *    "a departed member cannot read future traffic" property does NOT hold
+ *    today. Real channel-key rotation is PLAN-36 §5.6. What DOES exist:
+ *    removal on this node stops this node's fan-out to the evictee
+ *    immediately (getMembers is active-only), and the service fans a signed
+ *    removal NOTICE to the remaining members so their humans can prune their
+ *    own rosters too (CirclesService.removeMember) — informed consent, not
+ *    global revocation.
+ */
+
+import crypto from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+
+/**
+ * Hard roster ceiling (2026-08-13). "Circles cap at ~15" was prose in two
+ * comments with no enforcement anywhere — a join handler would happily add
+ * member 50. Enforced on the GROWTH paths only: invite minting
+ * (CirclesService.createInviteCode) and circle/join (handleCircleJoin,
+ * checked before the invite use is burned). `importCircle` deliberately does
+ * NOT clamp: a signed roster arriving in a welcome is imported as-is (never
+ * mutilate signed state), so an over-cap circle from an older build keeps
+ * working — it just cannot grow further.
+ */
+export const MAX_CIRCLE_MEMBERS = 15;
+
+/**
+ * An action-class scope a member may hold. A free string so third-party and
+ * future-domain skills can define their own scopes (sections 11-12) without a
+ * type change; the known first-party scopes are documented in KNOWN_SCOPES.
+ * Authorization is always default-deny.
+ */
+export type CircleScope = string;
+
+/** The first-party action-class scopes (documentation + reuse). */
+export const KNOWN_SCOPES = {
+  ledgerRead: "ledger.read",
+  ledgerAppend: "ledger.append",
+  settlePropose: "settle.propose",
+  scheduleRead: "schedule.read",
+  schedulePropose: "schedule.propose",
+  briefingRead: "briefing.read",
+  decideVote: "decide.vote",
+  // PLAN-31 C1/C2 connection-first verbs (v3): the social surface.
+  rosterRead: "roster.read",
+  messageSend: "message.send",
+  presenceShare: "presence.share",
+  askSend: "ask.send",
+  answerSend: "answer.send",
+} as const;
+
+/** A circle's coordination domain. Free string; expense is the v1 beachhead. */
+export type CircleKind = string;
+
+export type CircleMember = {
+  circleId: string;
+  memberPubkey: string;
+  displayName: string | null;
+  /** Payout wallet pinned at pair time; settlements refuse any other payTo. */
+  pinnedWallet: string | null;
+  a2aUrl: string | null;
+  /** X25519 box pubkey (base64) for mailbox sealing; published in signed envelopes. */
+  boxPubkey: string | null;
+  /** The member's mailbox host URL (where WE deposit mail for THEM). */
+  mailboxUrl: string | null;
+  /** libp2p PeerId claimed in the member's SIGNED join/presence envelope
+   * (PLAN-35 B-1 binding) — the mesh dial target for circle RPC. */
+  peerId: string | null;
+  role: "creator" | "member";
+  scopes: CircleScope[];
+  /**
+   * Only "active" members hold scopes, receive fan-out, or appear in rosters.
+   * (A legacy 'suspended' value may exist in rows written by pre-2026-07-27
+   * builds; every check compares against 'active', so it stays default-deny.)
+   */
+  status: "active" | "left";
+  joinedAt: number;
+};
+
+export type Circle = {
+  circleId: string;
+  name: string;
+  kind: CircleKind;
+  creatorPubkey: string;
+  keyEpoch: number;
+  /** `frozen` = event-ledger fork detected; writes refused until a human clears it. */
+  status: "active" | "archived" | "frozen";
+  /** JSON fork evidence recorded at freeze time (author, seq, hashes); NULL otherwise. */
+  freezeReason: string | null;
+  createdAt: number;
+};
+
+/** Default scopes granted to an ordinary member of an expense circle. */
+export const DEFAULT_MEMBER_SCOPES: CircleScope[] = Object.values(KNOWN_SCOPES);
+
+type CircleRow = {
+  circle_id: string;
+  name: string;
+  kind: string;
+  creator_pubkey: string;
+  key_epoch: number;
+  status: string;
+  freeze_reason: string | null;
+  created_at: number;
+};
+
+type MemberRow = {
+  circle_id: string;
+  member_pubkey: string;
+  display_name: string | null;
+  pinned_wallet: string | null;
+  a2a_url: string | null;
+  box_pubkey: string | null;
+  mailbox_url: string | null;
+  peer_id: string | null;
+  role: string;
+  scopes_json: string;
+  status: string;
+  joined_at: number;
+};
+
+function rowToCircle(r: CircleRow): Circle {
+  return {
+    circleId: r.circle_id,
+    name: r.name,
+    kind: r.kind,
+    creatorPubkey: r.creator_pubkey,
+    keyEpoch: r.key_epoch,
+    status: r.status as Circle["status"],
+    freezeReason: r.freeze_reason ?? null,
+    createdAt: r.created_at,
+  };
+}
+
+function rowToMember(r: MemberRow): CircleMember {
+  let scopes: CircleScope[] = [];
+  try {
+    const parsed = JSON.parse(r.scopes_json) as unknown;
+    if (Array.isArray(parsed)) scopes = parsed.filter((s): s is string => typeof s === "string");
+  } catch {
+    // corrupt scope blob → default-deny (empty), never a crash
+  }
+  return {
+    circleId: r.circle_id,
+    memberPubkey: r.member_pubkey,
+    displayName: r.display_name,
+    pinnedWallet: r.pinned_wallet,
+    a2aUrl: r.a2a_url,
+    boxPubkey: r.box_pubkey ?? null,
+    mailboxUrl: r.mailbox_url ?? null,
+    peerId: r.peer_id ?? null,
+    role: r.role as CircleMember["role"],
+    scopes,
+    status: r.status as CircleMember["status"],
+    joinedAt: r.joined_at,
+  };
+}
+
+export class CirclesStore {
+  constructor(private readonly db: DatabaseSync) {}
+
+  /** Create a circle with its creator as the first member. Returns the id. */
+  createCircle(args: {
+    name: string;
+    kind?: CircleKind;
+    creatorPubkey: string;
+    creatorWallet?: string;
+    creatorA2aUrl?: string;
+    /** §5.6: the creator's own display name, so the roster carries it from the
+     *  start (previously NULL — the creator's name only reached friends via a
+     *  later presence beat). */
+    creatorDisplayName?: string;
+    now?: number;
+  }): string {
+    const now = args.now ?? Date.now();
+    const circleId = crypto.randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO circles
+           (circle_id, name, kind, creator_pubkey, key_epoch, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 0, 'active', ?, ?)`,
+      )
+      .run(circleId, args.name, args.kind ?? "expense", args.creatorPubkey, now, now);
+    this.db
+      .prepare(
+        `INSERT INTO circle_members
+           (circle_id, member_pubkey, display_name, pinned_wallet, a2a_url, role,
+            scopes_json, status, joined_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'creator', ?, 'active', ?, ?)`,
+      )
+      .run(
+        circleId,
+        args.creatorPubkey,
+        args.creatorDisplayName?.trim().slice(0, 80) || null,
+        args.creatorWallet ?? null,
+        args.creatorA2aUrl ?? null,
+        JSON.stringify(DEFAULT_MEMBER_SCOPES),
+        now,
+        now,
+      );
+    return circleId;
+  }
+
+  /**
+   * Add (or re-pair) a member. Pins their payout wallet; bumps the circle's
+   * key epoch so the transport layer rotates the channel key. Idempotent on
+   * (circle, pubkey): a second call re-pairs (this is the explicit,
+   * human-approved path a pinned-wallet change must take).
+   */
+  addMember(args: {
+    circleId: string;
+    memberPubkey: string;
+    displayName?: string;
+    pinnedWallet?: string;
+    a2aUrl?: string;
+    boxPubkey?: string;
+    mailboxUrl?: string;
+    peerId?: string;
+    scopes?: CircleScope[];
+    now?: number;
+  }): void {
+    const now = args.now ?? Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO circle_members
+           (circle_id, member_pubkey, display_name, pinned_wallet, a2a_url, box_pubkey,
+            mailbox_url, peer_id, role, scopes_json, status, joined_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'member', ?, 'active', ?, ?)
+         ON CONFLICT(circle_id, member_pubkey) DO UPDATE SET
+           display_name = excluded.display_name,
+           pinned_wallet = excluded.pinned_wallet,
+           a2a_url = excluded.a2a_url,
+           box_pubkey = COALESCE(excluded.box_pubkey, circle_members.box_pubkey),
+           mailbox_url = COALESCE(excluded.mailbox_url, circle_members.mailbox_url),
+           peer_id = COALESCE(excluded.peer_id, circle_members.peer_id),
+           scopes_json = excluded.scopes_json,
+           status = 'active',
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        args.circleId,
+        args.memberPubkey,
+        args.displayName ?? null,
+        args.pinnedWallet ?? null,
+        args.a2aUrl ?? null,
+        args.boxPubkey ?? null,
+        args.mailboxUrl ?? null,
+        args.peerId ?? null,
+        JSON.stringify(args.scopes ?? DEFAULT_MEMBER_SCOPES),
+        now,
+        now,
+      );
+    this.bumpKeyEpoch(args.circleId, now);
+  }
+
+  /** Update a member's mesh dial target from a SIGNED presence/join body. */
+  setMemberPeerId(circleId: string, memberPubkey: string, peerId: string): void {
+    this.db
+      .prepare(
+        `UPDATE circle_members SET peer_id = ?, updated_at = ?
+          WHERE circle_id = ? AND member_pubkey = ?`,
+      )
+      .run(peerId, Date.now(), circleId, memberPubkey);
+  }
+
+  /**
+   * A member leaves / is evicted (node-local). Balances are NOT erased (they
+   * live in the ledger). Does NOT bump the key epoch: the epoch only blinds
+   * the gossip topic NAME, which an evictee already knows (they know the
+   * circleId), so a bump grants no read-exclusion — and bumping on only one
+   * node desyncs the remaining members' topic home (§5.5 review F2/F3). Write
+   * refusal is total regardless (memberHasScope default-denies non-active).
+   */
+  removeMember(circleId: string, memberPubkey: string, now: number = Date.now()): void {
+    this.db
+      .prepare(
+        `UPDATE circle_members SET status = 'left', peer_id = NULL, updated_at = ?
+          WHERE circle_id = ? AND member_pubkey = ? AND status != 'left'`,
+      )
+      .run(now, circleId, memberPubkey);
+    // M5: their sending keys only decrypt frames this node now refuses anyway
+    // (writes are default-denied for a 'left' member). Drop the material.
+    this.db
+      .prepare(`DELETE FROM circle_sender_keys WHERE circle_id = ? AND sender_pubkey = ?`)
+      .run(circleId, memberPubkey);
+  }
+
+  /**
+   * Stage4 MED-7 (partial): is `peerId` already the dial target of a DIFFERENT
+   * active member of this circle? A peer_id is a self-claimed hint, so a
+   * collision means someone is trying to capture another member's dials.
+   */
+  peerIdHeldByOther(circleId: string, memberPubkey: string, peerId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM circle_members
+          WHERE circle_id = ? AND peer_id = ? AND member_pubkey != ? AND status = 'active'
+          LIMIT 1`,
+      )
+      .get(circleId, peerId, memberPubkey);
+    return row !== undefined && row !== null;
+  }
+
+  getCircle(circleId: string): Circle | null {
+    const row = this.db.prepare(`SELECT * FROM circles WHERE circle_id = ?`).get(circleId) as
+      | CircleRow
+      | undefined;
+    return row ? rowToCircle(row) : null;
+  }
+
+  /** Count of ACTIVE members (cheap roster-cap check). */
+  activeMemberCount(circleId: string): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM circle_members WHERE circle_id = ? AND status = 'active'`,
+        )
+        .get(circleId) as { n: number }
+    ).n;
+  }
+
+  /** Active members of a circle. */
+  getMembers(circleId: string): CircleMember[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM circle_members WHERE circle_id = ? AND status = 'active' ORDER BY joined_at`,
+      )
+      .all(circleId) as unknown as MemberRow[];
+    return rows.map(rowToMember);
+  }
+
+  getMember(circleId: string, memberPubkey: string): CircleMember | null {
+    const row = this.db
+      .prepare(`SELECT * FROM circle_members WHERE circle_id = ? AND member_pubkey = ?`)
+      .get(circleId, memberPubkey) as MemberRow | undefined;
+    return row ? rowToMember(row) : null;
+  }
+
+  /** Circles this member actively belongs to (ACTIVE only — the work set). */
+  getCirclesForMember(memberPubkey: string): Circle[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.* FROM circles c
+           JOIN circle_members m ON m.circle_id = c.circle_id
+          WHERE m.member_pubkey = ? AND m.status = 'active' AND c.status = 'active'
+          ORDER BY c.created_at`,
+      )
+      .all(memberPubkey) as unknown as CircleRow[];
+    return rows.map(rowToCircle);
+  }
+
+  /**
+   * Every circle this member belongs to for the UI — active, frozen, AND
+   * archived (active-only would hide frozen circles, making the unfreeze
+   * banner unreachable, and archived circles have nowhere to be restored
+   * from). Archived sort last.
+   */
+  getCirclesForMemberUi(memberPubkey: string): Circle[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.* FROM circles c
+           JOIN circle_members m ON m.circle_id = c.circle_id
+          WHERE m.member_pubkey = ? AND m.status = 'active'
+            AND c.status IN ('active', 'frozen', 'archived')
+          ORDER BY (c.status = 'archived') ASC, c.created_at ASC`,
+      )
+      .all(memberPubkey) as unknown as CircleRow[];
+    return rows.map(rowToCircle);
+  }
+
+  /**
+   * NODE-LOCAL rename: the circle's name on THIS node only (your label for
+   * the group, like a petname for a person). Never fans out — each member
+   * names their own copy; the wire never carries it.
+   */
+  renameCircle(circleId: string, name: string, now: number = Date.now()): boolean {
+    const res = this.db
+      .prepare(`UPDATE circles SET name = ?, updated_at = ? WHERE circle_id = ?`)
+      .run(name, now, circleId);
+    return Number(res.changes) === 1;
+  }
+
+  /** Hide a circle (reversible). Active or frozen → archived. */
+  archiveCircle(circleId: string, now: number = Date.now()): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE circles SET status = 'archived', updated_at = ?
+          WHERE circle_id = ? AND status IN ('active', 'frozen')`,
+      )
+      .run(now, circleId);
+    return Number(res.changes) === 1;
+  }
+
+  /** Restore an archived circle to active. */
+  unarchiveCircle(circleId: string, now: number = Date.now()): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE circles SET status = 'active', updated_at = ?
+          WHERE circle_id = ? AND status = 'archived'`,
+      )
+      .run(now, circleId);
+    return Number(res.changes) === 1;
+  }
+
+  /**
+   * Permanently delete a circle from THIS node — every circle-scoped table.
+   * Node-local: friends keep their own copy (there is no central authority to
+   * dissolve a P2P circle). Person/node-scoped tables (petnames, presence,
+   * settings, rate buckets) are NOT touched — they outlive any one circle.
+   */
+  deleteCircle(circleId: string): void {
+    const scoped = [
+      "circle_members",
+      "circle_messages",
+      "circle_events",
+      "circle_invites",
+      "circle_read_state",
+      "circle_pending_join",
+      "circle_pending_outbound",
+      "circle_disclosure_grants",
+      "circle_agent_drafts",
+      // M5: key material must not outlive the circle it encrypted.
+      "circle_sender_keys",
+      "circle_own_sender_keys",
+    ];
+    this.db.exec("BEGIN");
+    try {
+      for (const table of scoped) {
+        this.db.prepare(`DELETE FROM ${table} WHERE circle_id = ?`).run(circleId);
+      }
+      this.db.prepare(`DELETE FROM circles WHERE circle_id = ?`).run(circleId);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /**
+   * Authorization primitive the A2A friend-auth branch calls: does this
+   * member hold this scope in this circle right now? Default-deny — an
+   * unknown or non-active member (left, or any legacy status value) or a
+   * missing scope returns false.
+   */
+  memberHasScope(circleId: string, memberPubkey: string, scope: CircleScope): boolean {
+    const m = this.getMember(circleId, memberPubkey);
+    return m?.status === "active" && m.scopes.includes(scope);
+  }
+
+  /** The pinned payout wallet for a member; settlements must match this. */
+  pinnedWalletFor(circleId: string, memberPubkey: string): string | null {
+    return this.getMember(circleId, memberPubkey)?.pinnedWallet ?? null;
+  }
+
+  /**
+   * Update a member's transport endpoints (a2a URL, box pubkey, mailbox URL)
+   * from a SIGNED envelope body (join/presence). Never touches the pinned
+   * wallet — that requires the explicit re-pair ceremony.
+   */
+  updateMemberEndpoints(
+    circleId: string,
+    memberPubkey: string,
+    endpoints: {
+      a2aUrl?: string | null;
+      boxPubkey?: string | null;
+      mailboxUrl?: string | null;
+      // §5.6: a member's self-asserted name carried in presence, so a rename
+      // reaches EXISTING friends' rosters (not just new joins). Peer-controlled,
+      // capped by the caller; the petname layer defends against spoofing.
+      displayName?: string | null;
+    },
+    now: number = Date.now(),
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE circle_members SET
+           a2a_url = COALESCE(?, a2a_url),
+           box_pubkey = COALESCE(?, box_pubkey),
+           mailbox_url = COALESCE(?, mailbox_url),
+           display_name = COALESCE(?, display_name),
+           updated_at = ?
+         WHERE circle_id = ? AND member_pubkey = ?`,
+      )
+      .run(
+        endpoints.a2aUrl ?? null,
+        endpoints.boxPubkey ?? null,
+        endpoints.mailboxUrl ?? null,
+        endpoints.displayName ?? null,
+        now,
+        circleId,
+        memberPubkey,
+      );
+  }
+
+  // -------------------------------------------------------------------------
+  // Node-local settings (§5.6): this node's own circle profile (e.g. the
+  // display name friends see you by).
+  // -------------------------------------------------------------------------
+
+  getSetting(key: string): string | null {
+    const row = this.db.prepare(`SELECT value FROM circle_settings WHERE key = ?`).get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  }
+
+  setSetting(key: string, value: string, now: number = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO circle_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = ?`,
+      )
+      .run(key, value, now, now);
+  }
+
+  /**
+   * Mirror a circle we were invited into (PLAN-31 C1: after a successful
+   * circle/join redemption, the invitee stores the inviter's roster so both
+   * nodes hold the same membership view). Upserts the circle row with the
+   * REMOTE circle_id (identity across the mesh) and every roster member.
+   * Idempotent: re-mirroring refreshes names/urls without duplicating rows.
+   */
+  importCircle(
+    circle: {
+      circleId: string;
+      name: string;
+      kind: CircleKind;
+      creatorPubkey: string;
+      keyEpoch: number;
+      createdAt: number;
+    },
+    members: Array<{
+      memberPubkey: string;
+      displayName?: string | null;
+      pinnedWallet?: string | null;
+      a2aUrl?: string | null;
+      boxPubkey?: string | null;
+      mailboxUrl?: string | null;
+      role?: "creator" | "member";
+      scopes?: CircleScope[];
+      joinedAt?: number;
+    }>,
+    now: number = Date.now(),
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO circles
+           (circle_id, name, kind, creator_pubkey, key_epoch, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+         ON CONFLICT(circle_id) DO UPDATE SET
+           name = excluded.name,
+           kind = excluded.kind,
+           key_epoch = MAX(circles.key_epoch, excluded.key_epoch),
+           -- Re-accepting an invite to a circle you ARCHIVED restores it
+           -- (else it re-mirrors but stays hidden). Frozen stays frozen —
+           -- that needs the deliberate unfreeze, not a silent re-import.
+           status = CASE WHEN circles.status = 'archived' THEN 'active' ELSE circles.status END,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        circle.circleId,
+        circle.name,
+        circle.kind,
+        circle.creatorPubkey,
+        circle.keyEpoch,
+        circle.createdAt,
+        now,
+      );
+    for (const m of members) {
+      this.db
+        .prepare(
+          `INSERT INTO circle_members
+             (circle_id, member_pubkey, display_name, pinned_wallet, a2a_url, box_pubkey,
+              mailbox_url, role, scopes_json, status, joined_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+           ON CONFLICT(circle_id, member_pubkey) DO UPDATE SET
+             display_name = excluded.display_name,
+             pinned_wallet = excluded.pinned_wallet,
+             a2a_url = excluded.a2a_url,
+             box_pubkey = COALESCE(excluded.box_pubkey, circle_members.box_pubkey),
+             mailbox_url = COALESCE(excluded.mailbox_url, circle_members.mailbox_url),
+             role = excluded.role,
+             scopes_json = excluded.scopes_json,
+             status = 'active',
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          circle.circleId,
+          m.memberPubkey,
+          m.displayName ?? null,
+          m.pinnedWallet ?? null,
+          m.a2aUrl ?? null,
+          m.boxPubkey ?? null,
+          m.mailboxUrl ?? null,
+          m.role ?? "member",
+          JSON.stringify(m.scopes ?? DEFAULT_MEMBER_SCOPES),
+          m.joinedAt ?? now,
+          now,
+        );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Petnames (PLAN-36 §5.6): node-local, per-person labels. Keyed by pubkey so
+  // one label names a person across every shared circle. Never synced.
+  // -------------------------------------------------------------------------
+
+  /** All petnames as pubkey -> label (node-local; the viewer's private map). */
+  getPetnames(): Map<string, string> {
+    const rows = this.db
+      .prepare(`SELECT member_pubkey, petname FROM circle_petnames`)
+      .all() as unknown as Array<{ member_pubkey: string; petname: string }>;
+    return new Map(rows.map((r) => [r.member_pubkey, r.petname]));
+  }
+
+  /** Set (or replace) our private label for a person. Empty label clears it. */
+  setPetname(memberPubkey: string, petname: string, now: number = Date.now()): void {
+    const label = petname.trim().slice(0, 80);
+    if (!label) {
+      this.clearPetname(memberPubkey);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO circle_petnames (member_pubkey, petname, created_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(member_pubkey) DO UPDATE SET petname = excluded.petname, updated_at = ?`,
+      )
+      .run(memberPubkey, label, now, now, now);
+  }
+
+  clearPetname(memberPubkey: string): void {
+    this.db.prepare(`DELETE FROM circle_petnames WHERE member_pubkey = ?`).run(memberPubkey);
+  }
+
+  /**
+   * Freeze a circle (fork detected in the event ledger, PLAN-31 §3.3: a
+   * same-seq divergence is cryptographic proof of tampering — writes stop
+   * and humans are surfaced). `reason` is the JSON fork evidence the UI
+   * shows the human. Unfreezing is a deliberate human act.
+   */
+  freezeCircle(circleId: string, now: number = Date.now(), reason: string | null = null): void {
+    this.db
+      .prepare(
+        `UPDATE circles SET status = 'frozen', freeze_reason = ?, updated_at = ?
+          WHERE circle_id = ?`,
+      )
+      .run(reason, now, circleId);
+  }
+
+  /**
+   * The deliberate human act that ends a freeze: resume writes, and MOVE the
+   * fork evidence into the `forgiven_forks` audit trail (never destroyed).
+   * Only a frozen circle can be unfrozen (returns false otherwise).
+   * Node-local: each member's node froze independently and each member's
+   * human decides independently. The forked author's CHAIN stays divergent —
+   * their future tab/canvas events may still chain-break until they recover —
+   * but conversation and everyone else's events resume. Because the author is
+   * now forgiven, replays of their fork are rejected WITHOUT re-freezing
+   * (isForkForgiven) — reviewed once is reviewed; a fork from a different
+   * member still freezes.
+   */
+  unfreezeCircle(circleId: string, now: number = Date.now()): boolean {
+    const circle = this.getCircle(circleId);
+    if (!circle || circle.status !== "frozen") return false;
+    let forgiven: unknown[] = [];
+    const row = this.db
+      .prepare(`SELECT forgiven_forks FROM circles WHERE circle_id = ?`)
+      .get(circleId) as { forgiven_forks: string | null } | undefined;
+    try {
+      const parsed = JSON.parse(row?.forgiven_forks ?? "[]") as unknown;
+      if (Array.isArray(parsed)) forgiven = parsed;
+    } catch {
+      /* corrupt audit trail: start fresh rather than fail the recovery */
+    }
+    if (circle.freezeReason) {
+      let evidence: Record<string, unknown> = {};
+      try {
+        evidence = JSON.parse(circle.freezeReason) as Record<string, unknown>;
+      } catch {
+        evidence = { raw: circle.freezeReason };
+      }
+      forgiven.push({ ...evidence, forgiven_at: now });
+      forgiven = forgiven.slice(-20); // bounded audit trail
+    }
+    const res = this.db
+      .prepare(
+        `UPDATE circles SET status = 'active', freeze_reason = NULL, forgiven_forks = ?,
+                updated_at = ?
+          WHERE circle_id = ? AND status = 'frozen'`,
+      )
+      .run(JSON.stringify(forgiven), now, circleId);
+    return Number(res.changes) === 1;
+  }
+
+  /**
+   * Has the human already reviewed (and forgiven) a fork from this author in
+   * this circle? Used by the fork branch to reject replays without
+   * re-freezing — otherwise one replayed envelope (a member restored from
+   * backup, or a griefer) puts the circle straight back in the freezer after
+   * every unfreeze. A determined attacker inside the circle can still fork at
+   * a DIFFERENT seq only by rewriting more of their own history — the audit
+   * trail names them each time; eviction is the §5.5 primitive.
+   */
+  isForkForgiven(circleId: string, authorPubkey: string): boolean {
+    const row = this.db
+      .prepare(`SELECT forgiven_forks FROM circles WHERE circle_id = ?`)
+      .get(circleId) as { forgiven_forks: string | null } | undefined;
+    if (!row?.forgiven_forks) return false;
+    try {
+      const parsed = JSON.parse(row.forgiven_forks) as Array<{ author_pubkey?: string }>;
+      return Array.isArray(parsed) && parsed.some((f) => f.author_pubkey === authorPubkey);
+    } catch {
+      return false;
+    }
+  }
+
+  /** True when the circle exists and accepts writes (active, not frozen). */
+  isWritable(circleId: string): boolean {
+    return this.getCircle(circleId)?.status === "active";
+  }
+
+  private bumpKeyEpoch(circleId: string, now: number): void {
+    this.db
+      .prepare(`UPDATE circles SET key_epoch = key_epoch + 1, updated_at = ? WHERE circle_id = ?`)
+      .run(now, circleId);
+  }
+}

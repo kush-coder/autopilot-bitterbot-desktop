@@ -1,0 +1,168 @@
+import type { Server as HttpServer } from "node:http";
+import type { WebSocketServer } from "ws";
+import type { CanvasHostHandler, CanvasHostServer } from "../canvas-host/server.js";
+import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
+import type { CirclesSchedulerHandle } from "../circles/scheduler.js";
+import { stopGmailWatcher } from "../hooks/gmail-watcher.js";
+import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
+import { flushSystemEventPersistence } from "../infra/system-events.js";
+import { flushUsageLedger, stopUsageLedger } from "../infra/usage-ledger.js";
+import type { PluginServicesHandle } from "../plugins/services.js";
+import type { EventLoopMonitorHandle } from "./event-loop-monitor.js";
+
+export function createGatewayCloseHandler(params: {
+  tailscaleCleanup: (() => Promise<void>) | null;
+  canvasHost: CanvasHostHandler | null;
+  canvasHostServer: CanvasHostServer | null;
+  stopChannel: (name: ChannelId, accountId?: string) => Promise<void>;
+  pluginServices: PluginServicesHandle | null;
+  heartbeatRunner: HeartbeatRunner;
+  nodePresenceTimers: Map<string, ReturnType<typeof setInterval>>;
+  broadcast: (event: string, payload: unknown, opts?: { dropIfSlow?: boolean }) => void;
+  tickInterval: ReturnType<typeof setInterval>;
+  healthInterval: ReturnType<typeof setInterval>;
+  dedupeCleanup: ReturnType<typeof setInterval>;
+  eventLoopMonitor: EventLoopMonitorHandle;
+  circlesScheduler: CirclesSchedulerHandle;
+  stopUpdateCheck: (() => void) | null;
+  agentUnsub: (() => void) | null;
+  heartbeatUnsub: (() => void) | null;
+  /** PLAN-50 */
+  usageUnsub?: (() => void) | null;
+  usageBudgetUnsub?: (() => void) | null;
+  usageMetricsUnsub?: (() => void) | null;
+  chatRunState: { clear: () => void };
+  clients: Set<{ socket: { close: (code: number, reason: string) => void } }>;
+  configReloader: { stop: () => Promise<void> };
+  browserControl: { stop: () => Promise<void> } | null;
+  orchestratorBridge?: { stop: () => Promise<void> } | null;
+  computeMesh?: { stop: () => Promise<void> };
+  peerRpcTransport?: { stop: () => void };
+  wss: WebSocketServer;
+  httpServer: HttpServer;
+  httpServers?: HttpServer[];
+  /** Release the A2A SQLite handle. No-op when A2A is disabled. */
+  closeA2a?: () => void;
+}) {
+  return async (opts?: { reason?: string; restartExpectedMs?: number | null }) => {
+    const reasonRaw = typeof opts?.reason === "string" ? opts.reason.trim() : "";
+    const reason = reasonRaw || "gateway stopping";
+    const restartExpectedMs =
+      typeof opts?.restartExpectedMs === "number" && Number.isFinite(opts.restartExpectedMs)
+        ? Math.max(0, Math.floor(opts.restartExpectedMs))
+        : null;
+    if (params.tailscaleCleanup) {
+      await params.tailscaleCleanup();
+    }
+    if (params.canvasHost) {
+      try {
+        await params.canvasHost.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (params.canvasHostServer) {
+      try {
+        await params.canvasHostServer.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const plugin of listChannelPlugins()) {
+      await params.stopChannel(plugin.id);
+    }
+    if (params.pluginServices) {
+      await params.pluginServices.stop().catch(() => {});
+    }
+    await stopGmailWatcher();
+    params.heartbeatRunner.stop();
+    for (const timer of params.nodePresenceTimers.values()) {
+      clearInterval(timer);
+    }
+    params.nodePresenceTimers.clear();
+    params.broadcast("shutdown", {
+      reason,
+      restartExpectedMs,
+    });
+    clearInterval(params.tickInterval);
+    clearInterval(params.healthInterval);
+    clearInterval(params.dedupeCleanup);
+    params.eventLoopMonitor.stop();
+    params.circlesScheduler.stop();
+    params.stopUpdateCheck?.();
+    if (params.agentUnsub) {
+      try {
+        params.agentUnsub();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (params.heartbeatUnsub) {
+      try {
+        params.heartbeatUnsub();
+      } catch {
+        /* ignore */
+      }
+    }
+    // PLAN-50: stop streaming usage rows and close the ledger.
+    for (const unsub of [params.usageUnsub, params.usageBudgetUnsub, params.usageMetricsUnsub]) {
+      if (unsub) {
+        try {
+          unsub();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    try {
+      // Drain queued rows (embeddings/hidden lanes have no reconcile safety net) before closing.
+      await Promise.race([flushUsageLedger(), new Promise((r) => setTimeout(r, 2_000))]);
+      stopUsageLedger();
+      // PLAN-53 E7: whatever is still queued for a session is on disk before exit.
+      flushSystemEventPersistence();
+    } catch {
+      // ignore
+    }
+    params.chatRunState.clear();
+    for (const c of params.clients) {
+      try {
+        c.socket.close(1012, "service restart");
+      } catch {
+        /* ignore */
+      }
+    }
+    params.clients.clear();
+    await params.configReloader.stop().catch(() => {});
+    if (params.browserControl) {
+      await params.browserControl.stop().catch(() => {});
+    }
+    if (params.orchestratorBridge) {
+      params.peerRpcTransport?.stop();
+      await params.computeMesh?.stop().catch(() => {});
+      await params.orchestratorBridge.stop().catch(() => {});
+    }
+    await new Promise<void>((resolve) => params.wss.close(() => resolve()));
+    const servers =
+      params.httpServers && params.httpServers.length > 0
+        ? params.httpServers
+        : [params.httpServer];
+    for (const server of servers) {
+      const httpServer = server as HttpServer & {
+        closeIdleConnections?: () => void;
+      };
+      if (typeof httpServer.closeIdleConnections === "function") {
+        httpServer.closeIdleConnections();
+      }
+      await new Promise<void>((resolve, reject) =>
+        httpServer.close((err) => (err ? reject(err) : resolve())),
+      );
+    }
+    if (params.closeA2a) {
+      try {
+        params.closeA2a();
+      } catch {
+        /* best-effort */
+      }
+    }
+  };
+}

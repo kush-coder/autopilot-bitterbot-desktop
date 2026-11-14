@@ -1,0 +1,531 @@
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { applyBackoff, backoffDelayMs } from "./backoff.js";
+import { runIsolatedJob } from "./isolated-agent.js";
+import { runMainSessionJob } from "./main-session.js";
+import { computeNextRunAt, oneShotTime } from "./schedule.js";
+import {
+  appendRun,
+  loadJobsFile,
+  resolveCronPaths,
+  saveJobsFile,
+  type CronStorePaths,
+} from "./store.js";
+import type { CronEngineStatus, CronJob, CronRun, CronRunStatus } from "./types.js";
+import { postFinishedRunWebhook, type CronWebhookConfig } from "./webhook.js";
+
+const log = createSubsystemLogger("gateway/cron");
+const DEFAULT_TICK_MS = 5_000;
+const STARTUP_GRACE_MS = 1_500;
+
+export type CronEngineOptions = {
+  storePath?: string;
+  enabled?: boolean;
+  maxConcurrentRuns?: number;
+  webhook?: string;
+  webhookToken?: string;
+  tickMs?: number;
+  // Fired after every job run terminates (success or failure). Tests rely on
+  // this hook to avoid sleep-polling.
+  onRunFinished?: (run: CronRun) => void;
+  // Allow tests to override the runners.
+  runners?: {
+    main?: typeof runMainSessionJob;
+    isolated?: typeof runIsolatedJob;
+  };
+  nowMs?: () => number;
+  /**
+   * Something the owner or the UI should hear about: every finished run, a
+   * job turned off after failing repeatedly, a one-shot that failed for good.
+   */
+  onEvent?: (event: CronEngineEvent) => void;
+  /**
+   * Turn a recurring job off after this many failures in a row. It would
+   * otherwise fail every hour for ever with nobody told. 0 never turns it off.
+   */
+  autoDisableAfterErrors?: number;
+};
+
+export const DEFAULT_AUTO_DISABLE_AFTER_ERRORS = 8;
+
+export type CronEngineEvent =
+  /** `job` is null when the run deleted it (a one-shot that succeeded). */
+  | { kind: "run"; run: CronRun; job: CronJob | null }
+  | { kind: "disabled"; run: CronRun; job: CronJob }
+  | { kind: "gave-up"; run: CronRun; job: CronJob };
+
+type RunOutcome = {
+  status: CronRunStatus;
+  durationMs: number;
+  error?: string;
+};
+
+export class CronEngine {
+  private readonly opts: CronEngineOptions;
+  private readonly paths: CronStorePaths;
+  private jobs: CronJob[] = [];
+  private inFlight = new Set<string>();
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+  private flushQueued = false;
+  private flushing = false;
+  private dirty = false;
+  private nowMs: () => number;
+
+  constructor(opts: CronEngineOptions = {}) {
+    this.opts = opts;
+    this.paths = resolveCronPaths({ storePath: opts.storePath });
+    this.nowMs = opts.nowMs ?? Date.now;
+  }
+
+  async start(): Promise<void> {
+    if (this.running) {
+      return;
+    }
+    if (this.opts.enabled === false) {
+      log.info(`cron engine disabled (storePath=${this.paths.jobsFile})`);
+      return;
+    }
+    const file = await loadJobsFile(this.paths.jobsFile);
+    this.jobs = file.jobs.map(this.refreshDerived.bind(this));
+    this.running = true;
+    log.info(`cron engine started — ${this.jobs.length} job(s) loaded from ${this.paths.jobsFile}`);
+    // Light startup grace before the first tick so booting services are ready.
+    setTimeout(() => this.scheduleTick(), STARTUP_GRACE_MS).unref?.();
+    if (this.dirty) {
+      await this.flush();
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this.dirty || this.flushQueued) {
+      await this.flush();
+    }
+  }
+
+  status(): CronEngineStatus {
+    let nextWakeAtMs: number | null = null;
+    for (const job of this.jobs) {
+      if (!job.enabled || typeof job.nextRunAt !== "number") {
+        continue;
+      }
+      if (nextWakeAtMs === null || job.nextRunAt < nextWakeAtMs) {
+        nextWakeAtMs = job.nextRunAt;
+      }
+    }
+    return {
+      enabled: this.opts.enabled !== false,
+      running: this.running,
+      storePath: this.paths.jobsFile,
+      jobs: this.jobs.length,
+      enabledJobs: this.jobs.filter((job) => job.enabled).length,
+      inFlight: this.inFlight.size,
+      maxConcurrentRuns: this.opts.maxConcurrentRuns ?? 1,
+      webhookConfigured: Boolean(this.opts.webhook),
+      nextWakeAtMs,
+    };
+  }
+
+  listJobs(): CronJob[] {
+    return this.jobs.map((job) => ({ ...job }));
+  }
+
+  getJob(jobId: string): CronJob | undefined {
+    const found = this.jobs.find((job) => job.jobId === jobId);
+    return found ? { ...found } : undefined;
+  }
+
+  paths_(): CronStorePaths {
+    return this.paths;
+  }
+
+  async upsertJob(job: CronJob): Promise<CronJob> {
+    const existingIndex = this.jobs.findIndex((entry) => entry.jobId === job.jobId);
+    const wasOff = existingIndex >= 0 && !this.jobs[existingIndex].enabled;
+    // Turning a job back on is a fresh start. Carrying the old failure count
+    // over would put it on a long backoff and turn it off again at the very
+    // next failure.
+    const next = this.refreshDerived(
+      wasOff && job.enabled ? { ...job, consecutiveErrors: 0 } : job,
+    );
+    if (existingIndex >= 0) {
+      this.jobs[existingIndex] = next;
+    } else {
+      this.jobs.push(next);
+    }
+    await this.flush();
+    this.scheduleTick();
+    return { ...next };
+  }
+
+  async removeJob(jobId: string): Promise<boolean> {
+    const before = this.jobs.length;
+    this.jobs = this.jobs.filter((job) => job.jobId !== jobId);
+    if (this.jobs.length === before) {
+      return false;
+    }
+    await this.flush();
+    return true;
+  }
+
+  // Manually trigger a single job. `mode === "due"` only runs when the job is
+  // currently due; `force` (default) runs unconditionally.
+  async runJob(jobId: string, mode: "force" | "due" = "force"): Promise<CronRun> {
+    const job = this.jobs.find((entry) => entry.jobId === jobId);
+    if (!job) {
+      throw new Error(`cron job not found: ${jobId}`);
+    }
+    if (mode === "due") {
+      // A job with no next run is not scheduled, so it is not due.
+      const due = typeof job.nextRunAt === "number" && job.nextRunAt <= this.nowMs();
+      if (!due) {
+        return this.recordSkip(jobId, "not-due", "manual-due");
+      }
+    }
+    if (this.inFlight.has(jobId)) {
+      return this.recordSkip(jobId, "already-running", "manual");
+    }
+    return this.runOne(job, mode === "due" ? "manual-due" : "manual");
+  }
+
+  private scheduleTick(): void {
+    if (!this.running || this.timer) {
+      return;
+    }
+    const tickMs = this.opts.tickMs ?? DEFAULT_TICK_MS;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.tick();
+    }, tickMs);
+    this.timer.unref?.();
+  }
+
+  private async tick(): Promise<void> {
+    if (!this.running) {
+      return;
+    }
+    try {
+      await this.fireDueJobs();
+    } catch (err) {
+      log.error(`tick failed: ${formatErr(err)}`);
+    } finally {
+      this.scheduleTick();
+    }
+  }
+
+  private async fireDueJobs(): Promise<void> {
+    const now = this.nowMs();
+    const due = this.jobs.filter((job) => {
+      if (!job.enabled) {
+        return false;
+      }
+      if (this.inFlight.has(job.jobId)) {
+        return false;
+      }
+      const next = job.nextRunAt ?? 0;
+      return next > 0 && next <= now;
+    });
+    if (due.length === 0) {
+      return;
+    }
+    const cap = Math.max(1, this.opts.maxConcurrentRuns ?? 1);
+    const slots = Math.max(0, cap - this.inFlight.size);
+    const batch = due.slice(0, slots);
+    await Promise.all(batch.map((job) => this.runOne(job, "schedule")));
+  }
+
+  private async runOne(job: CronJob, trigger: CronRun["trigger"]): Promise<CronRun> {
+    this.inFlight.add(job.jobId);
+    const startedAt = this.nowMs();
+    // Recorded and flushed before the run: if the process dies mid-run, the
+    // next start must see that this job was started (see isMissedOneShot).
+    job.lastStartedAt = startedAt;
+    this.replaceJob(job);
+    try {
+      await this.flush();
+    } catch (err) {
+      log.warn(`could not persist the start of ${job.jobId}: ${formatErr(err)}`);
+    }
+    let outcome: RunOutcome;
+    try {
+      outcome = await this.dispatch(job);
+    } catch (err) {
+      outcome = {
+        status: "error",
+        durationMs: this.nowMs() - startedAt,
+        error: formatErr(err),
+      };
+    }
+    if (typeof outcome.durationMs !== "number" || !Number.isFinite(outcome.durationMs)) {
+      outcome.durationMs = this.nowMs() - startedAt;
+    }
+    const run: CronRun = {
+      ts: startedAt,
+      jobId: job.jobId,
+      status: outcome.status,
+      durationMs: outcome.durationMs,
+      error: outcome.error,
+      trigger,
+    };
+    await this.bookkeeping(job, run);
+    this.inFlight.delete(job.jobId);
+    return run;
+  }
+
+  private async dispatch(job: CronJob): Promise<RunOutcome> {
+    const started = this.nowMs();
+    try {
+      if (job.sessionTarget === "main") {
+        const fn = this.opts.runners?.main ?? runMainSessionJob;
+        await fn(job);
+      } else {
+        const fn = this.opts.runners?.isolated ?? runIsolatedJob;
+        await fn(job);
+      }
+      return { status: "ok", durationMs: this.nowMs() - started };
+    } catch (err) {
+      return {
+        status: "error",
+        durationMs: this.nowMs() - started,
+        error: formatErr(err),
+      };
+    }
+  }
+
+  private async bookkeeping(job: CronJob, run: CronRun): Promise<void> {
+    job.lastRunAt = run.ts;
+    job.lastRunStatus = run.status;
+
+    const isOneShot = job.schedule.kind === "at";
+    const isTerminal = run.status === "ok" || run.status === "error" || run.status === "skipped";
+
+    let outcome: "disabled" | "gave-up" | null = null;
+    let deleted = false;
+    if (isOneShot && isTerminal) {
+      const shouldDelete = job.deleteAfterRun !== false && run.status === "ok";
+      const errors = run.status === "error" ? (job.consecutiveErrors ?? 0) + 1 : 0;
+      const retryAt = run.status === "error" ? this.nowMs() + backoffDelayMs(errors) : null;
+      if (shouldDelete) {
+        this.jobs = this.jobs.filter((entry) => entry.jobId !== job.jobId);
+        deleted = true;
+      } else if (
+        retryAt !== null &&
+        typeof job.retryUntilMs === "number" &&
+        retryAt <= job.retryUntilMs
+      ) {
+        // Asked to keep trying until a deadline, and there is still time.
+        job.consecutiveErrors = errors;
+        job.nextRunAt = retryAt;
+        job.updatedAt = this.nowMs();
+        this.replaceJob(job);
+      } else {
+        job.enabled = false;
+        job.nextRunAt = undefined;
+        // Keep the count: resetting it made a failed one-shot look clean.
+        job.consecutiveErrors = errors;
+        job.updatedAt = this.nowMs();
+        this.replaceJob(job);
+        if (run.status === "error") {
+          outcome = "gave-up";
+        }
+      }
+    } else {
+      if (run.status === "error") {
+        job.consecutiveErrors = (job.consecutiveErrors ?? 0) + 1;
+      } else if (run.status === "ok") {
+        job.consecutiveErrors = 0;
+      }
+      const limit = this.opts.autoDisableAfterErrors ?? DEFAULT_AUTO_DISABLE_AFTER_ERRORS;
+      if (run.status === "error" && limit > 0 && job.consecutiveErrors >= limit) {
+        job.enabled = false;
+        job.nextRunAt = undefined;
+        outcome = "disabled";
+        log.warn(`job ${job.jobId} turned off after ${job.consecutiveErrors} failures in a row`);
+      } else {
+        const next = this.nextFor(job, this.nowMs() + 1);
+        job.nextRunAt =
+          next === null ? undefined : applyBackoff(next, job.consecutiveErrors, this.nowMs());
+      }
+      job.updatedAt = this.nowMs();
+      this.replaceJob(job);
+    }
+
+    try {
+      await appendRun(this.paths.runsDir, run);
+    } catch (err) {
+      log.warn(`could not persist run history for ${job.jobId}: ${formatErr(err)}`);
+    }
+    await this.flush();
+    this.opts.onRunFinished?.(run);
+    this.emit({ kind: "run", run, job: deleted ? null : { ...job } });
+    if (outcome) {
+      this.emit({ kind: outcome, run, job: { ...job } });
+    }
+    if (job.notify && this.opts.webhook) {
+      const cfg: CronWebhookConfig = {
+        webhook: this.opts.webhook,
+        webhookToken: this.opts.webhookToken,
+      };
+      void postFinishedRunWebhook(cfg, {
+        jobId: run.jobId,
+        status: run.status,
+        durationMs: run.durationMs,
+        error: run.error,
+        ts: run.ts,
+        trigger: run.trigger,
+      });
+    }
+  }
+
+  private emit(event: CronEngineEvent): void {
+    try {
+      this.opts.onEvent?.(event);
+    } catch (err) {
+      log.warn(`cron event handler failed: ${formatErr(err)}`);
+    }
+  }
+
+  /** The next time a job is due after `from`; `every` jobs count from their anchor. */
+  private nextFor(job: CronJob, from: number): number | null {
+    if (job.schedule.kind === "every" && typeof job.everyAnchorMs === "number") {
+      const every = job.schedule.everyMs;
+      const steps = Math.floor((from - job.everyAnchorMs) / every) + 1;
+      return job.everyAnchorMs + Math.max(1, steps) * every;
+    }
+    return computeNextRunAt(job.schedule, from);
+  }
+
+  private replaceJob(job: CronJob): void {
+    const idx = this.jobs.findIndex((entry) => entry.jobId === job.jobId);
+    if (idx >= 0) {
+      this.jobs[idx] = { ...job };
+    }
+  }
+
+  private async recordSkip(
+    jobId: string,
+    error: string,
+    trigger: CronRun["trigger"],
+  ): Promise<CronRun> {
+    const run: CronRun = {
+      ts: this.nowMs(),
+      jobId,
+      status: "skipped",
+      error,
+      trigger,
+    };
+    try {
+      await appendRun(this.paths.runsDir, run);
+    } catch (err) {
+      log.warn(`could not persist skip for ${jobId}: ${formatErr(err)}`);
+    }
+    this.opts.onRunFinished?.(run);
+    return run;
+  }
+
+  private refreshDerived(job: CronJob): CronJob {
+    const next = { ...job };
+    if (typeof next.consecutiveErrors !== "number") {
+      next.consecutiveErrors = 0;
+    }
+    if (next.enabled) {
+      try {
+        const now = this.nowMs();
+        if (next.schedule.kind === "every" && typeof next.everyAnchorMs !== "number") {
+          // Anchored the first time the engine sees it, so the first run is a
+          // full interval away, as it always was.
+          next.everyAnchorMs = now;
+        }
+        const computed = this.nextFor(next, now);
+        const savedNext = job.nextRunAt;
+        if (next.schedule.kind === "every" && typeof savedNext === "number" && savedNext <= now) {
+          // Its slot came and went while the gateway was down. Recomputing
+          // from now used to push it a whole interval out on every restart,
+          // so a job with a long interval on a node that restarts could never
+          // run. Run it once now; the following run is back on the grid.
+          next.nextRunAt = now;
+        } else if (
+          next.schedule.kind === "at" &&
+          next.consecutiveErrors > 0 &&
+          typeof next.retryUntilMs === "number" &&
+          now < next.retryUntilMs
+        ) {
+          // A one-shot in the middle of its retries keeps its retry time.
+          next.nextRunAt = Math.max(typeof savedNext === "number" ? savedNext : now, now);
+        } else if (computed === null && isMissedOneShot(next, now)) {
+          // Its time passed while the gateway was down (or it was created
+          // with a time already in the past). Dropping it silently left
+          // reminders unsent and task wakeups hanging forever: run it at the
+          // next tick instead.
+          log.info(`one-shot job ${next.jobId} missed its time; running it at the next tick`);
+          next.nextRunAt = now;
+        } else {
+          next.nextRunAt =
+            computed === null
+              ? undefined
+              : applyBackoff(computed, next.consecutiveErrors ?? 0, now);
+        }
+      } catch (err) {
+        log.warn(`could not compute next run for job ${next.jobId}: ${formatErr(err)}`);
+        next.nextRunAt = undefined;
+      }
+    } else {
+      next.nextRunAt = undefined;
+    }
+    this.dirty = true;
+    return next;
+  }
+
+  private async flush(): Promise<void> {
+    this.flushQueued = true;
+    if (this.flushing) {
+      return;
+    }
+    this.flushing = true;
+    try {
+      while (this.flushQueued) {
+        this.flushQueued = false;
+        await saveJobsFile(this.paths.jobsFile, { version: 1, jobs: this.jobs });
+      }
+      this.dirty = false;
+    } finally {
+      this.flushing = false;
+    }
+  }
+}
+
+function formatErr(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return String(err);
+}
+
+/**
+ * How far behind a one-shot may be and still be caught up. Older than this it
+ * stays inert, as every missed one-shot did before: a reminder from last
+ * spring should not fire on the first start after an upgrade.
+ */
+export const MISSED_ONE_SHOT_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * A one-shot job that is enabled, was never started, and whose time is at
+ * most a week behind us. "Never started" rather than "never finished": a run
+ * that was interrupted (a restart, a crash, a job whose own turn restarts the
+ * gateway) must not start again, or it could repeat its side effects on
+ * every boot.
+ */
+function isMissedOneShot(job: CronJob, nowMs: number): boolean {
+  if (job.schedule.kind !== "at" || !job.enabled) {
+    return false;
+  }
+  if (job.lastRunAt !== undefined || job.lastStartedAt !== undefined) {
+    return false;
+  }
+  const scheduledAt = oneShotTime(job.schedule);
+  return scheduledAt !== null && nowMs - scheduledAt <= MISSED_ONE_SHOT_MAX_AGE_MS;
+}

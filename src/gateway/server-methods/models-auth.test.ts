@@ -1,0 +1,416 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { probeProviderKey } from "../../agents/auth-probe.js";
+import { ensureAuthProfileStore, resolveAuthProfileOrder } from "../../agents/auth-profiles.js";
+import { updateAuthProfileStoreWithLock } from "../../agents/auth-profiles/store.js";
+import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
+import { resolveApiKeyForProvider, resolveEnvApiKey } from "../../agents/model-auth.js";
+import { applyDefaultModelPrimaryUpdate, updateConfig } from "../../commands/models/shared.js";
+import { refreshGatewayModelCatalog } from "../server-model-catalog.js";
+import { modelsAuthHandlers } from "./models-auth.js";
+import { modelsHandlers } from "./models.js";
+
+vi.mock("../../config/config.js", () => ({
+  loadConfig: () => ({
+    models: {
+      providers: { "custom-local": { baseUrl: "http://127.0.0.1:1/v1", apiKey: "cfg-key" } },
+    },
+  }),
+}));
+vi.mock("../../agents/auth-profiles.js", () => ({
+  ensureAuthProfileStore: vi.fn(),
+  resolveAuthProfileOrder: vi.fn(),
+}));
+vi.mock("../../agents/auth-profiles/store.js", () => ({
+  updateAuthProfileStoreWithLock: vi.fn(),
+}));
+vi.mock("../../agents/model-auth.js", () => ({
+  resolveApiKeyForProvider: vi.fn(),
+  resolveEnvApiKey: vi.fn(),
+}));
+vi.mock("../../agents/auth-probe.js", () => ({
+  probeProviderKey: vi.fn(),
+}));
+vi.mock("../server-model-catalog.js", () => ({
+  refreshGatewayModelCatalog: vi.fn(async () => []),
+}));
+vi.mock("../../commands/models/shared.js", () => ({
+  updateConfig: vi.fn(),
+  applyDefaultModelPrimaryUpdate: vi.fn(),
+}));
+
+const SECRET = "sk-test-super-secret-value";
+
+function capture() {
+  const calls: Array<{ ok: boolean; payload?: unknown; error?: unknown }> = [];
+  const respond = (ok: boolean, payload?: unknown, error?: unknown) =>
+    calls.push({ ok, payload, error });
+  return { calls, respond };
+}
+
+function makeStore(): AuthProfileStore {
+  return {
+    version: 1,
+    profiles: {
+      "anthropic:default": { type: "api_key", provider: "anthropic", key: SECRET },
+    },
+    usageStats: {
+      "anthropic:default": { cooldownUntil: Date.now() + 60_000, errorCount: 3 },
+    },
+    order: { anthropic: ["anthropic:default"] },
+    lastGood: { anthropic: "anthropic:default" },
+  };
+}
+
+const context = {
+  loadGatewayModelCatalog: vi.fn(async () => [
+    { id: "claude-opus-4-8", name: "Claude Opus 4.8", provider: "anthropic" },
+    { id: "gpt-5.3", name: "GPT-5.3", provider: "openai" },
+  ]),
+} as never;
+
+beforeEach(() => {
+  vi.mocked(ensureAuthProfileStore).mockReset().mockReturnValue(makeStore());
+  vi.mocked(resolveAuthProfileOrder)
+    .mockReset()
+    .mockImplementation(({ provider }: { provider: string }) =>
+      provider === "anthropic" ? ["anthropic:default"] : [],
+    );
+  vi.mocked(resolveEnvApiKey)
+    .mockReset()
+    .mockImplementation((provider: string) =>
+      provider === "openai" ? { apiKey: SECRET, source: "env: OPENAI_API_KEY" } : null,
+    );
+  vi.mocked(resolveApiKeyForProvider).mockReset();
+  vi.mocked(probeProviderKey).mockReset().mockResolvedValue({ ok: true, status: 200 });
+  vi.mocked(updateAuthProfileStoreWithLock).mockReset();
+  vi.mocked(refreshGatewayModelCatalog).mockClear();
+});
+
+describe("models.auth.list", () => {
+  it("summarizes provider status with winning source and never leaks secrets", async () => {
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.list"]!({
+      params: {},
+      respond,
+      context,
+    } as never);
+
+    expect(calls[0].ok).toBe(true);
+    const payload = calls[0].payload as {
+      providers: Array<{
+        provider: string;
+        winningSource: string | null;
+        envPresent: boolean;
+        profiles: Array<{ profileId: string; inCooldown: boolean }>;
+        configKeyPresent: boolean;
+      }>;
+    };
+    const anthropic = payload.providers.find((p) => p.provider === "anthropic")!;
+    expect(anthropic.winningSource).toBe("profile:anthropic:default");
+    expect(anthropic.profiles[0].inCooldown).toBe(true);
+
+    const openai = payload.providers.find((p) => p.provider === "openai")!;
+    expect(openai.envPresent).toBe(true);
+    expect(openai.winningSource).toBe("env: OPENAI_API_KEY");
+
+    const custom = payload.providers.find((p) => p.provider === "custom-local")!;
+    expect(custom.configKeyPresent).toBe(true);
+    expect(custom.winningSource).toBe("models.json");
+
+    // Write-only contract: no stored secret may appear anywhere in the payload.
+    expect(JSON.stringify(payload)).not.toContain(SECRET);
+    expect(JSON.stringify(payload)).not.toContain("cfg-key");
+  });
+
+  it("keeps a retired provider only while a stale profile exists, marked retired (PLAN-56 Phase 1)", async () => {
+    const store = makeStore();
+    // google-gemini-cli: stale profile stored -> listed, flagged, deletable.
+    store.profiles["google-gemini-cli:default"] = {
+      type: "oauth",
+      provider: "google-gemini-cli",
+      access: "stale",
+      refresh: "stale",
+      expires: Date.now() + 60_000,
+    } as never;
+    store.order = { ...store.order, "google-gemini-cli": ["google-gemini-cli:default"] };
+    vi.mocked(ensureAuthProfileStore).mockReturnValue(store);
+    vi.mocked(resolveAuthProfileOrder).mockImplementation(({ provider }: { provider: string }) =>
+      provider === "anthropic"
+        ? ["anthropic:default"]
+        : provider === "google-gemini-cli"
+          ? ["google-gemini-cli:default"]
+          : [],
+    );
+    // google-antigravity: only in the catalog, no profile -> dropped.
+    const ctx = {
+      loadGatewayModelCatalog: vi.fn(async () => [
+        { id: "claude-opus-4-8", name: "Claude Opus 4.8", provider: "anthropic" },
+        { id: "x", name: "x", provider: "google-antigravity" },
+      ]),
+    } as never;
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.list"]!({ params: {}, respond, context: ctx } as never);
+    expect(calls[0].ok).toBe(true);
+    const providers = (
+      calls[0].payload as {
+        providers: Array<{ provider: string; retired?: string; profiles: unknown[] }>;
+      }
+    ).providers;
+    const gemini = providers.find((p) => p.provider === "google-gemini-cli");
+    expect(gemini?.retired).toBe("Google Gemini CLI OAuth");
+    expect(gemini?.profiles).toHaveLength(1);
+    expect(providers.find((p) => p.provider === "google-antigravity")).toBeUndefined();
+    expect(providers.find((p) => p.provider === "anthropic")?.retired).toBeUndefined();
+  });
+});
+
+describe("models.auth.test", () => {
+  it("probes a draft key without saving", async () => {
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.test"]!({
+      params: { provider: "anthropic", apiKey: `  ${SECRET}  ` },
+      respond,
+      context,
+    } as never);
+
+    expect(vi.mocked(probeProviderKey)).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "anthropic", apiKey: SECRET }),
+    );
+    expect(vi.mocked(updateAuthProfileStoreWithLock)).not.toHaveBeenCalled();
+    expect(calls[0].ok).toBe(true);
+    expect((calls[0].payload as { result: { ok: boolean } }).result.ok).toBe(true);
+  });
+
+  it("reports oauth credentials as unsupported instead of probing", async () => {
+    vi.mocked(resolveApiKeyForProvider).mockResolvedValue({
+      apiKey: "oauth-derived",
+      source: "profile:anthropic:oauth",
+      mode: "oauth",
+    });
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.test"]!({
+      params: { provider: "anthropic" },
+      respond,
+      context,
+    } as never);
+
+    expect(vi.mocked(probeProviderKey)).not.toHaveBeenCalled();
+    const payload = calls[0].payload as { result: { ok: boolean; unsupported?: boolean } };
+    expect(payload.result.ok).toBe(false);
+    expect(payload.result.unsupported).toBe(true);
+  });
+
+  it("rejects a caller baseUrl when probing a stored credential (exfiltration guard)", async () => {
+    vi.mocked(resolveApiKeyForProvider).mockResolvedValue({
+      apiKey: SECRET,
+      source: "profile:anthropic:default",
+      mode: "api-key",
+    });
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.test"]!({
+      params: { provider: "anthropic", baseUrl: "https://attacker.example/v1" },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(false);
+    expect(vi.mocked(probeProviderKey)).not.toHaveBeenCalled();
+  });
+
+  it("turns a missing-credential throw into a probe failure, not an RPC error", async () => {
+    vi.mocked(resolveApiKeyForProvider).mockRejectedValue(
+      new Error('No API key found for provider "openai".'),
+    );
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.test"]!({
+      params: { provider: "openai" },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(true);
+    const payload = calls[0].payload as { result: { ok: boolean; error?: string } };
+    expect(payload.result.ok).toBe(false);
+    expect(payload.result.error).toContain("No API key found");
+  });
+});
+
+describe("models.auth.set", () => {
+  it("writes a normalized api_key credential, clears cooldown state, busts the catalog", async () => {
+    const store = makeStore();
+    vi.mocked(updateAuthProfileStoreWithLock).mockImplementation(async ({ updater }) => {
+      updater(store);
+      return store;
+    });
+
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.set"]!({
+      params: { provider: "Anthropic", value: `  ${SECRET}\n` },
+      respond,
+      context,
+    } as never);
+
+    expect(calls[0].ok).toBe(true);
+    expect((calls[0].payload as { profileId: string }).profileId).toBe("anthropic:default");
+    expect(store.profiles["anthropic:default"]).toEqual({
+      type: "api_key",
+      provider: "anthropic",
+      key: SECRET,
+    });
+    // PLAN-37 H2: rotation must not inherit the dead key's cooldown.
+    expect(store.usageStats?.["anthropic:default"]).toBeUndefined();
+    expect(vi.mocked(refreshGatewayModelCatalog)).toHaveBeenCalled();
+    // The response never echoes the secret.
+    expect(JSON.stringify(calls[0].payload)).not.toContain(SECRET);
+  });
+
+  it("writes token credentials under a named profile", async () => {
+    const store = makeStore();
+    vi.mocked(updateAuthProfileStoreWithLock).mockImplementation(async ({ updater }) => {
+      updater(store);
+      return store;
+    });
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.set"]!({
+      params: {
+        provider: "github-copilot",
+        name: "Work Laptop",
+        credentialType: "token",
+        value: SECRET,
+      },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(true);
+    expect((calls[0].payload as { profileId: string }).profileId).toBe(
+      "github-copilot:work-laptop",
+    );
+    expect(store.profiles["github-copilot:work-laptop"]).toEqual({
+      type: "token",
+      provider: "github-copilot",
+      token: SECRET,
+    });
+  });
+
+  it("appends the new profile to an explicit stored order so it is not silently dead", async () => {
+    const store = makeStore();
+    store.order = { anthropic: ["anthropic:default"] };
+    vi.mocked(updateAuthProfileStoreWithLock).mockImplementation(async ({ updater }) => {
+      updater(store);
+      return store;
+    });
+    // Simulate the explicit-order world: the fresh profile is NOT in the
+    // effective rotation until the handler appends it.
+    vi.mocked(resolveAuthProfileOrder).mockImplementation(({ provider }: { provider: string }) =>
+      provider === "anthropic" ? ["anthropic:default"] : [],
+    );
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.set"]!({
+      params: { provider: "anthropic", name: "backup", value: SECRET },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(true);
+    expect(store.order?.anthropic).toEqual(["anthropic:default", "anthropic:backup"]);
+  });
+
+  it("rejects empty credentials", async () => {
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.set"]!({
+      params: { provider: "anthropic", value: "   " },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(false);
+    expect(vi.mocked(updateAuthProfileStoreWithLock)).not.toHaveBeenCalled();
+  });
+});
+
+describe("models.auth.delete", () => {
+  it("removes the profile plus its stats, order entries, and lastGood pointer", async () => {
+    const store = makeStore();
+    vi.mocked(updateAuthProfileStoreWithLock).mockImplementation(async ({ updater }) => {
+      updater(store);
+      return store;
+    });
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.delete"]!({
+      params: { profileId: "anthropic:default" },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(true);
+    expect(store.profiles["anthropic:default"]).toBeUndefined();
+    expect(store.usageStats?.["anthropic:default"]).toBeUndefined();
+    expect(store.order).toBeUndefined();
+    expect(store.lastGood?.anthropic).toBeUndefined();
+  });
+
+  it("errors on unknown profile ids", async () => {
+    const store = makeStore();
+    vi.mocked(updateAuthProfileStoreWithLock).mockImplementation(async ({ updater }) => {
+      updater(store);
+      return store;
+    });
+    const { calls, respond } = capture();
+    await modelsAuthHandlers["models.auth.delete"]!({
+      params: { profileId: "nope:missing" },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(false);
+  });
+});
+
+describe("models.setDefault", () => {
+  it("writes agents.defaults.model.primary via the CLI-shared update path", async () => {
+    vi.mocked(updateConfig).mockImplementation(async (mutator) => mutator({} as never));
+    vi.mocked(applyDefaultModelPrimaryUpdate).mockReturnValue({
+      agents: { defaults: { model: { primary: "openai/gpt-5.3" } } },
+    } as never);
+    const { calls, respond } = capture();
+    await modelsHandlers["models.setDefault"]!({
+      params: { model: "openai/gpt-5.3" },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(true);
+    expect((calls[0].payload as { model: string }).model).toBe("openai/gpt-5.3");
+    expect(vi.mocked(applyDefaultModelPrimaryUpdate)).toHaveBeenCalledWith(
+      expect.objectContaining({ modelRaw: "openai/gpt-5.3", field: "model" }),
+    );
+  });
+
+  it("maps an invalid ref to an INVALID_REQUEST error", async () => {
+    vi.mocked(updateConfig).mockRejectedValue(new Error("Invalid model reference: nope"));
+    const { calls, respond } = capture();
+    await modelsHandlers["models.setDefault"]!({
+      params: { model: "nope" },
+      respond,
+      context,
+    } as never);
+    expect(calls[0].ok).toBe(false);
+  });
+});
+
+describe("models.list refresh", () => {
+  it("busts the catalog cache when refresh:true", async () => {
+    const { calls, respond } = capture();
+    await modelsHandlers["models.list"]!({
+      params: { refresh: true },
+      respond,
+      context,
+    } as never);
+    expect(vi.mocked(refreshGatewayModelCatalog)).toHaveBeenCalled();
+    expect(calls[0].ok).toBe(true);
+  });
+
+  it("uses the cached catalog path by default", async () => {
+    const { calls, respond } = capture();
+    await modelsHandlers["models.list"]!({
+      params: {},
+      respond,
+      context,
+    } as never);
+    expect(vi.mocked(refreshGatewayModelCatalog)).not.toHaveBeenCalled();
+    expect(calls[0].ok).toBe(true);
+  });
+});

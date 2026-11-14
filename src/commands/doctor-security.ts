@@ -1,0 +1,246 @@
+import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
+import { listChannelPlugins } from "../channels/plugins/index.js";
+import type { ChannelId } from "../channels/plugins/types.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import type { BitterbotConfig, GatewayBindMode } from "../config/config.js";
+import { resolveGatewayAuth } from "../gateway/auth.js";
+import { isLoopbackHost, resolveGatewayBindHost } from "../gateway/net.js";
+import { readChannelAllowFromStore } from "../pairing/pairing-store.js";
+import { renderSection, type CheckResult, ok, warn, info } from "./doctor-check.js";
+
+/**
+ * Fold the flat warning-line list into structured findings: a line starting
+ * with "- " opens a finding; indented lines are continuations of the one
+ * before (fix hints, secondary sentences). Exported for tests.
+ *
+ * Severity: default warn, but deliberate lockdown states ("DMs: disabled",
+ * "DMs: locked … with no allowlist") are INFO — they are safe configurations
+ * the operator chose, and inflating them to warn would make every hardened
+ * node's --json report look degraded. Even the CRITICAL exposure lines stay
+ * warn (never error) on the contract — an exposed gateway is pre-existing
+ * config state, and blocking an update would not reduce the exposure.
+ */
+const NEUTRAL_SECURITY_LINE = /DMs: (disabled|locked)\b/;
+
+export function groupSecurityWarnings(lines: string[]): CheckResult[] {
+  const results: CheckResult[] = [];
+  for (const line of lines) {
+    if (line.startsWith("- ") || results.length === 0) {
+      const message = line.replace(/^- /, "");
+      results.push(NEUTRAL_SECURITY_LINE.test(message) ? info(message) : warn(message));
+    } else {
+      const prev = results[results.length - 1];
+      if (prev) prev.message += `\n${line}`;
+    }
+  }
+  return results;
+}
+
+export async function runSecurityChecks(cfg: BitterbotConfig) {
+  const warnings: string[] = [];
+  const auditHint = `- Run: ${formatCliCommand("bitterbot security audit --deep")}`;
+
+  // ===========================================
+  // GATEWAY NETWORK EXPOSURE CHECK
+  // ===========================================
+  // Check for dangerous gateway binding configurations
+  // that expose the gateway to network without proper auth
+
+  const gatewayBind = (cfg.gateway?.bind ?? "loopback") as string;
+  const customBindHost = cfg.gateway?.customBindHost?.trim();
+  const bindModes: GatewayBindMode[] = ["auto", "lan", "loopback", "custom", "tailnet"];
+  const bindMode = bindModes.includes(gatewayBind as GatewayBindMode)
+    ? (gatewayBind as GatewayBindMode)
+    : undefined;
+  const resolvedBindHost = bindMode
+    ? await resolveGatewayBindHost(bindMode, customBindHost)
+    : "0.0.0.0";
+  const isExposed = !isLoopbackHost(resolvedBindHost);
+
+  const resolvedAuth = resolveGatewayAuth({
+    authConfig: cfg.gateway?.auth,
+    env: process.env,
+    tailscaleMode: cfg.gateway?.tailscale?.mode ?? "off",
+  });
+  const authToken = resolvedAuth.token?.trim() ?? "";
+  const authPassword = resolvedAuth.password?.trim() ?? "";
+  const hasToken = authToken.length > 0;
+  const hasPassword = authPassword.length > 0;
+  const hasSharedSecret =
+    (resolvedAuth.mode === "token" && hasToken) ||
+    (resolvedAuth.mode === "password" && hasPassword);
+  const bindDescriptor = `"${gatewayBind}" (${resolvedBindHost})`;
+
+  if (isExposed) {
+    if (!hasSharedSecret) {
+      const authFixLines =
+        resolvedAuth.mode === "password"
+          ? [
+              `  Fix: ${formatCliCommand("bitterbot configure")} to set a password`,
+              `  Or switch to token: ${formatCliCommand("bitterbot config set gateway.auth.mode token")}`,
+            ]
+          : [
+              `  Fix: ${formatCliCommand("bitterbot doctor --fix")} to generate a token`,
+              `  Or set token directly: ${formatCliCommand(
+                "bitterbot config set gateway.auth.mode token",
+              )}`,
+            ];
+      warnings.push(
+        `- CRITICAL: Gateway bound to ${bindDescriptor} without authentication.`,
+        `  Anyone on your network (or internet if port-forwarded) can fully control your agent.`,
+        `  Fix: ${formatCliCommand("bitterbot config set gateway.bind loopback")}`,
+        ...authFixLines,
+      );
+    } else {
+      // Auth is configured, but still warn about network exposure
+      warnings.push(
+        `- WARNING: Gateway bound to ${bindDescriptor} (network-accessible).`,
+        `  Ensure your auth credentials are strong and not exposed.`,
+      );
+    }
+  }
+
+  // ===========================================
+  // A2A HTTP SURFACE EXPOSURE
+  // ===========================================
+  // POST /a2a executes agent tasks. Loopback callers are token-exempt by
+  // design; everything else must present a bearer token — so a non-loopback
+  // bind (docker-compose defaults to lan) or a tailnet mode puts the surface
+  // within reach of other machines and deserves a flag. authentication.type
+  // "none" on an exposed bind removes the token requirement entirely.
+  const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
+  const a2aEnabled = cfg.a2a?.enabled === true;
+  const a2aAuthType = cfg.a2a?.authentication?.type ?? "bearer";
+  if (a2aEnabled && (isExposed || tailscaleMode !== "off")) {
+    const reach = isExposed ? `bind ${bindDescriptor}` : `Tailscale mode "${tailscaleMode}"`;
+    if (a2aAuthType === "none") {
+      warnings.push(
+        `- CRITICAL: A2A endpoint (/a2a) is network-reachable (${reach}) with a2a.authentication.type="none".`,
+        `  Anyone who can reach the port can run agent tasks without a token.`,
+        `  Fix: ${formatCliCommand("bitterbot config set a2a.authentication.type bearer")}`,
+        `  Or disable: ${formatCliCommand("bitterbot config set a2a.enabled false")}`,
+      );
+    } else {
+      warnings.push(
+        `- WARNING: A2A endpoint (/a2a) is network-reachable (${reach}).`,
+        `  Non-loopback callers need the bearer token; keep it strong, or bind loopback / disable a2a.`,
+      );
+    }
+  }
+
+  const warnDmPolicy = async (params: {
+    label: string;
+    provider: ChannelId;
+    dmPolicy: string;
+    allowFrom?: Array<string | number> | null;
+    policyPath?: string;
+    allowFromPath: string;
+    approveHint: string;
+    normalizeEntry?: (raw: string) => string;
+  }) => {
+    const dmPolicy = params.dmPolicy;
+    const policyPath = params.policyPath ?? `${params.allowFromPath}policy`;
+    const configAllowFrom = (params.allowFrom ?? []).map((v) => String(v).trim());
+    const hasWildcard = configAllowFrom.includes("*");
+    const storeAllowFrom = await readChannelAllowFromStore(params.provider).catch(() => []);
+    const normalizedCfg = configAllowFrom
+      .filter((v) => v !== "*")
+      .map((v) => (params.normalizeEntry ? params.normalizeEntry(v) : v))
+      .map((v) => v.trim())
+      .filter(Boolean);
+    const normalizedStore = storeAllowFrom
+      .map((v) => (params.normalizeEntry ? params.normalizeEntry(v) : v))
+      .map((v) => v.trim())
+      .filter(Boolean);
+    const allowCount = new Set([...normalizedCfg, ...normalizedStore]).size;
+    const dmScope = cfg.session?.dmScope ?? "main";
+    const isMultiUserDm = hasWildcard || allowCount > 1;
+
+    if (dmPolicy === "open") {
+      const allowFromPath = `${params.allowFromPath}allowFrom`;
+      warnings.push(`- ${params.label} DMs: OPEN (${policyPath}="open"). Anyone can DM it.`);
+      if (!hasWildcard) {
+        warnings.push(
+          `- ${params.label} DMs: config invalid — "open" requires ${allowFromPath} to include "*".`,
+        );
+      }
+    }
+
+    if (dmPolicy === "disabled") {
+      warnings.push(`- ${params.label} DMs: disabled (${policyPath}="disabled").`);
+      return;
+    }
+
+    if (dmPolicy !== "open" && allowCount === 0) {
+      warnings.push(
+        `- ${params.label} DMs: locked (${policyPath}="${dmPolicy}") with no allowlist; unknown senders will be blocked / get a pairing code.`,
+      );
+      warnings.push(`  ${params.approveHint}`);
+    }
+
+    if (dmScope === "main" && isMultiUserDm) {
+      warnings.push(
+        `- ${params.label} DMs: multiple senders share the main session; run: ` +
+          formatCliCommand('bitterbot config set session.dmScope "per-channel-peer"') +
+          ' (or "per-account-channel-peer" for multi-account channels) to isolate sessions.',
+      );
+    }
+  };
+
+  for (const plugin of listChannelPlugins()) {
+    if (!plugin.security) {
+      continue;
+    }
+    const accountIds = plugin.config.listAccountIds(cfg);
+    const defaultAccountId = resolveChannelDefaultAccountId({
+      plugin,
+      cfg,
+      accountIds,
+    });
+    const account = plugin.config.resolveAccount(cfg, defaultAccountId);
+    const enabled = plugin.config.isEnabled ? plugin.config.isEnabled(account, cfg) : true;
+    if (!enabled) {
+      continue;
+    }
+    const configured = plugin.config.isConfigured
+      ? await plugin.config.isConfigured(account, cfg)
+      : true;
+    if (!configured) {
+      continue;
+    }
+    const dmPolicy = plugin.security.resolveDmPolicy?.({
+      cfg,
+      accountId: defaultAccountId,
+      account,
+    });
+    if (dmPolicy) {
+      await warnDmPolicy({
+        label: plugin.meta.label ?? plugin.id,
+        provider: plugin.id,
+        dmPolicy: dmPolicy.policy,
+        allowFrom: dmPolicy.allowFrom,
+        policyPath: dmPolicy.policyPath,
+        allowFromPath: dmPolicy.allowFromPath,
+        approveHint: dmPolicy.approveHint,
+        normalizeEntry: dmPolicy.normalizeEntry,
+      });
+    }
+    if (plugin.security.collectWarnings) {
+      const extra = await plugin.security.collectWarnings({
+        cfg,
+        accountId: defaultAccountId,
+        account,
+      });
+      if (extra?.length) {
+        warnings.push(...extra);
+      }
+    }
+  }
+
+  const results: CheckResult[] =
+    warnings.length > 0
+      ? groupSecurityWarnings(warnings)
+      : [ok("No channel security warnings detected.")];
+  results.push(info(auditHint.replace(/^- /, "")));
+  renderSection("Security", results);
+}

@@ -1,0 +1,1459 @@
+/**
+ * Agent tools for long-horizon Task management (PLAN-16).
+ *
+ * Phase A — `task_monitor` (event journal stream).
+ * Phase B — `task_create`, `task_update`, `task_get`, `task_list`,
+ *           `task_stop`, `task_output`.
+ * Phase C — `task_schedule_wakeup` (self-resume via cron).
+ * Phase D — `task_judge` (operator-initiated re-verification).
+ *
+ * Tools are exposed through `bitterbot-tools.ts`. They share a runtime
+ * dependency on the singleton `TaskStore` (started in `server.impl.ts`)
+ * and `EventJournal` (Phase A). When either is missing the tool returns
+ * a structured error rather than throwing.
+ */
+
+import crypto from "node:crypto";
+import { Type } from "@sinclair/typebox";
+import { getCronEngine } from "../../cron/active.js";
+import type { CronJob } from "../../cron/types.js";
+import { emitAgentEvent } from "../../infra/agent-events.js";
+import { getActiveEventJournal } from "../../infra/event-journal.js";
+import {
+  getTaskCheckContext,
+  parseTaskChecks,
+  runTaskChecks,
+  taskChecksHash,
+} from "../../tasks/checks.js";
+import {
+  buildTaskVerification,
+  DEFAULT_MAX_JUDGE_ROUNDS,
+  type TaskJudgeDecision,
+  emitTaskReward,
+  getJudgeLlmCall,
+  getJudgeModel,
+  runTaskJudge,
+} from "../../tasks/judge.js";
+import { getActiveTaskStore, type TaskStore } from "../../tasks/store.js";
+import type {
+  PlanStep,
+  PlanStepStatus,
+  Task,
+  TaskPlan,
+  TaskSource,
+  TaskStatus,
+} from "../../tasks/types.js";
+import { isTerminal, readTaskStaleFacts } from "../../tasks/types.js";
+import type { AnyAgentTool } from "./common.js";
+
+/** Hard cap on per-task scheduled wakeups to prevent runaway loops. */
+const DEFAULT_MAX_WAKEUPS = 50;
+import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import { currentRunIsNonOwner } from "../run-owner-context.js";
+import {
+  jsonResult,
+  readNumberParam,
+  readStringArrayParam,
+  readStringParam,
+  ToolInputError,
+} from "./common.js";
+
+type ExecuteFn = (
+  toolCallId: string,
+  params: Record<string, unknown>,
+) => Promise<AgentToolResult<unknown>>;
+
+/**
+ * Wrap a tool's execute body in a uniform error catch. Converts
+ * ToolInputError (thrown by readStringParam/readNumberParam when
+ * required:true is missing) into a structured `{ok:false,error}`
+ * response so callers see a consistent shape.
+ */
+function safeExecute(
+  fn: ExecuteFn,
+): (toolCallId: string, params: unknown) => Promise<AgentToolResult<unknown>> {
+  return async (toolCallId, params) => {
+    try {
+      return await fn(toolCallId, params as Record<string, unknown>);
+    } catch (err) {
+      if (err instanceof ToolInputError) {
+        return jsonResult({ ok: false, error: err.message });
+      }
+      throw err;
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_monitor (Phase A).
+// ---------------------------------------------------------------------------
+
+const MonitorSchema = Type.Object({
+  task_id: Type.String({
+    description: "Task id to monitor. Required.",
+    minLength: 1,
+  }),
+  since_seq: Type.Optional(
+    Type.Integer({
+      description:
+        "Return only events with journal seq strictly greater than this cursor. Use the " +
+        "seq of the last event you saw to poll incrementally. Omit on first call.",
+      minimum: 0,
+    }),
+  ),
+  streams: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Filter to specific event streams (e.g. ['tool', 'assistant', 'lifecycle', 'error']). " +
+        "Omit to receive all streams.",
+    }),
+  ),
+  limit: Type.Optional(
+    Type.Integer({
+      description: "Max events to return. Defaults to 200; capped at 2000.",
+      minimum: 1,
+      maximum: 2000,
+    }),
+  ),
+});
+
+export function createTaskMonitorTool(): AnyAgentTool {
+  return {
+    label: "Monitor Task",
+    name: "task_monitor",
+    description:
+      "Stream events from a running or completed long-horizon task. Returns durable " +
+      "events from the event journal (tool calls, lifecycle frames, assistant messages, " +
+      "errors) so you can watch a background task's progress without blocking. Poll " +
+      "incrementally using the `since_seq` cursor from the previous response. Use this " +
+      "after starting a task via task_create or after spawning a background subagent.",
+    parameters: MonitorSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const sinceSeq = readNumberParam(params, "since_seq", { integer: true });
+      const streams = readStringArrayParam(params, "streams");
+      const limit = readNumberParam(params, "limit", { integer: true }) ?? 200;
+
+      const journal = getActiveEventJournal();
+      if (!journal) {
+        return jsonResult({
+          ok: false,
+          error:
+            "event journal is not active. Set BITTERBOT_EVENT_JOURNAL=1 (default) and " +
+            "ensure the gateway is up.",
+        });
+      }
+
+      const events = journal.query({
+        taskId,
+        ...(typeof sinceSeq === "number" ? { sinceSeq } : {}),
+        ...(streams && streams.length > 0 ? { streams } : {}),
+        limit,
+      });
+      const last = events.length > 0 ? events[events.length - 1].seq : (sinceSeq ?? 0);
+      return jsonResult({
+        ok: true,
+        taskId,
+        count: events.length,
+        nextSinceSeq: last,
+        events,
+      });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_create (Phase B).
+// ---------------------------------------------------------------------------
+
+const PlanStepSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 64 }),
+  title: Type.String({ minLength: 1, maxLength: 200 }),
+  description: Type.Optional(Type.String()),
+  status: Type.Optional(
+    Type.Union([
+      Type.Literal("pending"),
+      Type.Literal("in_progress"),
+      Type.Literal("completed"),
+      Type.Literal("skipped"),
+      Type.Literal("failed"),
+    ]),
+  ),
+});
+
+const CreateSchema = Type.Object({
+  goal: Type.String({
+    description:
+      "What the task is trying to accomplish, in one or two sentences. This is the " +
+      "high-level intent — the Judge uses it together with done_criteria to decide " +
+      "whether the task is complete.",
+    minLength: 1,
+    maxLength: 2000,
+  }),
+  done_criteria: Type.String({
+    description:
+      "Falsifiable acceptance criteria. The Judge will pass/fail based on these — be " +
+      "specific (e.g. 'docs/x.md updated AND pnpm test passes AND no new TODOs added').",
+    minLength: 1,
+    maxLength: 2000,
+  }),
+  checks: Type.Optional(
+    Type.Array(Type.Record(Type.String(), Type.Unknown()), {
+      description:
+        "Deterministic acceptance checks the harness EXECUTES at judge time (level-3 evidence). " +
+        "Kinds: {kind:'file_exists',path}, {kind:'file_contains',path,value}, {kind:'file_regex',path,pattern}, " +
+        "{kind:'output_regex',pattern} (over the task output), {kind:'command',command,expectExitCode?,stdoutRegex?} " +
+        "(runs only when the operator enables BITTERBOT_TASKS_CHECK_COMMANDS). Paths are relative to the workspace. " +
+        "A failed check fails the judge round without a model call; prefer checks over prose whenever the outcome is observable.",
+    }),
+  ),
+  plan: Type.Optional(
+    Type.Array(PlanStepSchema, {
+      description:
+        "Optional initial plan as ordered steps. Each step has id, title, optional " +
+        "description, and optional status (defaults to 'pending'). Use task_update with " +
+        "step_update to advance step states as you work.",
+    }),
+  ),
+  parent_task_id: Type.Optional(
+    Type.String({
+      description:
+        "Parent task id when this task was spawned by another task. Used for hierarchy " +
+        "tracking in task_list.",
+    }),
+  ),
+  source: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("user"),
+        Type.Literal("curiosity"),
+        Type.Literal("subagent"),
+        Type.Literal("judge"),
+        Type.Literal("operator"),
+      ],
+      {
+        description:
+          "Where the task originated. Defaults to 'user'. Use 'curiosity' for tasks " +
+          "auto-generated from frontier gaps; 'subagent' when one task spawns another.",
+      },
+    ),
+  ),
+  bounty: Type.Optional(
+    Type.Integer({
+      description: "Optional bounty in cents. Tasks with bounty > 0 are eligible for P2P bidding.",
+      minimum: 0,
+    }),
+  ),
+  metadata: Type.Optional(
+    Type.Record(Type.String(), Type.Unknown(), {
+      description: "Free-form key/value metadata to attach to the task.",
+    }),
+  ),
+});
+
+export function createTaskCreateTool(options: { agentSessionKey?: string }): AnyAgentTool {
+  return {
+    label: "Create Task",
+    name: "task_create",
+    description:
+      "Register a new long-horizon Task. Use this when the user gives you work that " +
+      "will take more than a few minutes, requires multiple steps, or should survive " +
+      "this conversation. The Task becomes a durable coordination object: it persists " +
+      "across restarts, can be monitored via task_monitor, and is the substrate for " +
+      "auto-handoff (Phase C) and Judge verification (Phase D). Write specific, " +
+      "falsifiable done_criteria — the Judge will refuse to mark the task complete " +
+      "without them.",
+    parameters: CreateSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+
+      const goal = readStringParam(params, "goal", { required: true });
+      const doneCriteria = readStringParam(params, "done_criteria", { required: true });
+      let checks: ReturnType<typeof parseTaskChecks> | undefined;
+      if (params.checks !== undefined) {
+        try {
+          checks = parseTaskChecks(params.checks);
+        } catch (err) {
+          return jsonResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      const source = (readStringParam(params, "source") as TaskSource | undefined) ?? "user";
+      const parentTaskId = readStringParam(params, "parent_task_id");
+      const bounty = readNumberParam(params, "bounty", { integer: true });
+      const rawPlan = params.plan;
+      const rawMeta = params.metadata;
+
+      const plan = parsePlanArray(rawPlan);
+      const metadata =
+        rawMeta && typeof rawMeta === "object" && !Array.isArray(rawMeta)
+          ? (rawMeta as Record<string, unknown>)
+          : null;
+
+      let task: Task;
+      try {
+        task = store.create({
+          goal,
+          doneCriteria,
+          ...(checks !== undefined ? { checks } : {}),
+          source,
+          parentTaskId: parentTaskId ?? null,
+          bounty: typeof bounty === "number" ? bounty : null,
+          plan,
+          metadata,
+          agentSessionKey: options.agentSessionKey ?? null,
+        });
+      } catch (err) {
+        return jsonResult({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      // Emit a `task` lifecycle event so task_monitor returns at least one
+      // row even before any worker run starts.
+      emitTaskEvent(task.id, "created", { task });
+      return jsonResult({ ok: true, task });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_update (Phase B).
+// ---------------------------------------------------------------------------
+
+const StatusSchema = Type.Union([
+  Type.Literal("pending"),
+  Type.Literal("planning"),
+  Type.Literal("running"),
+  Type.Literal("waiting_external"),
+  Type.Literal("judging"),
+  Type.Literal("completed"),
+  Type.Literal("failed"),
+  Type.Literal("stopped"),
+]);
+
+const UpdateSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  status: Type.Optional(StatusSchema),
+  goal: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+  done_criteria: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+  plan: Type.Optional(
+    Type.Array(PlanStepSchema, {
+      description: "Replace the entire plan. Use step_update for single-step transitions.",
+    }),
+  ),
+  step_update: Type.Optional(
+    Type.Object(
+      {
+        step_id: Type.String({ minLength: 1 }),
+        status: Type.Union([
+          Type.Literal("pending"),
+          Type.Literal("in_progress"),
+          Type.Literal("completed"),
+          Type.Literal("skipped"),
+          Type.Literal("failed"),
+        ]),
+        output: Type.Optional(Type.String()),
+      },
+      { description: "Mutate one step's status (and optional output)." },
+    ),
+  ),
+  output: Type.Optional(Type.String()),
+  current_run_id: Type.Optional(Type.String()),
+  metadata: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  checks: Type.Optional(
+    Type.Array(Type.Record(Type.String(), Type.Unknown()), {
+      description: "Replace the task's deterministic acceptance checks (see task_create).",
+    }),
+  ),
+});
+
+export function createTaskUpdateTool(): AnyAgentTool {
+  return {
+    label: "Update Task",
+    name: "task_update",
+    description:
+      "Mutate a Task's status, plan, checks, current_run_id, or output reference. Use this " +
+      "to advance through plan steps (`step_update`), to mark a task as running / " +
+      "judging, or to attach a final artifact reference. `completed` is NOT settable " +
+      "here: only a passing task_judge verification completes a task. Status " +
+      "transitions out of completed/failed/stopped are blocked — those are terminal.",
+    parameters: UpdateSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+
+      const rawStepUpdate = params.step_update;
+      if (rawStepUpdate && typeof rawStepUpdate === "object") {
+        const su = rawStepUpdate as Record<string, unknown>;
+        const stepId = readStringParam(su, "step_id", { required: true });
+        const status = readStringParam(su, "status", { required: true }) as PlanStepStatus;
+        const output = readStringParam(su, "output");
+        try {
+          const task = store.setStepStatus(taskId, stepId, status, output);
+          emitTaskEvent(taskId, "step_update", { stepId, status, output });
+          return jsonResult({ ok: true, task });
+        } catch (err) {
+          return jsonResult({
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const status = readStringParam(params, "status") as TaskStatus | undefined;
+      const goal = readStringParam(params, "goal");
+      const doneCriteria = readStringParam(params, "done_criteria");
+      const output = readStringParam(params, "output");
+      const currentRunId = readStringParam(params, "current_run_id");
+      const rawPlan = params.plan;
+      const rawMeta = params.metadata;
+      const plan = parsePlanArray(rawPlan);
+      let checks: ReturnType<typeof parseTaskChecks> | undefined;
+      if (params.checks !== undefined) {
+        try {
+          checks = parseTaskChecks(params.checks);
+        } catch (err) {
+          return jsonResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      const metadata =
+        rawMeta && typeof rawMeta === "object" && !Array.isArray(rawMeta)
+          ? (rawMeta as Record<string, unknown>)
+          : undefined;
+
+      try {
+        const task = store.update(taskId, {
+          ...(status !== undefined ? { status } : {}),
+          ...(goal !== undefined ? { goal } : {}),
+          ...(doneCriteria !== undefined ? { doneCriteria } : {}),
+          ...(rawPlan !== undefined ? { plan } : {}),
+          ...(output !== undefined ? { output } : {}),
+          ...(currentRunId !== undefined ? { currentRunId } : {}),
+          ...(metadata !== undefined ? { metadata } : {}),
+          ...(checks !== undefined ? { checks } : {}),
+        });
+        emitTaskEvent(taskId, "updated", { status: task.status });
+        return jsonResult({ ok: true, task });
+      } catch (err) {
+        return jsonResult({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_get (Phase B).
+// ---------------------------------------------------------------------------
+
+const GetSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  include_recent_events: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true (default), include the most recent N events from the journal in the response.",
+    }),
+  ),
+  recent_events_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+});
+
+export function createTaskGetTool(): AnyAgentTool {
+  return {
+    label: "Get Task",
+    name: "task_get",
+    description:
+      "Fetch a single Task by id with its status, plan, checkpoint pointer, and (by " +
+      "default) its most recent event-journal entries. Use this to inspect a task " +
+      "without subscribing to the live stream. `staleFacts` lists facts the plan still " +
+      "cites at a value the owner has since corrected or retired.",
+    parameters: GetSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const task = store.get(taskId);
+      if (!task) {
+        return jsonResult({ ok: false, error: `task ${taskId} not found` });
+      }
+      const includeEvents = params.include_recent_events !== false;
+      const limit = readNumberParam(params, "recent_events_limit", { integer: true }) ?? 50;
+      let recentEvents: unknown[] = [];
+      if (includeEvents) {
+        const journal = getActiveEventJournal();
+        if (journal) {
+          recentEvents = journal.query({ taskId, limit });
+        }
+      }
+      // PLAN-55 Phase 2: facts this task still cites at a value the owner
+      // replaced or retired; re-check the plan before acting on them.
+      const staleFacts = readTaskStaleFacts(task);
+      return jsonResult({
+        ok: true,
+        task,
+        recentEvents,
+        ...(staleFacts.length > 0 ? { staleFacts } : {}),
+      });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_list (Phase B).
+// ---------------------------------------------------------------------------
+
+const ListSchema = Type.Object({
+  // Array only: a `Union([Status, Array(Status)])` cannot flatten to an enum,
+  // so it leaked `anyOf` to providers that reject unions (every other tool
+  // schema is union-free). execute() still accepts a bare string at runtime.
+  status: Type.Optional(
+    Type.Array(StatusSchema, { description: "Only tasks in one of these statuses" }),
+  ),
+  parent_task_id: Type.Optional(Type.String()),
+  source: Type.Optional(
+    Type.Union([
+      Type.Literal("user"),
+      Type.Literal("curiosity"),
+      Type.Literal("subagent"),
+      Type.Literal("judge"),
+      Type.Literal("operator"),
+    ]),
+  ),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+  since_ts: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+export function createTaskListTool(): AnyAgentTool {
+  return {
+    label: "List Tasks",
+    name: "task_list",
+    description:
+      "List long-horizon Tasks, optionally filtered by status, parent task, source, " +
+      "or updated-since timestamp. Useful to see what's currently in flight, waiting, " +
+      "or recently completed. Default ordering is most-recently-updated first.",
+    parameters: ListSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const rawStatus = params.status;
+      let status: TaskStatus | TaskStatus[] | undefined;
+      if (typeof rawStatus === "string") status = rawStatus as TaskStatus;
+      else if (Array.isArray(rawStatus)) status = rawStatus as TaskStatus[];
+      const parentTaskId = readStringParam(params, "parent_task_id");
+      const source = readStringParam(params, "source") as TaskSource | undefined;
+      const limit = readNumberParam(params, "limit", { integer: true });
+      const sinceTs = readNumberParam(params, "since_ts", { integer: true });
+      const tasks = store.list({
+        ...(status !== undefined ? { status } : {}),
+        ...(parentTaskId !== undefined ? { parentTaskId } : {}),
+        ...(source !== undefined ? { source } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(sinceTs !== undefined ? { sinceTs } : {}),
+      });
+      return jsonResult({ ok: true, count: tasks.length, tasks });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_stop (Phase B).
+// ---------------------------------------------------------------------------
+
+const StopSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  reason: Type.String({
+    description: "Why the task is being stopped. Recorded in metadata.",
+    minLength: 1,
+    maxLength: 500,
+  }),
+});
+
+export function createTaskStopTool(): AnyAgentTool {
+  return {
+    label: "Stop Task",
+    name: "task_stop",
+    description:
+      "Gracefully terminate a Task. Transitions status to 'stopped' and prevents " +
+      "further automatic resumption. Use this when the user cancels, when a task " +
+      "is no longer relevant, or when the agent determines the goal can't be met. " +
+      "Already-terminal tasks return an error.",
+    parameters: StopSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const reason = readStringParam(params, "reason", { required: true });
+      const existing = store.get(taskId);
+      if (!existing) {
+        return jsonResult({ ok: false, error: `task ${taskId} not found` });
+      }
+      if (isTerminal(existing.status)) {
+        return jsonResult({
+          ok: false,
+          error: `task ${taskId} is already terminal (${existing.status})`,
+        });
+      }
+      const meta = {
+        ...existing.metadata,
+        stoppedReason: reason,
+        stoppedAt: Date.now(),
+      };
+      const task = store.update(taskId, { status: "stopped", metadata: meta });
+      emitTaskEvent(taskId, "stopped", { reason });
+      return jsonResult({ ok: true, task });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_output (Phase B).
+// ---------------------------------------------------------------------------
+
+const OutputSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+});
+
+export function createTaskOutputTool(): AnyAgentTool {
+  return {
+    label: "Get Task Output",
+    name: "task_output",
+    description:
+      "Fetch the final artifact reference for a completed task (crystal id, file " +
+      "path, URL — whatever the worker recorded as `output` on completion). Returns " +
+      "an error if the task is not yet terminal or has no output recorded.",
+    parameters: OutputSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const task = store.get(taskId);
+      if (!task) {
+        return jsonResult({ ok: false, error: `task ${taskId} not found` });
+      }
+      if (!task.output) {
+        return jsonResult({
+          ok: false,
+          status: task.status,
+          error: `task ${taskId} has no output (status=${task.status})`,
+        });
+      }
+      return jsonResult({
+        ok: true,
+        taskId,
+        status: task.status,
+        output: task.output,
+        completedAt: task.completedAt,
+      });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_write_handoff (Phase C).
+// ---------------------------------------------------------------------------
+
+const WriteHandoffSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  intent: Type.String({
+    description:
+      "One or two sentences summarizing why you're suspending now (e.g. 'context " +
+      "approaching 70%; need to continue research after rest').",
+    minLength: 1,
+    maxLength: 2000,
+  }),
+  decisions: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "List of material decisions made so far that the next run must respect. Be " +
+        "specific — these are the constraints the cold-restart agent will inherit.",
+    }),
+  ),
+  pending: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "Remaining work items in priority order.",
+    }),
+  ),
+  context: Type.Optional(
+    Type.String({
+      description:
+        "Free-form additional context (key findings, citations, partial outputs). The " +
+        "structured pending/decisions arrays are preferred — use this for narrative.",
+    }),
+  ),
+  context_tokens: Type.Optional(
+    Type.Integer({
+      description: "Approximate token budget at handoff time. Informational; cap 1M.",
+      minimum: 0,
+    }),
+  ),
+});
+
+export function createTaskWriteHandoffTool(): AnyAgentTool {
+  return {
+    label: "Write Task Handoff",
+    name: "task_write_handoff",
+    description:
+      "Author a structured handoff record for a long-horizon task. Call this when " +
+      "you're about to suspend the task — typically at a rest boundary, when context " +
+      "is approaching saturation (~70% of the model's window), or when an external " +
+      "dependency blocks progress. The handoff captures intent, decisions, and " +
+      "pending work so the next run can rebuild context cold without summarization. " +
+      "Use task_schedule_wakeup right after to schedule the resume. " +
+      "Returns { ok, handoff:{id,...} }.",
+    parameters: WriteHandoffSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const intent = readStringParam(params, "intent", { required: true });
+      const decisions = readStringArrayParam(params, "decisions");
+      const pending = readStringArrayParam(params, "pending");
+      const context = readStringParam(params, "context");
+      const contextTokens = readNumberParam(params, "context_tokens", { integer: true });
+
+      try {
+        const handoff = store.writeHandoff({
+          taskId,
+          intent,
+          ...(decisions ? { decisions } : {}),
+          ...(pending ? { pending } : {}),
+          ...(context !== undefined ? { context } : {}),
+          ...(typeof contextTokens === "number" ? { contextTokens } : {}),
+        });
+        emitTaskEvent(taskId, "handoff_written", {
+          handoffId: handoff.id,
+          intent,
+          decisionsCount: handoff.decisions.length,
+          pendingCount: handoff.pending.length,
+        });
+        return jsonResult({ ok: true, handoff });
+      } catch (err) {
+        return jsonResult({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_read_handoff (Phase C).
+// ---------------------------------------------------------------------------
+
+const ReadHandoffSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  list: Type.Optional(
+    Type.Boolean({
+      description: "When true, returns the recent N handoffs. Default: returns only the latest.",
+    }),
+  ),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+});
+
+export function createTaskReadHandoffTool(): AnyAgentTool {
+  return {
+    label: "Read Task Handoff",
+    name: "task_read_handoff",
+    description:
+      "Read the latest structured handoff record for a task. This is the FIRST thing " +
+      "to call when resuming a long-horizon task — it gives you the intent, the " +
+      "decisions you made before suspending, and the pending work in priority order. " +
+      "Combined with task_get (for status/plan) and the original goal/done_criteria, " +
+      "the handoff is enough to rebuild a fresh context cold. Pass list=true to see " +
+      "the full handoff history.",
+    parameters: ReadHandoffSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const list = params.list === true;
+      const limit = readNumberParam(params, "limit", { integer: true }) ?? 10;
+      if (list) {
+        const handoffs = store.listHandoffs(taskId, limit);
+        return jsonResult({ ok: true, count: handoffs.length, handoffs });
+      }
+      const latest = store.latestHandoff(taskId);
+      if (!latest) {
+        return jsonResult({ ok: false, error: `no handoff for task ${taskId}` });
+      }
+      // Surface the machine-readable workspace alongside the narrative handoff
+      let workspace: Record<string, unknown> | undefined;
+      try {
+        const ws = store.getWorkspace(taskId);
+        if (Object.keys(ws).length > 0) {
+          workspace = ws;
+        }
+      } catch {
+        // Task lookup failed — handoff alone is still useful
+      }
+      return jsonResult({ ok: true, handoff: latest, ...(workspace ? { workspace } : {}) });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_workspace_get / task_workspace_merge — durable per-task machine state.
+// ---------------------------------------------------------------------------
+
+const WorkspaceGetSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+});
+
+export function createTaskWorkspaceGetTool(): AnyAgentTool {
+  return {
+    label: "Get Task Workspace",
+    name: "task_workspace_get",
+    description:
+      "Read a task's durable workspace: machine-readable state (variables, artifact " +
+      "paths, handles, intermediate results) that survives handoffs, wakeups, and " +
+      "compaction. Read it when resuming a task, alongside task_read_handoff. " +
+      "Returns { ok, workspace }.",
+    parameters: WorkspaceGetSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      try {
+        return jsonResult({ ok: true, workspace: store.getWorkspace(taskId) });
+      } catch (err) {
+        return jsonResult({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }),
+  };
+}
+
+const WorkspaceMergeSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  entries: Type.Record(Type.String(), Type.Unknown(), {
+    description:
+      "Key/value entries to merge into the workspace. Values must be JSON-serializable; " +
+      "set a key to null to delete it. Keep values small (64KB total cap) — store large " +
+      "artifacts as files and keep their paths here.",
+  }),
+});
+
+export function createTaskWorkspaceMergeTool(): AnyAgentTool {
+  return {
+    label: "Merge Task Workspace",
+    name: "task_workspace_merge",
+    description:
+      "Merge machine-readable state into a task's durable workspace (variables, " +
+      "artifact paths, handles, parsed results). Unlike the narrative handoff, the " +
+      "workspace is structured data the resuming run can use directly without " +
+      "re-deriving it. Merge semantics: existing keys are preserved unless " +
+      "overwritten; null deletes a key. Returns { ok, workspace }.",
+    parameters: WorkspaceMergeSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const entries = params.entries;
+      if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+        return jsonResult({ ok: false, error: "entries must be an object" });
+      }
+      try {
+        store.mergeWorkspace(taskId, entries as Record<string, unknown>);
+        const workspace = store.getWorkspace(taskId);
+        emitTaskEvent(taskId, "workspace_merged", {
+          keys: Object.keys(entries as Record<string, unknown>),
+        });
+        return jsonResult({ ok: true, workspace });
+      } catch (err) {
+        return jsonResult({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_schedule_wakeup (Phase C).
+// ---------------------------------------------------------------------------
+
+const ScheduleWakeupSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  delay_seconds: Type.Optional(
+    Type.Integer({
+      description:
+        "Delay before the wakeup fires, in seconds. Mutually exclusive with at_iso. " +
+        "Minimum 5 seconds (cron tick floor).",
+      minimum: 5,
+    }),
+  ),
+  at_iso: Type.Optional(
+    Type.String({
+      description:
+        "ISO-8601 timestamp to fire at. Mutually exclusive with delay_seconds. Must " +
+        "be in the future.",
+    }),
+  ),
+  message: Type.Optional(
+    Type.String({
+      description:
+        "Override the default wakeup-prompt message. Defaults to a structured " +
+        "'resume task X via handoff Y' instruction that the model is expected to follow.",
+      maxLength: 4000,
+    }),
+  ),
+  handoff_id: Type.Optional(
+    Type.Integer({
+      description:
+        "Specific handoff id to reference. Defaults to the latest handoff for the task " +
+        "(the conventional and correct choice).",
+      minimum: 1,
+    }),
+  ),
+  reason: Type.String({
+    description:
+      "Why you're scheduling this wakeup. Recorded in the task event journal so the " +
+      "operator can audit the wakeup chain.",
+    minLength: 1,
+    maxLength: 500,
+  }),
+});
+
+export function createTaskScheduleWakeupTool(): AnyAgentTool {
+  return {
+    label: "Schedule Task Wakeup",
+    name: "task_schedule_wakeup",
+    description:
+      "Schedule a future agent invocation that will resume this task. The receiving " +
+      "agent gets a structured message instructing it to read the latest handoff and " +
+      "continue. Use this after task_write_handoff to suspend cleanly across context " +
+      "boundaries, rest periods, or external waits. Provide either delay_seconds or " +
+      "at_iso (not both). Hard cap of 50 wakeups per task prevents runaway loops; " +
+      "raise BITTERBOT_TASKS_MAX_WAKEUPS to override.",
+    parameters: ScheduleWakeupSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const cron = getCronEngine();
+      if (!cron) {
+        return jsonResult({
+          ok: false,
+          error:
+            "cron engine is not active — task wakeups cannot be scheduled. Check " +
+            "BITTERBOT_SKIP_CRON and the gateway cron config.",
+        });
+      }
+
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const reason = readStringParam(params, "reason", { required: true });
+      const delaySeconds = readNumberParam(params, "delay_seconds", { integer: true });
+      const atIso = readStringParam(params, "at_iso");
+      const messageOverride = readStringParam(params, "message");
+      const handoffId = readNumberParam(params, "handoff_id", { integer: true });
+
+      const task = store.get(taskId);
+      if (!task) {
+        return jsonResult({ ok: false, error: `task ${taskId} not found` });
+      }
+      if (isTerminal(task.status)) {
+        return jsonResult({
+          ok: false,
+          error: `task ${taskId} is terminal (${task.status}); cannot schedule wakeup`,
+        });
+      }
+
+      const maxWakeups = readMaxWakeups();
+      if (task.wakeupCount >= maxWakeups) {
+        return jsonResult({
+          ok: false,
+          error: `task ${taskId} has hit the wakeup cap (${task.wakeupCount}/${maxWakeups})`,
+        });
+      }
+
+      const atMs = computeAtMs(delaySeconds, atIso);
+      if (atMs instanceof Error) {
+        return jsonResult({ ok: false, error: atMs.message });
+      }
+
+      const effectiveHandoffId = handoffId ?? store.latestHandoff(taskId)?.id;
+      const message =
+        messageOverride ?? buildResumeMessage({ task, handoffId: effectiveHandoffId, reason });
+
+      const job: CronJob = {
+        jobId: `task-wakeup-${taskId}-${Date.now().toString(36)}-${randomTag()}`,
+        name: `task wakeup: ${truncatePreview(task.goal)}`,
+        description: `Resume task ${taskId}: ${truncatePreview(reason, 80)}`,
+        enabled: true,
+        schedule: { kind: "at", at: new Date(atMs).toISOString() },
+        sessionTarget: "isolated",
+        wakeMode: "now",
+        payload: {
+          kind: "agentTurn",
+          message,
+          taskId,
+          ...(currentRunIsNonOwner() ? { senderIsOwner: false as const } : {}),
+          ...(typeof effectiveHandoffId === "number" ? { handoffId: effectiveHandoffId } : {}),
+          ...(task.checkpoint
+            ? {
+                resumeFromCheckpoint: {
+                  threadId: task.checkpoint.threadId,
+                  stepId: task.checkpoint.stepId,
+                },
+              }
+            : {}),
+        },
+        delivery: { mode: "none" },
+        notify: false,
+        deleteAfterRun: true,
+        consecutiveErrors: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      try {
+        const persisted = await cron.upsertJob(job);
+        // Mark the task as waiting and bump wakeupCount atomically.
+        store.update(taskId, {
+          status: "waiting_external",
+          incrementWakeup: true,
+        });
+        emitTaskEvent(taskId, "wakeup_scheduled", {
+          jobId: persisted.jobId,
+          atMs,
+          atIso: new Date(atMs).toISOString(),
+          handoffId: effectiveHandoffId,
+          reason,
+        });
+        return jsonResult({
+          ok: true,
+          taskId,
+          jobId: persisted.jobId,
+          atIso: new Date(atMs).toISOString(),
+          atMs,
+          handoffId: effectiveHandoffId,
+          wakeupCount: task.wakeupCount + 1,
+          wakeupCap: maxWakeups,
+        });
+      } catch (err) {
+        return jsonResult({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_resume_inline (PLAN-17 Phase 4 — promote-to-foreground).
+// ---------------------------------------------------------------------------
+
+/** Default recency window for the foreground/foreground race-guard. */
+const DEFAULT_RACE_GUARD_MS = 10 * 60_000;
+
+function readRaceGuardMs(): number {
+  const raw = process.env.BITTERBOT_TASKS_RACE_GUARD_MS;
+  if (!raw) return DEFAULT_RACE_GUARD_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_RACE_GUARD_MS;
+  return parsed;
+}
+
+const ResumeInlineSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  reason: Type.Optional(
+    Type.String({
+      description: "Why you're pulling this task into the current chat. Recorded for audit.",
+      maxLength: 500,
+    }),
+  ),
+  force: Type.Optional(
+    Type.Boolean({
+      description:
+        "Override the race-guard. Use when you intentionally want to take over a " +
+        "task another agent is already running (e.g. the original is stuck). The " +
+        "previous owner's currentRunId is overwritten — its next task_update may " +
+        "fail because the task no longer matches its run.",
+    }),
+  ),
+});
+
+export function createTaskResumeInlineTool(options: { agentSessionKey?: string }): AnyAgentTool {
+  return {
+    label: "Resume Task Inline",
+    name: "task_resume_inline",
+    description:
+      "Pull a paused long-horizon task into the current chat instead of letting it " +
+      "resume asynchronously via cron. The next turn in this session will receive a " +
+      "resume prompt (same protocol as a cron wakeup): read the latest handoff, then " +
+      "continue. Use this when the user says 'pick up the X task here', or when you " +
+      "want to drive a paused task to completion right now. The task's status moves " +
+      "to 'running' and its agentSessionKey is rebound to the current session.",
+    parameters: ResumeInlineSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const sessionKey = options.agentSessionKey;
+      if (!sessionKey) {
+        return jsonResult({
+          ok: false,
+          error:
+            "task_resume_inline requires a current agent session; no agentSessionKey " +
+            "was plumbed to this tool factory.",
+        });
+      }
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const reason =
+        readStringParam(params, "reason") ?? "inline resume requested by current agent";
+
+      const task = store.get(taskId);
+      if (!task) {
+        return jsonResult({ ok: false, error: `task ${taskId} not found` });
+      }
+      if (isTerminal(task.status)) {
+        return jsonResult({
+          ok: false,
+          error: `task ${taskId} is terminal (${task.status}); cannot resume`,
+        });
+      }
+
+      // PLAN-17 follow-up: race-guard. If another runner is actively
+      // working this task (currentRunId set AND lastSeenAt within the
+      // recency window), refuse unless force=true. The cron isolated
+      // path already aborts on a mismatched currentRunId; this guard
+      // closes the foreground/foreground hole where two chats both try
+      // to claim the same task.
+      const force = params.force === true;
+      if (!force && task.currentRunId) {
+        const raceGuardMs = readRaceGuardMs();
+        const ageMs = Date.now() - task.lastSeenAt;
+        if (ageMs >= 0 && ageMs < raceGuardMs) {
+          return jsonResult({
+            ok: false,
+            error:
+              `task ${taskId} is already being run by ${task.currentRunId} ` +
+              `(last seen ${(ageMs / 1000).toFixed(1)}s ago, within the ` +
+              `${(raceGuardMs / 1000).toFixed(0)}s race-guard window). ` +
+              `Pass force=true to take over.`,
+            conflict: {
+              currentRunId: task.currentRunId,
+              lastSeenAt: task.lastSeenAt,
+              ageMs,
+              raceGuardMs,
+            },
+          });
+        }
+      }
+
+      const handoff = store.latestHandoff(taskId);
+      const handoffId = handoff?.id;
+      const message = buildResumeMessage({ task, handoffId, reason });
+
+      store.update(taskId, {
+        status: "running",
+        agentSessionKey: sessionKey,
+        // Clear the old currentRunId so the previous owner's next update
+        // sees a mismatch and stops cleanly. The new runner's first
+        // task_update will set the field to its own run id.
+        currentRunId: null,
+      });
+
+      const { enqueueSystemEvent } = await import("../../infra/system-events.js");
+      enqueueSystemEvent(message, {
+        sessionKey,
+        contextKey: `task-resume:${taskId}`,
+      });
+      emitTaskEvent(taskId, "resumed_inline", { reason, handoffId });
+
+      return jsonResult({
+        ok: true,
+        taskId,
+        handoffId: handoffId ?? null,
+        sessionKey,
+        message,
+      });
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// task_judge (Phase D).
+// ---------------------------------------------------------------------------
+
+const JudgeSchema = Type.Object({
+  task_id: Type.String({ minLength: 1 }),
+  /** Maximum rounds before forcing a failed terminal verdict. */
+  max_rounds: Type.Optional(
+    Type.Integer({
+      description: "Override the judge round cap. Defaults to 5.",
+      minimum: 1,
+      maximum: 20,
+    }),
+  ),
+});
+
+export function createTaskJudgeTool(): AnyAgentTool {
+  return {
+    label: "Judge Task",
+    name: "task_judge",
+    description:
+      "Run the planner/worker/judge verification pass on a task that is in " +
+      "status='judging' (or status='running' if you want a mid-run check). The " +
+      "Judge is an INDEPENDENT pass: it sees only the goal, done_criteria, plan-" +
+      "step statuses, output reference, and latest handoff — never the worker's " +
+      "chain of thought. Three verdicts: 'pass' (→ completed), 'fail' (→ " +
+      "rejecting handoff written, task back to running OR failed at round cap), " +
+      "'needs_more' (→ feedback handoff, back to running). The task's deterministic " +
+      "checks are EXECUTED first; a failed check fails the round with no model call. " +
+      "This is the only path to 'completed'.",
+    parameters: JudgeSchema,
+    execute: safeExecute(async (_toolCallId, params) => {
+      const store = getActiveTaskStore();
+      if (!store) return storeUnavailable();
+      const llmCall = getJudgeLlmCall();
+      if (!llmCall) {
+        return jsonResult({
+          ok: false,
+          error:
+            "judge LLM call is not registered. Configure the judge provider during " +
+            "gateway boot via registerJudgeLlmCall(). For tests, register a stub.",
+        });
+      }
+      const taskId = readStringParam(params, "task_id", { required: true });
+      const maxRounds =
+        readNumberParam(params, "max_rounds", { integer: true }) ?? DEFAULT_MAX_JUDGE_ROUNDS;
+
+      const task = store.get(taskId);
+      if (!task) {
+        return jsonResult({ ok: false, error: `task ${taskId} not found` });
+      }
+      if (isTerminal(task.status)) {
+        return jsonResult({
+          ok: false,
+          error: `task ${taskId} is terminal (${task.status}); judge cannot rerun`,
+        });
+      }
+
+      const latestHandoff = store.latestHandoff(taskId) ?? null;
+      const checkCtx = getTaskCheckContext();
+      const checksHash = taskChecksHash(task.checks);
+      const checkResults = await runTaskChecks(task.checks, {
+        workspaceDir: checkCtx.workspaceDir,
+        allowCommands: checkCtx.allowCommands,
+        output: task.output,
+      });
+      const judgeCalled = checkResults.every((r) => r.passed);
+      const decision = await runTaskJudge(
+        { task, output: task.output, latestHandoff, checkResults },
+        llmCall,
+      );
+
+      if (!decision) {
+        emitTaskEvent(taskId, "judge_error", { reason: "judge response unparseable" });
+        return jsonResult({
+          ok: false,
+          error: "judge returned an unparseable response. Inspect the LLM provider and retry.",
+        });
+      }
+
+      const judgeRounds = task.judgeRounds + 1;
+      const verdict = decision.verdict;
+
+      let nextStatus: TaskStatus;
+      if (verdict === "pass") {
+        nextStatus = "completed";
+      } else if (verdict === "needs_more") {
+        nextStatus = "running";
+      } else {
+        nextStatus = judgeRounds >= maxRounds ? "failed" : "running";
+      }
+
+      // For fail/needs_more, write a rejecting handoff so the worker sees the
+      // judge's feedback when it resumes.
+      if (verdict !== "pass") {
+        try {
+          store.writeHandoff({
+            taskId,
+            intent: `Judge ${verdict}: ${decision.reasoning}`,
+            pending: decision.missing ?? [],
+            decisions: [`judge round ${judgeRounds} of ${maxRounds}`],
+          });
+        } catch (err) {
+          log_(err, taskId);
+        }
+      }
+
+      const verification = buildTaskVerification({
+        decision,
+        checkResults,
+        judgeModel: getJudgeModel(),
+        judgeCalled,
+        runId: task.currentRunId,
+      });
+      const checksStable = store.get(taskId)?.checksRevision === task.checksRevision;
+      const updated = store.recordVerification(taskId, verification, nextStatus);
+      // Journaled under the task id so the run's trace (and the run-outcome
+      // derivation in skill-evolution) can find the verdict and its evidence
+      // level without trusting the worker's narration.
+      emitTaskEvent(taskId, "judged", {
+        verdict,
+        level: verification.level,
+        checksPassed: checkResults.filter((r) => r.passed).length,
+        checksTotal: checkResults.length,
+        checksExecuted: checkResults.filter((r) => r.executed === true).length,
+        checksFailedExecuted: checkResults.filter((r) => r.executed === true && !r.passed).length,
+        checksHash,
+        checksRevision: task.checksRevision,
+        checksStable,
+        checksAuthor: "model",
+        checksIndependent: checkResults.every((r) => r.check.kind !== "output_regex"),
+        judgeModel: verification.judgeModel,
+        runId: task.currentRunId,
+        reasoning: decision.reasoning,
+        ...(decision.missing ? { missing: decision.missing } : {}),
+        judgeRounds,
+        nextStatus,
+      });
+      if (nextStatus === "completed") {
+        emitTaskReward("reward", { taskId, level: verification.level });
+      } else if (nextStatus === "failed") {
+        emitTaskReward("error", { taskId, level: verification.level });
+      }
+
+      return jsonResult({
+        ok: true,
+        verdict,
+        level: verification.level,
+        checks: checkResults,
+        reasoning: decision.reasoning,
+        missing: decision.missing ?? [],
+        judgeRounds,
+        maxRounds,
+        nextStatus,
+        task: updated,
+      });
+    }),
+  };
+}
+
+function log_(err: unknown, taskId: string): void {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `task_judge: failed to write feedback handoff for ${taskId}:`,
+    err instanceof Error ? err.message : String(err),
+  );
+}
+
+// Re-export the decision type so callers (e.g. operator dashboards) can type
+// their responses.
+export type { TaskJudgeDecision };
+
+// ---------------------------------------------------------------------------
+// Helpers.
+// ---------------------------------------------------------------------------
+
+function storeUnavailable() {
+  return jsonResult({
+    ok: false,
+    error:
+      "task store is not active. Start the gateway and ensure tasks aren't disabled " +
+      "via BITTERBOT_TASKS_DISABLED.",
+  });
+}
+
+function computeAtMs(delaySeconds: number | undefined, atIso: string | undefined): number | Error {
+  const now = Date.now();
+  if (typeof delaySeconds === "number" && atIso) {
+    return new Error("specify either delay_seconds or at_iso, not both");
+  }
+  if (typeof delaySeconds === "number") {
+    return now + delaySeconds * 1000;
+  }
+  if (atIso) {
+    const parsed = Date.parse(atIso);
+    if (Number.isNaN(parsed)) {
+      return new Error(`at_iso is not a valid ISO-8601 timestamp: ${atIso}`);
+    }
+    if (parsed <= now) {
+      return new Error(`at_iso must be in the future (got ${atIso})`);
+    }
+    return parsed;
+  }
+  return new Error("provide either delay_seconds or at_iso");
+}
+
+function buildResumeMessage(args: {
+  task: Task;
+  handoffId: number | undefined;
+  reason: string;
+}): string {
+  const { task, handoffId, reason } = args;
+  const handoffLine =
+    typeof handoffId === "number"
+      ? `Read the structured handoff via task_read_handoff({task_id:"${task.id}"}) — handoff id ${handoffId}.`
+      : `No prior handoff was recorded; call task_get({task_id:"${task.id}"}) for current state.`;
+  return [
+    `[long-horizon wakeup] Resume task ${task.id}.`,
+    `Goal: ${task.goal}`,
+    `Done criteria: ${task.doneCriteria}`,
+    `Wakeup reason: ${reason}`,
+    handoffLine,
+    `If done criteria are met, transition the task to status="judging" via task_update so the Judge can verify. ` +
+      `Otherwise continue the work. When you must suspend again, use task_write_handoff + task_schedule_wakeup.`,
+  ].join("\n");
+}
+
+function readMaxWakeups(): number {
+  const raw = process.env.BITTERBOT_TASKS_MAX_WAKEUPS;
+  if (!raw) return DEFAULT_MAX_WAKEUPS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_WAKEUPS;
+  return parsed;
+}
+
+function truncatePreview(s: string, n = 60): string {
+  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+}
+
+function randomTag(): string {
+  return crypto.randomBytes(3).toString("hex");
+}
+
+function parsePlanArray(raw: unknown): TaskPlan | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) {
+    throw new ToolInputError("plan must be an array of steps");
+  }
+  const steps: PlanStep[] = raw.map((entry, idx) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new ToolInputError(`plan[${idx}] must be an object`);
+    }
+    const e = entry as Record<string, unknown>;
+    const id = readStringParam(e, "id", { required: true });
+    const title = readStringParam(e, "title", { required: true });
+    const description = readStringParam(e, "description");
+    const status = (readStringParam(e, "status") ?? "pending") as PlanStepStatus;
+    return {
+      id,
+      title,
+      ...(description !== undefined ? { description } : {}),
+      status,
+    };
+  });
+  return { steps };
+}
+
+function emitTaskEvent(taskId: string, phase: string, data: Record<string, unknown>): void {
+  emitAgentEvent({
+    runId: `task:${taskId}`,
+    taskId,
+    stream: "task",
+    data: { phase, ...data },
+  });
+}
+
+// Re-export the store type for convenience in callers that need direct access.
+export type { TaskStore };

@@ -1,0 +1,72 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["unicorn", "typescript", "oxc"],
+  "categories": {
+    "correctness": "error",
+    "perf": "error",
+    "suspicious": "error"
+  },
+  "rules": {
+    "eslint-plugin-unicorn/prefer-array-find": "off",
+    "eslint/no-alert": "error",
+    "eslint/no-await-in-loop": "off",
+    "eslint/no-new": "off",
+    "oxc/no-accumulating-spread": "off",
+    "oxc/no-async-endpoint-handlers": "off",
+    "oxc/no-map-spread": "off",
+    // oxlint 1.85 (2026-09-29) enabled these under correctness/suspicious.
+    // no-shadow and no-underscore-dangle conflict with this codebase's naming
+    // conventions (344 hits, no bugs among them); no-unmodified-loop-condition
+    // cannot see loop state changed through closures, queue mutation or abort
+    // signals (all 8 hits were false positives).
+    "eslint/no-shadow": "off",
+    "eslint/no-underscore-dangle": "off",
+    "eslint/no-unmodified-loop-condition": "off",
+    // oxlint-tsgolint 7 type-aware rules, same rationale: 558 redundant-but-
+    // harmless conversions, React useEffect's conditional cleanup return, and
+    // single-use type parameters. The real findings (await-thenable,
+    // no-useless-default-assignment) were fixed in code.
+    "typescript/no-unnecessary-type-conversion": "off",
+    "typescript/consistent-return": "off",
+    "typescript/no-unnecessary-type-parameters": "off",
+    // `_`-prefixed parameters are deliberately unused.
+    "eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
+    "typescript/no-extraneous-class": "off",
+    "typescript/no-unnecessary-type-assertion": "off",
+    "typescript/no-unsafe-type-assertion": "off",
+    "unicorn/consistent-function-scoping": "off",
+    "unicorn/require-post-message-target-origin": "off"
+  },
+  "ignorePatterns": [
+    "assets/",
+    "benchmarks/",
+    "desktop/dist-renderer/",
+    "desktop/src-tauri/",
+    "dist/",
+    "docs/_layouts/",
+    "extensions/",
+    "node_modules/",
+    "patches/",
+    "pnpm-lock.yaml",
+    "/skills/",
+    "deploy/mailbox-host/mailbox-host.bundle.mjs",
+    "src/canvas-host/a2ui/a2ui.bundle.js",
+    "Swabble/",
+    "vendor/"
+  ],
+  "overrides": [
+    {
+      "files": ["desktop/**"],
+      "rules": {
+        "typescript/no-floating-promises": "off",
+        "eslint/no-unused-vars": "off",
+        "typescript/no-base-to-string": "off",
+        "typescript/no-misused-spread": "off",
+        "typescript/no-meaningless-void-operator": "off",
+        "typescript/no-unnecessary-boolean-literal-compare": "off",
+        "unicorn/no-array-sort": "off",
+        "unicorn/no-array-reverse": "off"
+      }
+    }
+  ]
+}

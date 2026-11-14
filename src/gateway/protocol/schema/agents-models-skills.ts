@@ -1,0 +1,668 @@
+import { Type } from "@sinclair/typebox";
+import { NonEmptyString } from "./primitives.js";
+
+export const ModelChoiceSchema = Type.Object(
+  {
+    id: NonEmptyString,
+    name: NonEmptyString,
+    provider: NonEmptyString,
+    contextWindow: Type.Optional(Type.Integer({ minimum: 1 })),
+    reasoning: Type.Optional(Type.Boolean()),
+    /**
+     * Whether this model may be selected under the node's current model policy.
+     * Absent means allowed (older gateways don't set it). The picker hides
+     * disallowed models so it never offers a choice sessions.patch would reject.
+     */
+    allowed: Type.Optional(Type.Boolean()),
+    /**
+     * Curated-menu overlay. `featured` = promoted in the lean default picker;
+     * `tier` groups it (frontier|mid|workhorse); `isDefault` marks the single
+     * recommended everyday model. Absent on older gateways (picker shows all).
+     */
+    featured: Type.Optional(Type.Boolean()),
+    tier: Type.Optional(
+      Type.Union([Type.Literal("frontier"), Type.Literal("mid"), Type.Literal("workhorse")]),
+    ),
+    isDefault: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentSummarySchema = Type.Object(
+  {
+    id: NonEmptyString,
+    name: Type.Optional(NonEmptyString),
+    identity: Type.Optional(
+      Type.Object(
+        {
+          name: Type.Optional(NonEmptyString),
+          theme: Type.Optional(NonEmptyString),
+          emoji: Type.Optional(NonEmptyString),
+          avatar: Type.Optional(NonEmptyString),
+          avatarUrl: Type.Optional(NonEmptyString),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsListParamsSchema = Type.Object({}, { additionalProperties: false });
+
+export const AgentsListResultSchema = Type.Object(
+  {
+    defaultId: NonEmptyString,
+    mainKey: NonEmptyString,
+    scope: Type.Union([Type.Literal("per-sender"), Type.Literal("global")]),
+    agents: Type.Array(AgentSummarySchema),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsCreateParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    workspace: NonEmptyString,
+    emoji: Type.Optional(Type.String()),
+    avatar: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsCreateResultSchema = Type.Object(
+  {
+    ok: Type.Literal(true),
+    agentId: NonEmptyString,
+    name: NonEmptyString,
+    workspace: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsUpdateParamsSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    name: Type.Optional(NonEmptyString),
+    workspace: Type.Optional(NonEmptyString),
+    model: Type.Optional(NonEmptyString),
+    avatar: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsUpdateResultSchema = Type.Object(
+  {
+    ok: Type.Literal(true),
+    agentId: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsDeleteParamsSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    deleteFiles: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsDeleteResultSchema = Type.Object(
+  {
+    ok: Type.Literal(true),
+    agentId: NonEmptyString,
+    removedBindings: Type.Integer({ minimum: 0 }),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFileEntrySchema = Type.Object(
+  {
+    name: NonEmptyString,
+    path: NonEmptyString,
+    missing: Type.Boolean(),
+    size: Type.Optional(Type.Integer({ minimum: 0 })),
+    updatedAtMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    content: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFilesListParamsSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFilesListResultSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    workspace: NonEmptyString,
+    files: Type.Array(AgentsFileEntrySchema),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFilesGetParamsSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    name: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFilesGetResultSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    workspace: NonEmptyString,
+    file: AgentsFileEntrySchema,
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFilesSetParamsSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    name: NonEmptyString,
+    content: Type.String(),
+  },
+  { additionalProperties: false },
+);
+
+export const AgentsFilesSetResultSchema = Type.Object(
+  {
+    ok: Type.Literal(true),
+    agentId: NonEmptyString,
+    workspace: NonEmptyString,
+    file: AgentsFileEntrySchema,
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsListParamsSchema = Type.Object(
+  {
+    /** Bust the process-lifetime catalog cache before listing (used after key/provider writes). */
+    refresh: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsListResultSchema = Type.Object(
+  {
+    models: Type.Array(ModelChoiceSchema),
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsAuthListParamsSchema = Type.Object({}, { additionalProperties: false });
+
+export const ModelsAuthTestParamsSchema = Type.Object(
+  {
+    provider: NonEmptyString,
+    /** Draft key to probe without saving. Omit to probe the stored credential. */
+    apiKey: Type.Optional(Type.String()),
+    profileId: Type.Optional(NonEmptyString),
+    /** Custom endpoint base URL (OpenAI/Anthropic compatible). */
+    baseUrl: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsAuthSetParamsSchema = Type.Object(
+  {
+    provider: NonEmptyString,
+    /** Profile name; defaults to "default" (profile id becomes provider:name). */
+    name: Type.Optional(Type.String()),
+    credentialType: Type.Optional(Type.Union([Type.Literal("api_key"), Type.Literal("token")])),
+    /** The secret. Write-only: never echoed back by any models.auth.* method. */
+    value: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsAuthDeleteParamsSchema = Type.Object(
+  {
+    profileId: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsSetDefaultParamsSchema = Type.Object(
+  {
+    /** Model ref ("provider/model", alias, or bare model id for the default provider). */
+    model: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsStatusParamsSchema = Type.Object(
+  {
+    agentId: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsBinsParamsSchema = Type.Object({}, { additionalProperties: false });
+
+export const SkillsBinsResultSchema = Type.Object(
+  {
+    bins: Type.Array(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsInstallParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    installId: NonEmptyString,
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 1000 })),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsUpdateParamsSchema = Type.Object(
+  {
+    skillKey: NonEmptyString,
+    enabled: Type.Optional(Type.Boolean()),
+    apiKey: Type.Optional(Type.String()),
+    env: Type.Optional(Type.Record(NonEmptyString, Type.String())),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsCreateParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    content: NonEmptyString,
+    /** Where to write the skill: "managed" (~/.bitterbot/skills) or "workspace". */
+    target: Type.Optional(Type.Union([Type.Literal("managed"), Type.Literal("workspace")])),
+    /** Optional agent ID; only used when target = "workspace". */
+    agentId: Type.Optional(NonEmptyString),
+    /** Refuse to overwrite an existing skill at the same path. */
+    overwrite: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Per-skill execution telemetry. Aggregated from skill_executions
+ * by SkillExecutionTracker.getSkillMetrics.
+ */
+export const SkillsMetricsParamsSchema = Type.Object(
+  {
+    /** Optional: pass a specific skillKey (skill name) to fetch one. Omit for all skills. */
+    skillKey: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillMetricsEntrySchema = Type.Object(
+  {
+    skillKey: NonEmptyString,
+    totalExecutions: Type.Integer({ minimum: 0 }),
+    successRate: Type.Number({ minimum: 0, maximum: 1 }),
+    avgRewardScore: Type.Number(),
+    avgExecutionTimeMs: Type.Number({ minimum: 0 }),
+    userFeedbackScore: Type.Number(),
+    lastExecutedAt: Type.Integer({ minimum: 0 }),
+    errorBreakdown: Type.Record(Type.String(), Type.Integer({ minimum: 0 })),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsMetricsResultSchema = Type.Object(
+  {
+    metrics: Type.Array(SkillMetricsEntrySchema),
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Per-agent skill allowlist mutation. Mirrors AgentConfig.skills:
+ * undefined / omitted => all skills allowed, [] => none, [...keys] => allowlist.
+ */
+export const SkillsUpdateAgentFilterParamsSchema = Type.Object(
+  {
+    agentId: NonEmptyString,
+    /** New allowlist, or null to clear (i.e. allow all). */
+    skills: Type.Union([Type.Array(NonEmptyString), Type.Null()]),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsUpdateAgentFilterResultSchema = Type.Object(
+  {
+    ok: Type.Literal(true),
+    agentId: NonEmptyString,
+    skills: Type.Union([Type.Array(NonEmptyString), Type.Null()]),
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Trust-related skill config (P2P ingest + agentskills.io bridge).
+ * Writes via the same path as skills.update — bump snapshot, no restart.
+ */
+export const SkillsUpdateTrustSettingsParamsSchema = Type.Object(
+  {
+    p2p: Type.Optional(
+      Type.Object(
+        {
+          ingestPolicy: Type.Optional(
+            Type.Union([Type.Literal("auto"), Type.Literal("review"), Type.Literal("deny")]),
+          ),
+          maxIngestedPerHour: Type.Optional(Type.Integer({ minimum: 1, maximum: 10000 })),
+          injectionScanner: Type.Optional(Type.Union([Type.Literal("regex"), Type.Literal("off")])),
+          quarantineTtlDays: Type.Optional(Type.Integer({ minimum: 0, maximum: 3650 })),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+    agentskills: Type.Optional(
+      Type.Object(
+        {
+          enabled: Type.Optional(Type.Boolean()),
+          defaultTrust: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("review")])),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsUpdateTrustSettingsResultSchema = Type.Object(
+  {
+    ok: Type.Literal(true),
+    p2p: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+    agentskills: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Sandbox-style validation: runs frontmatter parse, the prompt-injection
+ * scanner, and OS/bin compat checks on raw SKILL.md content. No persistence.
+ */
+export const SkillsValidateParamsSchema = Type.Object(
+  {
+    content: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const SkillValidationDiagnosticSchema = Type.Object(
+  {
+    severity: Type.Union([Type.Literal("error"), Type.Literal("warn"), Type.Literal("info")]),
+    code: NonEmptyString,
+    message: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsValidateResultSchema = Type.Object(
+  {
+    ok: Type.Boolean(),
+    frontmatter: Type.Object(
+      {
+        name: Type.Optional(Type.String()),
+        description: Type.Optional(Type.String()),
+        emoji: Type.Optional(Type.String()),
+        primaryEnv: Type.Optional(Type.String()),
+        os: Type.Optional(Type.Array(Type.String())),
+        requires: Type.Optional(
+          Type.Object(
+            {
+              bins: Type.Optional(Type.Array(Type.String())),
+              env: Type.Optional(Type.Array(Type.String())),
+            },
+            { additionalProperties: true },
+          ),
+        ),
+      },
+      { additionalProperties: true },
+    ),
+    injectionScan: Type.Object(
+      {
+        severity: Type.Union([
+          Type.Literal("ok"),
+          Type.Literal("low"),
+          Type.Literal("medium"),
+          Type.Literal("critical"),
+        ]),
+        flags: Type.Array(Type.String()),
+        weight: Type.Number(),
+        reason: Type.String(),
+      },
+      { additionalProperties: false },
+    ),
+    diagnostics: Type.Array(SkillValidationDiagnosticSchema),
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Sign-and-publish over the P2P skill gossipsub topic.
+ * The orchestrator does the signing using the local node identity key.
+ */
+export const SkillsPublishParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    content: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+// ── PLAN-15 Phase 2c: skill_manage / promote / rollback gateway surface ────
+
+const SkillManageBaseFields = {
+  name: NonEmptyString,
+  reason: NonEmptyString,
+  author: Type.Optional(NonEmptyString),
+};
+
+/**
+ * Stage a skill mutation through the SICA staging-gate pipeline. The action
+ * field discriminates the rest of the payload.
+ */
+export const SkillsManageParamsSchema = Type.Union([
+  Type.Object(
+    {
+      action: Type.Literal("create"),
+      ...SkillManageBaseFields,
+      content: NonEmptyString,
+      overwriteLive: Type.Optional(Type.Boolean()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      action: Type.Literal("edit"),
+      ...SkillManageBaseFields,
+      content: NonEmptyString,
+      acceptHighRiskDiff: Type.Optional(Type.Boolean()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      action: Type.Literal("patch"),
+      ...SkillManageBaseFields,
+      oldString: NonEmptyString,
+      newString: Type.String(),
+      replaceAll: Type.Optional(Type.Boolean()),
+      acceptHighRiskDiff: Type.Optional(Type.Boolean()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      action: Type.Literal("delete"),
+      ...SkillManageBaseFields,
+      note: Type.Optional(Type.String()),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      action: Type.Literal("consolidate"),
+      ...SkillManageBaseFields,
+      into: NonEmptyString,
+    },
+    { additionalProperties: false },
+  ),
+]);
+
+export const SkillsManageGateIssueSchema = Type.Object(
+  {
+    kind: NonEmptyString,
+    detail: Type.String(),
+    severity: Type.Union([Type.Literal("info"), Type.Literal("warn"), Type.Literal("block")]),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsManageResultSchema = Type.Object(
+  {
+    ok: Type.Boolean(),
+    action: NonEmptyString,
+    name: NonEmptyString,
+    stagedFilePath: Type.Optional(NonEmptyString),
+    gateOutcome: Type.Optional(
+      Type.Union([Type.Literal("pass"), Type.Literal("warn"), Type.Literal("fail")]),
+    ),
+    gateSummary: Type.Optional(Type.String()),
+    gateIssues: Type.Optional(Type.Array(SkillsManageGateIssueSchema)),
+    baselineRuns: Type.Optional(Type.Integer({ minimum: 0 })),
+    baselineSuccessRate: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+    error: Type.Optional(NonEmptyString),
+    detail: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+/** PLAN-44 Phase 2: corpus review — accept/reject mined capability-task drafts. */
+export const SkillsEvolutionCorpusReviewParamsSchema = Type.Object(
+  {
+    ids: Type.Array(NonEmptyString, { minItems: 1, maxItems: 50 }),
+    reviewedBy: Type.Optional(NonEmptyString),
+    reason: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+/** B8: explicit human verdict on one run (level-4 outcome evidence). */
+export const SkillsEvolutionFeedbackParamsSchema = Type.Object(
+  {
+    runId: NonEmptyString,
+    verdict: Type.Union([Type.Literal("confirmed"), Type.Literal("rejected")]),
+    note: Type.Optional(Type.String({ maxLength: 500 })),
+    by: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+/** PLAN-45 Phase 1.5: build a blind labeler-calibration set from real runs. */
+export const SkillsEvolutionCalibrationExportParamsSchema = Type.Object(
+  {
+    count: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+    seed: Type.Optional(Type.String({ maxLength: 64 })),
+    /** Also record the judge's label for every selected trace (two LLM calls each). */
+    withJudge: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+/** PLAN-45 Phase 1.5: score human label files against the labeler's key. */
+export const SkillsEvolutionCalibrationScoreParamsSchema = Type.Object(
+  {
+    dir: NonEmptyString,
+    labels: Type.Array(NonEmptyString, { minItems: 1, maxItems: 2 }),
+  },
+  { additionalProperties: false },
+);
+
+/** Promote staged content to live. */
+export const SkillsPromoteParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    reason: Type.Optional(NonEmptyString),
+    author: Type.Optional(NonEmptyString),
+    /** Override a failed gate. Defaults false. */
+    forceGate: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsPromoteResultSchema = Type.Object(
+  {
+    ok: Type.Boolean(),
+    kind: Type.Optional(
+      Type.Union([Type.Literal("edit"), Type.Literal("tombstone"), Type.Literal("consolidate")]),
+    ),
+    previousArchivedVersion: Type.Optional(Type.Integer({ minimum: 1 })),
+    error: Type.Optional(NonEmptyString),
+    detail: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+/** Restore an archived version to live. */
+export const SkillsRollbackParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    version: Type.Integer({ minimum: 1 }),
+    reason: Type.Optional(NonEmptyString),
+    author: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsRollbackResultSchema = Type.Object(
+  {
+    ok: Type.Boolean(),
+    previousArchivedVersion: Type.Optional(Type.Integer({ minimum: 1 })),
+    error: Type.Optional(NonEmptyString),
+    detail: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsPublishResultSchema = Type.Object(
+  {
+    ok: Type.Boolean(),
+    /** Skill content hash (sha256 hex) used as the version key. */
+    contentHash: Type.Optional(NonEmptyString),
+    /** Estimated number of peers that received the message. */
+    deliveredTo: Type.Optional(Type.Integer({ minimum: 0 })),
+    error: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Upload a SKILL.md to agentskills.io. Requires `skills.agentskills.enabled`
+ * and an API key configured under `skills.agentskills.apiKey`.
+ */
+export const SkillsUploadAgentskillsParamsSchema = Type.Object(
+  {
+    name: NonEmptyString,
+    content: NonEmptyString,
+    /** Optional human label; defaults to name. */
+    title: Type.Optional(Type.String()),
+    /** Visibility: 'public' (default) or 'unlisted'. */
+    visibility: Type.Optional(Type.Union([Type.Literal("public"), Type.Literal("unlisted")])),
+  },
+  { additionalProperties: false },
+);
+
+export const SkillsUploadAgentskillsResultSchema = Type.Object(
+  {
+    ok: Type.Boolean(),
+    slug: Type.Optional(NonEmptyString),
+    upstreamUrl: Type.Optional(NonEmptyString),
+    error: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);

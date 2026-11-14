@@ -1,0 +1,727 @@
+/**
+ * A2A Client — Outbound agent-to-agent task execution.
+ *
+ * Flow:
+ * 1. Discover peer agent (via Agent Card at /.well-known/agent.json)
+ * 2. Check if skill is available and get pricing
+ * 3. Execute x402 payment via wallet
+ * 4. Send task via JSON-RPC message/send
+ * 5. Collect result and record purchase
+ */
+
+import crypto from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { CommerceReputationLedger, type CommerceOutcome } from "../memory/commerce-reputation.js";
+import type { GatedSendOptions } from "../payments/ap2/gate.js";
+import type { WalletService } from "./wallet-service.js";
+
+const log = createSubsystemLogger("a2a-client");
+
+export type SignedPaymentPayload = {
+  txHash: string;
+  amount: number;
+  sender: string;
+  recipient: string;
+  timestamp: number;
+  version: "v1" | "v2";
+  /**
+   * v2 only: the hash of the bound AP2 payment mandate (`mandateHash`). Binding
+   * the mandate into the token signature means a stripped or tampered mandate
+   * yields a different hash, so the recovered signer no longer matches the
+   * declared sender and the token fails verification (PLAN-48 Phase 5 / PLAN-47
+   * finding C). Omitted for v1 (byte-compatible with legacy signed tokens).
+   */
+  mandateHash?: string;
+};
+
+/**
+ * Canonical signing string for a payment payload. Both signer and verifier
+ * MUST produce the same string for a given payload, so the field order is
+ * fixed (NOT JSON.stringify with object key order, which is not portable).
+ *
+ * Format (v1): `bitterbot-x402:v1:<recipient>:<txHash>:<amount-usdc>:<sender>:<ts-ms>`
+ * Format (v2): the v1 fields, then `:<mandateHash>` (binds the AP2 mandate).
+ *
+ * Lower-cased addresses for canonical form. Amount is the human-readable USDC
+ * value (matches what the buyer signs and what the seller verifies).
+ */
+export function canonicalizePaymentPayload(payload: SignedPaymentPayload): string {
+  const parts = [
+    "bitterbot-x402",
+    payload.version,
+    payload.recipient.toLowerCase(),
+    payload.txHash.toLowerCase(),
+    String(payload.amount),
+    payload.sender.toLowerCase(),
+    String(payload.timestamp),
+  ];
+  // v2 appends the bound mandate hash. v1 is left untouched so existing tokens
+  // and peers that never emit a mandate verify exactly as before.
+  if (payload.version === "v2") parts.push(payload.mandateHash ?? "");
+  return parts.join(":");
+}
+
+export interface A2aClientConfig {
+  /** Maximum USDC to spend per A2A task. Default: 0.50 */
+  maxTaskCostUsdc: number;
+  /** Maximum USDC to spend per day on outbound A2A tasks. Default: 2.00.
+   *  Without this, LLM retry loops can drain the wallet overnight.
+   *  (Gemini peer review: autonomous spend death loop fix) */
+  dailySpendLimitUsdc: number;
+  /** Request timeout in ms. Default: 60000 (1 minute) */
+  taskTimeoutMs: number;
+  /**
+   * Attach an AP2 payment mandate to outbound x402 payments (PLAN-47 Phase 1).
+   * Default: true. The mandate is advisory metadata alongside the x402 token —
+   * absence never breaks a peer, so this is safe on by default. Kill switch:
+   * a2a.payment.ap2.enabled.
+   */
+  ap2Enabled: boolean;
+  /**
+   * Require an active human-set spend grant to cover an outbound payment
+   * (PLAN-48 Phase 1). Default: false. When true, a spend with no covering grant
+   * is refused and an approval request is raised instead of paying; when false,
+   * a covering grant (if any) still back-references the consent, but its absence
+   * does not block. Kill switch: a2a.payment.consent.grantsRequired.
+   */
+  grantsRequired: boolean;
+}
+
+export interface PeerAgent {
+  url: string;
+  name: string;
+  description: string;
+  skills: Array<{ id: string; name: string; description: string }>;
+  paymentRequired: boolean;
+  paymentAddress?: string;
+  minPayment?: number;
+}
+
+export interface A2aTaskResult {
+  success: boolean;
+  taskId?: string;
+  response?: string;
+  artifacts?: Array<{ name?: string; content: string }>;
+  amountPaid?: number;
+  txHash?: string;
+  error?: string;
+}
+
+/**
+ * What an outbound result says about the PEER. Our own refusals (price
+ * cap, daily cap, our wallet) and HTTP 4xx (auth/payment/rate-limit: the
+ * peer answered, we did not qualify) are NOT the peer's fault and are not
+ * recorded (3d adversarial: a spend cap must never quarantine honest
+ * sellers). Network errors and 5xx are "unreachable"; a delivered-but-
+ * failed task is "failed".
+ */
+export function classifyOutcome(result: A2aTaskResult): CommerceOutcome | null {
+  if (result.success) {
+    return "answered";
+  }
+  const err = result.error ?? "";
+  if (
+    /^(Price \$|Daily A2A spend limit|Payment failed|Payment required but pricing|Peer is commerce-quarantined|Spend awaiting approval|Spend grant)/.test(
+      err,
+    )
+  ) {
+    return null;
+  }
+  const http = /^A2A request failed( after payment)?: (\d{3})$/.exec(err);
+  if (http) {
+    return Number(http[2]) >= 500 ? "dial_failure" : null;
+  }
+  if (/^A2A request failed( after payment)?: /.test(err)) {
+    return "dial_failure";
+  }
+  return "failed";
+}
+
+export class A2aClient {
+  private readonly config: A2aClientConfig;
+  private readonly db?: DatabaseSync;
+  private commerceLedger?: CommerceReputationLedger;
+
+  constructor(config?: Partial<A2aClientConfig>, db?: DatabaseSync) {
+    this.config = {
+      maxTaskCostUsdc: config?.maxTaskCostUsdc ?? 0.5,
+      dailySpendLimitUsdc: config?.dailySpendLimitUsdc ?? 2.0,
+      taskTimeoutMs: config?.taskTimeoutMs ?? 60_000,
+      ap2Enabled: config?.ap2Enabled ?? true,
+      grantsRequired: config?.grantsRequired ?? false,
+    };
+    this.db = db;
+  }
+
+  /**
+   * Check if daily outbound spend limit has been reached.
+   * MUST be called before every outbound payment.
+   * Without it, LLM retry loops can drain the wallet.
+   * (Gemini peer review fix)
+   */
+  checkDailySpendLimit(): { allowed: boolean; spent: number; remaining: number } {
+    if (!this.db) {
+      return { allowed: true, spent: 0, remaining: this.config.dailySpendLimitUsdc };
+    }
+
+    try {
+      const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const row = this.db
+        .prepare(`
+        SELECT COALESCE(SUM(amount_usdc), 0) as total
+        FROM marketplace_purchases
+        WHERE direction = 'purchase' AND purchased_at >= ?
+      `)
+        .get(oneDayAgo) as { total: number };
+
+      const spent = row.total;
+      const remaining = this.config.dailySpendLimitUsdc - spent;
+      return { allowed: remaining > 0, spent, remaining: Math.max(0, remaining) };
+    } catch {
+      return { allowed: true, spent: 0, remaining: this.config.dailySpendLimitUsdc };
+    }
+  }
+
+  /**
+   * Persist an outbound payment as a marketplace purchase row. These rows
+   * drive checkDailySpendLimit, spend reporting, and demand-driven dream
+   * intelligence, so a missing db (no marketplace) only degrades those —
+   * the payment itself already happened.
+   */
+  private recordOutboundPurchase(params: {
+    agentUrl: string;
+    amountUsdc: number;
+    txHash: string;
+  }): void {
+    if (!this.db) {
+      return;
+    }
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO marketplace_purchases
+             (id, skill_crystal_id, buyer_peer_id, amount_usdc, tx_hash, direction, purchased_at)
+           VALUES (?, ?, ?, ?, ?, 'purchase', ?)`,
+        )
+        .run(
+          crypto.randomUUID(),
+          `a2a:${params.agentUrl}`,
+          "local",
+          params.amountUsdc,
+          params.txHash,
+          Date.now(),
+        );
+    } catch (err) {
+      log.debug(`failed to record outbound purchase: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Discover a peer agent by fetching its Agent Card.
+   */
+  async discoverAgent(agentUrl: string): Promise<PeerAgent | null> {
+    const cardUrl = `${agentUrl.replace(/\/+$/, "")}/.well-known/agent.json`;
+    try {
+      const response = await fetch(cardUrl, { signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) {
+        return null;
+      }
+      const card = (await response.json()) as {
+        url: string;
+        name: string;
+        description: string;
+        skills: Array<{ id: string; name: string; description: string }>;
+        extensions?: Record<string, unknown>;
+      };
+
+      const paymentExt = card.extensions?.["x402-payment"] as
+        | {
+            address?: string;
+            minPayment?: string;
+          }
+        | undefined;
+
+      return {
+        url: card.url,
+        name: card.name,
+        description: card.description,
+        skills: card.skills.map((s) => ({ id: s.id, name: s.name, description: s.description })),
+        paymentRequired: !!paymentExt,
+        paymentAddress: paymentExt?.address,
+        minPayment: paymentExt?.minPayment ? parseFloat(paymentExt.minPayment) : undefined,
+      };
+    } catch (err) {
+      log.debug(`Failed to discover agent at ${agentUrl}: ${String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Execute a task on a peer agent, handling payment if required.
+   */
+  async executeTask(params: {
+    agentUrl: string;
+    message: string;
+    walletService?: WalletService;
+    /** PLAN-43 Phase 1: exact-ID metered skill invocation on the seller. */
+    skillId?: string;
+    /** Seller/author pubkey when known (marketplace entry): joins endpoint standing to fraud verdicts. */
+    peerPubkey?: string | null;
+  }): Promise<A2aTaskResult> {
+    // PLAN-43 Phase 3 (§3.7): commerce standing is built from what this
+    // node actually observed. A quarantined peer (stopped answering, or
+    // attested fraud) gets no more of this node's money until the window
+    // passes; every attempt is recorded as answered / unreachable / failed.
+    const ledger = this.commerce;
+    const quarantine = ledger?.quarantineFor(params.agentUrl, Date.now(), params.peerPubkey);
+    if (quarantine) {
+      return {
+        success: false,
+        error: `Peer is commerce-quarantined until ${new Date(quarantine.until).toISOString()} (${quarantine.reason})`,
+      };
+    }
+    const startedAt = Date.now();
+    let result: A2aTaskResult;
+    try {
+      result = await this.executeTaskUncounted(params);
+    } catch (err) {
+      // A malformed body from the peer must count against the peer, not
+      // escape the ledger as a raw exception.
+      result = { success: false, error: `A2A response unusable: ${String(err)}` };
+    }
+    const outcome = classifyOutcome(result);
+    if (ledger && outcome) {
+      try {
+        ledger.recordOutcome({
+          agentUrl: params.agentUrl,
+          ...(params.peerPubkey ? { peerPubkey: params.peerPubkey } : {}),
+          outcome,
+          latencyMs: Date.now() - startedAt,
+        });
+      } catch (err) {
+        log.debug(`commerce ledger write failed: ${String(err)}`);
+      }
+    }
+    return result;
+  }
+
+  private get commerce(): CommerceReputationLedger | undefined {
+    if (!this.db) {
+      return undefined;
+    }
+    this.commerceLedger ??= new CommerceReputationLedger(this.db);
+    return this.commerceLedger;
+  }
+
+  private async executeTaskUncounted(params: {
+    agentUrl: string;
+    message: string;
+    walletService?: WalletService;
+    skillId?: string;
+  }): Promise<A2aTaskResult> {
+    const a2aUrl = `${params.agentUrl.replace(/\/+$/, "")}/a2a`;
+
+    // First attempt — may return 402
+    const rpcPayload = {
+      jsonrpc: "2.0",
+      method: "message/send",
+      params: {
+        message: {
+          role: "user",
+          parts: [{ type: "text", text: params.message }],
+        },
+        ...(params.skillId ? { skillId: params.skillId } : {}),
+      },
+      id: crypto.randomUUID(),
+    };
+
+    let response: Response;
+    try {
+      response = await fetch(a2aUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(rpcPayload),
+        signal: AbortSignal.timeout(this.config.taskTimeoutMs),
+      });
+    } catch (err) {
+      return { success: false, error: `A2A request failed: ${String(err)}` };
+    }
+
+    // Handle 402 — payment required
+    if (response.status === 402 && params.walletService) {
+      const body = (await response.json()) as {
+        error?: { data?: { payTo?: string; pricing?: { priceUsdc: number } } };
+      };
+
+      const payTo = body.error?.data?.payTo;
+      const price = body.error?.data?.pricing?.priceUsdc;
+
+      if (!payTo || !price) {
+        return { success: false, error: "Payment required but pricing info missing" };
+      }
+
+      if (price > this.config.maxTaskCostUsdc) {
+        return {
+          success: false,
+          error: `Price $${price} exceeds per-task max $${this.config.maxTaskCostUsdc}`,
+        };
+      }
+
+      // Check daily spend limit before paying
+      const spendCheck = this.checkDailySpendLimit();
+      if (!spendCheck.allowed || price > spendCheck.remaining) {
+        return {
+          success: false,
+          error: `Daily A2A spend limit reached ($${spendCheck.spent.toFixed(2)}/$${this.config.dailySpendLimitUsdc.toFixed(2)}). Remaining: $${spendCheck.remaining.toFixed(2)}`,
+        };
+      }
+
+      // PLAN-48: spend-grant gate. Resolve the human-set grant that covers this
+      // spend (best-effort — the grant_ref back-references the consent). When
+      // grantsRequired is on, an uncovered spend does NOT pay: it raises an
+      // approval request and refuses, so the human can approve out-of-scope
+      // spends (Phase 2) instead of the agent spending unbidden.
+      let grantRef: string | undefined;
+      let releaseGrantHold: (() => void) | undefined;
+      if (this.db) {
+        try {
+          const { SpendGrantStore } = await import("../payments/grants/spend-grant-store.js");
+          const { verifyEd25519 } = await import("../payments/ap2/ed25519.js");
+          const { notifyEscalation } = await import("../payments/grants/escalation-notifier.js");
+          // Deliver a raised escalation to the operator's primary channel so an
+          // out-of-scope spend is not left waiting on the UI poll alone.
+          const { isSingleUseGrant } = await import("../payments/grants/spend-grant-store.js");
+          const store = new SpendGrantStore(this.db, (approval) => void notifyEscalation(approval));
+          const cov = store.activeGrantFor({ payee: payTo, amountUsd: price, verifyEd25519 });
+          // A one-time (approval) grant authorizes exactly one spend: claim it
+          // atomically before paying so a replay, retry, or concurrent spend
+          // cannot reuse it (period accounting alone leaves a TOCTOU window).
+          if (
+            cov.grant &&
+            isSingleUseGrant(cov.grant) &&
+            !store.claimSingleUse(cov.grant.claims.grant_id)
+          ) {
+            cov.grant = null;
+            cov.reason = "one-time approval already used";
+          }
+          if (cov.grant) {
+            const grantId = cov.grant.claims.grant_id;
+            grantRef = grantId;
+            // Count the spend against the period allowance now, before paying, so
+            // concurrent hires can't all pass the same remaining allowance. A
+            // failed payment hands it back as an offsetting usage row.
+            store.recordUsage(grantId, price);
+            releaseGrantHold = () => store.recordUsage(grantId, -price);
+          } else if (this.config.grantsRequired) {
+            store.requestApproval({
+              payee: payTo,
+              amountUsd: price,
+              reason: `A2A task at ${params.agentUrl}`,
+            });
+            return {
+              success: false,
+              error: `Spend awaiting approval: no active grant covers $${price} to ${payTo} (${cov.reason}). Approve it to proceed.`,
+            };
+          }
+        } catch (err) {
+          if (this.config.grantsRequired) {
+            return { success: false, error: `Spend grant check failed: ${String(err)}` };
+          }
+          log.debug(`spend-grant lookup skipped: ${String(err)}`);
+        }
+      } else if (this.config.grantsRequired) {
+        return {
+          success: false,
+          error: "Spend grants required but no grant store (marketplace db) available",
+        };
+      }
+
+      // Pay via wallet
+      let payment: { txHash: string };
+      try {
+        payment = await params.walletService.sendUsdc(
+          payTo,
+          price,
+          // A standing grant the owner signed is their approval (spend gate).
+          grantRef ? ({ authorizedByGrant: grantRef } as GatedSendOptions) : undefined,
+        );
+      } catch (err) {
+        releaseGrantHold?.();
+        return { success: false, error: `Payment failed: ${String(err)}` };
+      }
+
+      // Record the spend immediately — money has left the wallet even if the
+      // task fails after this point. The daily spend limit reads these rows.
+      this.recordOutboundPurchase({
+        agentUrl: params.agentUrl,
+        amountUsdc: price,
+        txHash: payment.txHash,
+      });
+
+      // Build a signed payment token. The signature binds the proof to
+      // (recipient, txHash, amount, sender, timestamp) so a leaked txHash
+      // can't be replayed against a different recipient by another agent.
+      // The verifier recovers the signer from the signature and confirms it
+      // matches the on-chain Transfer event sender.
+      const sender = await params.walletService.getAddress();
+      const timestamp = Date.now();
+
+      // PLAN-47 Phase 1: attach an AP2 payment mandate alongside the x402 token.
+      // Signed proof that this spend was authorized under a standing delegated
+      // budget (per-task max + daily ceiling). Advisory: a peer that doesn't
+      // understand `ap2` ignores it, and any failure here falls back to the
+      // plain token, so this never breaks settlement.
+      let ap2:
+        | { intent: unknown; payment: unknown; consent?: unknown; binding?: unknown }
+        | undefined;
+      if (this.config.ap2Enabled) {
+        try {
+          const { issueIntentMandate, issuePaymentMandate, usdc } =
+            await import("../payments/ap2/mandate.js");
+          const sign = (canonical: string) => params.walletService!.signMessage(canonical);
+          const intentMandate = await issueIntentMandate({
+            agentAddress: sender,
+            maxAmount: usdc(this.config.maxTaskCostUsdc),
+            totalAmount: usdc(this.config.dailySpendLimitUsdc),
+            promptPlayback: "pay a peer agent for the task the user asked me to run",
+            ttlMs: 24 * 60 * 60 * 1000,
+            sign,
+          });
+
+          // PLAN-47 Phase 4.x: Circles consent lineage. Sign a spend consent with
+          // the node's Ed25519 device identity (its Circles key) and a binding
+          // that ties that key to the paying wallet, so the settling party can
+          // prove this spend traces to the same principal that controls both
+          // keys — provenance an AP2-only stack can't produce. Best-effort: any
+          // failure just omits consent and ships the mandate alone.
+          let consent: unknown;
+          let binding: unknown;
+          let consentRef: string | undefined;
+          try {
+            const nodeCrypto = await import("node:crypto");
+            const { keyPairFromPrivateKeyPem, pubkeyId } = await import("../commerce/envelope.js");
+            const { loadOrCreateDeviceIdentity } = await import("../infra/device-identity.js");
+            const { buildSpendConsent, buildIdentityBinding, consentId } =
+              await import("../payments/ap2/consent.js");
+            const circleKey = keyPairFromPrivateKeyPem(loadOrCreateDeviceIdentity().privateKeyPem);
+            const circlePubkey = pubkeyId(circleKey);
+            const signCircle = (msg: string) =>
+              nodeCrypto.sign(null, Buffer.from(msg), circleKey.privateKey).toString("hex");
+            const spendConsent = buildSpendConsent({
+              walletAddress: sender,
+              circlePubkey,
+              maxAmount: usdc(this.config.maxTaskCostUsdc),
+              allowedPayees: ["*"],
+              grantRef,
+              ttlMs: 24 * 60 * 60 * 1000,
+              signCircle,
+            });
+            binding = await buildIdentityBinding({
+              walletAddress: sender,
+              circlePubkey,
+              signWallet: sign,
+              signCircle,
+            });
+            consent = spendConsent;
+            consentRef = consentId(spendConsent.claims);
+          } catch (err) {
+            log.debug(`AP2 consent lineage skipped: ${String(err)}`);
+          }
+
+          const paymentMandate = await issuePaymentMandate({
+            intent: intentMandate,
+            agentAddress: sender,
+            payee: { id: payTo },
+            amount: usdc(price),
+            instrument: { id: sender, type: "x402-usdc", description: "USDC on Base via x402" },
+            transactionId: payment.txHash,
+            ttlMs: 5 * 60 * 1000,
+            consentRef,
+            sign,
+          });
+          ap2 = { intent: intentMandate, payment: paymentMandate, consent, binding };
+        } catch (err) {
+          // Non-fatal (e.g. over-limit would have been caught upstream, or a
+          // signing failure): ship the plain x402 token.
+          log.debug(`AP2 mandate emission skipped: ${String(err)}`);
+        }
+      }
+
+      // Sign the token AFTER the mandate so a v2 token can bind the mandate hash
+      // into its signature (PLAN-48 Phase 5 / PLAN-47 finding C): with a mandate
+      // attached we sign a v2 payload carrying mandateHash, so the mandate cannot
+      // be stripped or altered without invalidating the token. With no mandate we
+      // sign a plain v1 token, unchanged and backward-compatible.
+      let boundMandateHash: string | undefined;
+      if (ap2) {
+        try {
+          const { mandateHash } = await import("../payments/ap2/mandate.js");
+          boundMandateHash = mandateHash(ap2.payment as never);
+        } catch (err) {
+          log.debug(`mandate-hash binding skipped: ${String(err)}`);
+        }
+      }
+      const tokenPayload: SignedPaymentPayload = boundMandateHash
+        ? {
+            txHash: payment.txHash,
+            amount: price,
+            sender,
+            recipient: payTo,
+            timestamp,
+            version: "v2",
+            mandateHash: boundMandateHash,
+          }
+        : {
+            txHash: payment.txHash,
+            amount: price,
+            sender,
+            recipient: payTo,
+            timestamp,
+            version: "v1",
+          };
+      let signature: string | undefined;
+      try {
+        signature = await params.walletService.signMessage(
+          canonicalizePaymentPayload(tokenPayload),
+        );
+      } catch (err) {
+        // Signing failure is non-fatal — fall back to unsigned token. The
+        // verifier still checks recipient/amount on-chain; the signature is
+        // defense-in-depth against off-chain replay vectors.
+        log.debug(`payment signature failed (continuing unsigned): ${String(err)}`);
+      }
+
+      const paymentToken = Buffer.from(
+        JSON.stringify({ ...tokenPayload, signature, ap2 }),
+      ).toString("base64");
+
+      try {
+        response = await fetch(a2aUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Payment-Token": paymentToken,
+          },
+          body: JSON.stringify({ ...rpcPayload, id: crypto.randomUUID() }),
+          signal: AbortSignal.timeout(this.config.taskTimeoutMs),
+        });
+      } catch (err) {
+        return {
+          success: false,
+          error: `A2A request failed after payment: ${String(err)}`,
+          amountPaid: price,
+          txHash: payment.txHash,
+        };
+      }
+
+      if (!response.ok) {
+        return {
+          success: false,
+          error: `A2A request failed after payment: ${response.status}`,
+          amountPaid: price,
+          txHash: payment.txHash,
+        };
+      }
+
+      const result = (await response.json()) as {
+        result?: CreatedTaskShape;
+      };
+      const settled = await this.awaitTaskResult(a2aUrl, result.result);
+      return {
+        success: settled.success,
+        ...(settled.error ? { error: settled.error } : {}),
+        taskId: result.result?.id,
+        response: settled.response,
+        amountPaid: price,
+        txHash: payment.txHash,
+      };
+    }
+
+    if (!response.ok) {
+      return { success: false, error: `A2A request failed: ${response.status}` };
+    }
+
+    const result = (await response.json()) as {
+      result?: CreatedTaskShape;
+    };
+    const settled = await this.awaitTaskResult(a2aUrl, result.result);
+    return {
+      success: settled.success,
+      ...(settled.error ? { error: settled.error } : {}),
+      taskId: result.result?.id,
+      response: settled.response,
+    };
+  }
+
+  /**
+   * PLAN-43 Phase 1: message/send returns the task in "working" state — the
+   * result does not exist yet (previously this client read the immediate
+   * response and buyers effectively never received their paid output).
+   * Poll tasks/get with the per-task access token until a final state.
+   */
+  private async awaitTaskResult(
+    a2aUrl: string,
+    created: CreatedTaskShape | undefined,
+  ): Promise<{ success: boolean; response?: string; error?: string }> {
+    const immediate = lastTextFromTask(created);
+    const state = created?.status?.state;
+    if (!created?.id || state === "completed") {
+      return { success: true, response: immediate };
+    }
+    if (state === "failed" || state === "canceled") {
+      return { success: false, error: immediate ?? `task ${state}` };
+    }
+    const deadline = Date.now() + this.config.taskTimeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      let task: CreatedTaskShape | undefined;
+      try {
+        const res = await fetch(a2aUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "tasks/get",
+            params: {
+              id: created.id,
+              ...(created.accessToken ? { accessToken: created.accessToken } : {}),
+            },
+            id: crypto.randomUUID(),
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) {
+          continue;
+        }
+        task = ((await res.json()) as { result?: CreatedTaskShape }).result;
+      } catch {
+        continue;
+      }
+      const polledState = task?.status?.state;
+      if (polledState === "completed") {
+        return { success: true, response: lastTextFromTask(task) };
+      }
+      if (polledState === "failed" || polledState === "canceled") {
+        return { success: false, error: lastTextFromTask(task) ?? `task ${polledState}` };
+      }
+    }
+    return { success: false, error: "timed out waiting for task result" };
+  }
+}
+
+type CreatedTaskShape = {
+  id?: string;
+  accessToken?: string;
+  status?: { state?: string; message?: { parts?: Array<{ text?: string }> } };
+  artifacts?: Array<{ parts?: Array<{ text?: string }> }>;
+};
+
+function lastTextFromTask(task: CreatedTaskShape | undefined): string | undefined {
+  const artifactText = task?.artifacts
+    ?.flatMap((a) => a.parts ?? [])
+    .map((p) => p.text)
+    .filter((t): t is string => Boolean(t))
+    .at(-1);
+  return artifactText ?? task?.status?.message?.parts?.[0]?.text;
+}

@@ -1,0 +1,1386 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import JSON5 from "json5";
+import { loadDotEnv } from "../infra/dotenv.js";
+import { resolveRequiredHomeDir } from "../infra/home-dir.js";
+import { installerOutputMode } from "../infra/installer-env.js";
+import {
+  loadShellEnvFallback,
+  resolveShellEnvFallbackTimeoutMs,
+  shouldDeferShellEnvFallback,
+  shouldEnableShellEnvFallback,
+} from "../infra/shell-env.js";
+import { VERSION } from "../version.js";
+import { DuplicateAgentDirError, findDuplicateAgentDirs } from "./agent-dirs.js";
+import { rotateConfigBackups } from "./backup-rotation.js";
+import {
+  applyCompactionDefaults,
+  applyContextPruningDefaults,
+  applyAgentDefaults,
+  applyLoggingDefaults,
+  applyMessageDefaults,
+  applyA2aDefaults,
+  applyCirclesDefaults,
+  applyModelDefaults,
+  applyP2pDefaults,
+  applySessionDefaults,
+  applyTalkApiKey,
+} from "./defaults.js";
+import { restoreEnvVarRefs } from "./env-preserve.js";
+import {
+  MissingEnvVarError,
+  containsEnvVarReference,
+  resolveConfigEnvVars,
+} from "./env-substitution.js";
+import { applyConfigEnvVars } from "./env-vars.js";
+import { ConfigIncludeError, resolveConfigIncludes } from "./includes.js";
+import { SHELL_ENV_EXPECTED_KEYS } from "./known-env-vars.js";
+import { findLegacyConfigIssues } from "./legacy.js";
+import { applyMergePatch } from "./merge-patch.js";
+import { normalizeConfigPaths } from "./normalize-paths.js";
+import { resolveConfigPath, resolveDefaultConfigCandidates, resolveStateDir } from "./paths.js";
+import { applyConfigOverrides } from "./runtime-overrides.js";
+import { DEPRECATED_ONLY_WHEN, DEPRECATED_PATHS } from "./schema.defaults.js";
+import type { BitterbotConfig, ConfigFileSnapshot, LegacyConfigIssue } from "./types.js";
+import {
+  validateConfigObjectRawWithPlugins,
+  validateConfigObjectWithPlugins,
+} from "./validation.js";
+import { compareBitterbotVersions } from "./version.js";
+
+// Re-export for backwards compatibility
+export { CircularIncludeError, ConfigIncludeError } from "./includes.js";
+export { MissingEnvVarError } from "./env-substitution.js";
+
+const CONFIG_AUDIT_LOG_FILENAME = "config-audit.jsonl";
+const loggedInvalidConfigs = new Set<string>();
+
+type ConfigWriteAuditResult = "rename" | "copy-fallback" | "failed";
+
+type ConfigWriteAuditRecord = {
+  ts: string;
+  source: "config-io";
+  event: "config.write";
+  result: ConfigWriteAuditResult;
+  configPath: string;
+  pid: number;
+  ppid: number;
+  cwd: string;
+  argv: string[];
+  execArgv: string[];
+  watchMode: boolean;
+  watchSession: string | null;
+  watchCommand: string | null;
+  existsBefore: boolean;
+  previousHash: string | null;
+  nextHash: string | null;
+  previousBytes: number | null;
+  nextBytes: number | null;
+  changedPathCount: number | null;
+  hasMetaBefore: boolean;
+  hasMetaAfter: boolean;
+  gatewayModeBefore: string | null;
+  gatewayModeAfter: string | null;
+  suspicious: string[];
+  errorCode?: string;
+  errorMessage?: string;
+};
+
+export type ParseConfigJson5Result = { ok: true; parsed: unknown } | { ok: false; error: string };
+export type ConfigWriteOptions = {
+  /**
+   * Read-time env snapshot used to validate `${VAR}` restoration decisions.
+   * If omitted, write falls back to current process env.
+   */
+  envSnapshotForRestore?: Record<string, string | undefined>;
+  /**
+   * Optional safety check: only use envSnapshotForRestore when writing the
+   * same config file path that produced the snapshot.
+   */
+  expectedConfigPath?: string;
+};
+
+export type ReadConfigFileSnapshotForWriteResult = {
+  snapshot: ConfigFileSnapshot;
+  writeOptions: ConfigWriteOptions;
+};
+
+function hashConfigRaw(raw: string | null): string {
+  return crypto
+    .createHash("sha256")
+    .update(raw ?? "")
+    .digest("hex");
+}
+
+export function resolveConfigSnapshotHash(snapshot: {
+  hash?: string;
+  raw?: string | null;
+}): string | null {
+  if (typeof snapshot.hash === "string") {
+    const trimmed = snapshot.hash.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  if (typeof snapshot.raw !== "string") {
+    return null;
+  }
+  return hashConfigRaw(snapshot.raw);
+}
+
+function coerceConfig(value: unknown): BitterbotConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as BitterbotConfig;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasConfigMeta(value: unknown): boolean {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  const meta = value.meta;
+  return isPlainObject(meta);
+}
+
+function resolveGatewayMode(value: unknown): string | null {
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  const gateway = value.gateway;
+  if (!isPlainObject(gateway) || typeof gateway.mode !== "string") {
+    return null;
+  }
+  const trimmed = gateway.mode.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function cloneUnknown<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function createMergePatch(base: unknown, target: unknown): unknown {
+  if (!isPlainObject(base) || !isPlainObject(target)) {
+    return cloneUnknown(target);
+  }
+
+  const patch: Record<string, unknown> = {};
+  const keys = new Set([...Object.keys(base), ...Object.keys(target)]);
+  for (const key of keys) {
+    const hasBase = key in base;
+    const hasTarget = key in target;
+    if (!hasTarget) {
+      patch[key] = null;
+      continue;
+    }
+    const targetValue = target[key];
+    if (!hasBase) {
+      patch[key] = cloneUnknown(targetValue);
+      continue;
+    }
+    const baseValue = base[key];
+    if (isPlainObject(baseValue) && isPlainObject(targetValue)) {
+      const childPatch = createMergePatch(baseValue, targetValue);
+      if (isPlainObject(childPatch) && Object.keys(childPatch).length === 0) {
+        continue;
+      }
+      patch[key] = childPatch;
+      continue;
+    }
+    if (!configValuesEqual(baseValue, targetValue)) {
+      patch[key] = cloneUnknown(targetValue);
+    }
+  }
+  return patch;
+}
+
+/**
+ * Structural equality for config values (JSON data). Unlike
+ * isDeepStrictEqual it ignores prototypes, so an array or object made in
+ * another realm (structuredClone under a vm context, a worker's message)
+ * still equals its same-realm twin. With isDeepStrictEqual such a clone of
+ * the loaded config differed from the snapshot at every array, and a write
+ * froze those arrays (the fallback p2p.bootstrapPeers) into the file
+ * (drift-pass review HIGH-2).
+ */
+export function configValuesEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) {
+    return true;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((item, index) => configValuesEqual(item, b[index]));
+  }
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) {
+      return false;
+    }
+    const bRecord = b as Record<string, unknown>;
+    const aRecord = a as Record<string, unknown>;
+    return aKeys.every((key) => key in bRecord && configValuesEqual(aRecord[key], bRecord[key]));
+  }
+  return false;
+}
+
+function collectEnvRefPaths(value: unknown, path: string, output: Map<string, string>): void {
+  if (typeof value === "string") {
+    if (containsEnvVarReference(value)) {
+      output.set(path, value);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      collectEnvRefPaths(item, `${path}[${index}]`, output);
+    });
+    return;
+  }
+  if (isPlainObject(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = path ? `${path}.${key}` : key;
+      collectEnvRefPaths(child, childPath, output);
+    }
+  }
+}
+
+function collectChangedPaths(
+  base: unknown,
+  target: unknown,
+  path: string,
+  output: Set<string>,
+): void {
+  if (Array.isArray(base) && Array.isArray(target)) {
+    const max = Math.max(base.length, target.length);
+    for (let index = 0; index < max; index += 1) {
+      const childPath = path ? `${path}[${index}]` : `[${index}]`;
+      if (index >= base.length || index >= target.length) {
+        output.add(childPath);
+        continue;
+      }
+      collectChangedPaths(base[index], target[index], childPath, output);
+    }
+    return;
+  }
+  if (isPlainObject(base) && isPlainObject(target)) {
+    const keys = new Set([...Object.keys(base), ...Object.keys(target)]);
+    for (const key of keys) {
+      const childPath = path ? `${path}.${key}` : key;
+      const hasBase = key in base;
+      const hasTarget = key in target;
+      if (!hasTarget || !hasBase) {
+        output.add(childPath);
+        continue;
+      }
+      collectChangedPaths(base[key], target[key], childPath, output);
+    }
+    return;
+  }
+  if (!configValuesEqual(base, target)) {
+    output.add(path);
+  }
+}
+
+function parentPath(value: string): string {
+  if (!value) {
+    return "";
+  }
+  if (value.endsWith("]")) {
+    const index = value.lastIndexOf("[");
+    return index > 0 ? value.slice(0, index) : "";
+  }
+  const index = value.lastIndexOf(".");
+  return index >= 0 ? value.slice(0, index) : "";
+}
+
+function isPathChanged(path: string, changedPaths: Set<string>): boolean {
+  if (changedPaths.has(path)) {
+    return true;
+  }
+  let current = parentPath(path);
+  while (current) {
+    if (changedPaths.has(current)) {
+      return true;
+    }
+    current = parentPath(current);
+  }
+  return changedPaths.has("");
+}
+
+function restoreEnvRefsFromMap(
+  value: unknown,
+  path: string,
+  envRefMap: Map<string, string>,
+  changedPaths: Set<string>,
+): unknown {
+  if (typeof value === "string") {
+    if (!isPathChanged(path, changedPaths)) {
+      const original = envRefMap.get(path);
+      if (original !== undefined) {
+        return original;
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item, index) => {
+      const updated = restoreEnvRefsFromMap(item, `${path}[${index}]`, envRefMap, changedPaths);
+      if (updated !== item) {
+        changed = true;
+      }
+      return updated;
+    });
+    return changed ? next : value;
+  }
+  if (isPlainObject(value)) {
+    let changed = false;
+    const next: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = path ? `${path}.${key}` : key;
+      const updated = restoreEnvRefsFromMap(child, childPath, envRefMap, changedPaths);
+      if (updated !== child) {
+        changed = true;
+      }
+      next[key] = updated;
+    }
+    return changed ? next : value;
+  }
+  return value;
+}
+
+function resolveConfigAuditLogPath(env: NodeJS.ProcessEnv, homedir: () => string): string {
+  return path.join(resolveStateDir(env, homedir), "logs", CONFIG_AUDIT_LOG_FILENAME);
+}
+
+function resolveConfigWriteSuspiciousReasons(params: {
+  existsBefore: boolean;
+  previousBytes: number | null;
+  nextBytes: number | null;
+  hasMetaBefore: boolean;
+  gatewayModeBefore: string | null;
+  gatewayModeAfter: string | null;
+}): string[] {
+  const reasons: string[] = [];
+  if (!params.existsBefore) {
+    return reasons;
+  }
+  if (
+    typeof params.previousBytes === "number" &&
+    typeof params.nextBytes === "number" &&
+    params.previousBytes >= 512 &&
+    params.nextBytes < Math.floor(params.previousBytes * 0.5)
+  ) {
+    reasons.push(`size-drop:${params.previousBytes}->${params.nextBytes}`);
+  }
+  if (!params.hasMetaBefore) {
+    reasons.push("missing-meta-before-write");
+  }
+  if (params.gatewayModeBefore && !params.gatewayModeAfter) {
+    reasons.push("gateway-mode-removed");
+  }
+  return reasons;
+}
+
+async function appendConfigWriteAuditRecord(
+  deps: Required<ConfigIoDeps>,
+  record: ConfigWriteAuditRecord,
+): Promise<void> {
+  try {
+    const auditPath = resolveConfigAuditLogPath(deps.env, deps.homedir);
+    await deps.fs.promises.mkdir(path.dirname(auditPath), { recursive: true, mode: 0o700 });
+    await deps.fs.promises.appendFile(auditPath, `${JSON.stringify(record)}\n`, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+export type ConfigIoDeps = {
+  fs?: typeof fs;
+  json5?: typeof JSON5;
+  env?: NodeJS.ProcessEnv;
+  homedir?: () => string;
+  configPath?: string;
+  logger?: Pick<typeof console, "error" | "warn">;
+};
+
+function warnOnConfigMiskeys(raw: unknown, logger: Pick<typeof console, "warn">): void {
+  if (!raw || typeof raw !== "object") {
+    return;
+  }
+  const gateway = (raw as Record<string, unknown>).gateway;
+  if (!gateway || typeof gateway !== "object") {
+    return;
+  }
+  if ("token" in (gateway as Record<string, unknown>)) {
+    logger.warn(
+      'Config uses "gateway.token". This key is ignored; use "gateway.auth.token" instead.',
+    );
+  }
+}
+
+function readAtDottedPath(obj: unknown, path: string): unknown {
+  let cur: unknown = obj;
+  for (const part of path.split(".")) {
+    if (!cur || typeof cur !== "object") {
+      return undefined;
+    }
+    cur = (cur as Record<string, unknown>)[part];
+  }
+  return cur;
+}
+
+/**
+ * Resolve a registry path (`a.b`, `a.list[].b`) against a config object and
+ * return every value present. `[]` fans out over array elements.
+ */
+function collectAtRegistryPath(
+  obj: unknown,
+  path: string,
+): Array<{ path: string; value: unknown }> {
+  const idx = path.indexOf("[]");
+  if (idx === -1) {
+    const value = readAtDottedPath(obj, path);
+    return value === undefined ? [] : [{ path, value }];
+  }
+  const head = path.slice(0, idx);
+  const tail = path.slice(idx + 2).replace(/^\./, "");
+  const list = readAtDottedPath(obj, head);
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  const out: Array<{ path: string; value: unknown }> = [];
+  list.forEach((item, i) => {
+    for (const hit of collectAtRegistryPath(item, tail)) {
+      out.push({ path: `${head}[${i}].${hit.path}`, value: hit.value });
+    }
+  });
+  return out;
+}
+
+const warnedDeprecatedKeys = new Set<string>();
+
+/** @internal */
+export function resetDeprecatedConfigWarningsForTests(): void {
+  warnedDeprecatedKeys.clear();
+}
+
+/**
+ * Every deprecated key present in `raw` (DEPRECATED_PATHS), with its concrete
+ * path (`agents.list[1].runtime.engine`), value and reason. Keys in
+ * DEPRECATED_ONLY_WHEN count only for the listed value. Shared by the load
+ * warning and `bitterbot doctor`.
+ */
+export function findDeprecatedConfigKeys(
+  raw: unknown,
+): Array<{ path: string; value: unknown; reason: string }> {
+  if (!raw || typeof raw !== "object") {
+    return [];
+  }
+  const found: Array<{ path: string; value: unknown; reason: string }> = [];
+  for (const [registryPath, reason] of Object.entries(DEPRECATED_PATHS)) {
+    for (const hit of collectAtRegistryPath(raw, registryPath)) {
+      if (
+        registryPath in DEPRECATED_ONLY_WHEN &&
+        !isDeepStrictEqual(hit.value, DEPRECATED_ONLY_WHEN[registryPath])
+      ) {
+        continue;
+      }
+      found.push({ path: hit.path, value: hit.value, reason });
+    }
+  }
+  return found;
+}
+
+/**
+ * Count these deprecated keys as already reported in this process (the
+ * config check before a command said so in one line), so loading the
+ * config does not list them again.
+ */
+export function markDeprecatedConfigKeysWarned(paths: string[]): void {
+  for (const p of paths) {
+    warnedDeprecatedKeys.add(p);
+  }
+}
+
+/**
+ * PLAN-56 Phase 1: warn once per process for every deprecated key present in
+ * the config (DEPRECATED_PATHS). Keys in DEPRECATED_ONLY_WHEN warn only for
+ * the listed value. The schema keeps accepting them this release.
+ */
+export function warnOnDeprecatedConfigKeys(
+  raw: unknown,
+  logger: Pick<typeof console, "warn">,
+  options?: { once?: boolean },
+): string[] {
+  const once = options?.once ?? true;
+  const warned: string[] = [];
+  for (const hit of findDeprecatedConfigKeys(raw)) {
+    if (once) {
+      if (warnedDeprecatedKeys.has(hit.path)) {
+        continue;
+      }
+      warnedDeprecatedKeys.add(hit.path);
+    }
+    logger.warn(`Config key "${hit.path}" is deprecated: ${hit.reason}`);
+    warned.push(hit.path);
+  }
+  return warned;
+}
+
+function stampConfigVersion(cfg: BitterbotConfig): BitterbotConfig {
+  const now = new Date().toISOString();
+  return {
+    ...cfg,
+    meta: {
+      ...cfg.meta,
+      lastTouchedVersion: VERSION,
+      lastTouchedAt: now,
+    },
+  };
+}
+
+function warnIfConfigFromFuture(cfg: BitterbotConfig, logger: Pick<typeof console, "warn">): void {
+  const touched = cfg.meta?.lastTouchedVersion;
+  if (!touched) {
+    return;
+  }
+  const cmp = compareBitterbotVersions(VERSION, touched);
+  if (cmp === null) {
+    return;
+  }
+  if (cmp < 0) {
+    logger.warn(
+      `Config was last written by a newer Bitterbot (${touched}); current version is ${VERSION}.`,
+    );
+  }
+}
+
+function resolveConfigPathForDeps(deps: Required<ConfigIoDeps>): string {
+  if (deps.configPath) {
+    return deps.configPath;
+  }
+  return resolveConfigPath(deps.env, resolveStateDir(deps.env, deps.homedir));
+}
+
+function normalizeDeps(overrides: ConfigIoDeps = {}): Required<ConfigIoDeps> {
+  return {
+    fs: overrides.fs ?? fs,
+    json5: overrides.json5 ?? JSON5,
+    env: overrides.env ?? process.env,
+    homedir:
+      overrides.homedir ?? (() => resolveRequiredHomeDir(overrides.env ?? process.env, os.homedir)),
+    configPath: overrides.configPath ?? "",
+    logger: overrides.logger ?? console,
+  };
+}
+
+function maybeLoadDotEnvForConfig(env: NodeJS.ProcessEnv): void {
+  // Only hydrate dotenv for the real process env. Callers using injected env
+  // objects (tests/diagnostics) should stay isolated.
+  if (env !== process.env) {
+    return;
+  }
+  loadDotEnv({ quiet: true });
+}
+
+export function parseConfigJson5(
+  raw: string,
+  json5: { parse: (value: string) => unknown } = JSON5,
+): ParseConfigJson5Result {
+  try {
+    return { ok: true, parsed: json5.parse(raw) };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+type ConfigReadResolution = {
+  resolvedConfigRaw: unknown;
+  envSnapshotForRestore: Record<string, string | undefined>;
+};
+
+function resolveConfigIncludesForRead(
+  parsed: unknown,
+  configPath: string,
+  deps: Required<ConfigIoDeps>,
+): unknown {
+  return resolveConfigIncludes(parsed, configPath, {
+    readFile: (candidate) => deps.fs.readFileSync(candidate, "utf-8"),
+    parseJson: (raw) => deps.json5.parse(raw),
+  });
+}
+
+function resolveConfigForRead(
+  resolvedIncludes: unknown,
+  env: NodeJS.ProcessEnv,
+): ConfigReadResolution {
+  // Apply config.env to process.env BEFORE substitution so ${VAR} can reference config-defined vars.
+  if (resolvedIncludes && typeof resolvedIncludes === "object" && "env" in resolvedIncludes) {
+    applyConfigEnvVars(resolvedIncludes as BitterbotConfig, env);
+  }
+
+  return {
+    resolvedConfigRaw: resolveConfigEnvVars(resolvedIncludes, env),
+    // Capture env snapshot after substitution for write-time ${VAR} restoration.
+    envSnapshotForRestore: { ...env } as Record<string, string | undefined>,
+  };
+}
+
+type ReadConfigFileSnapshotInternalResult = {
+  snapshot: ConfigFileSnapshot;
+  envSnapshotForRestore?: Record<string, string | undefined>;
+};
+
+/**
+ * The load-time defaults chain shared by loadConfig() and the missing-file
+ * snapshot. Returns a new object with paths normalised.
+ */
+function applyLoadTimeDefaults(validated: BitterbotConfig): BitterbotConfig {
+  const cfg = applyA2aDefaults(
+    applyP2pDefaults(
+      applyModelDefaults(
+        applyCompactionDefaults(
+          applyContextPruningDefaults(
+            applyAgentDefaults(
+              applySessionDefaults(
+                applyLoggingDefaults(applyMessageDefaults(applyCirclesDefaults(validated))),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  normalizeConfigPaths(cfg);
+  return cfg;
+}
+
+/**
+ * Remove, in place, every value of `candidate` that the file does not hold
+ * (`raw`) and that equals what the load-time defaults supply for that file
+ * (`defaults`). Objects are walked so a partially customised defaulted block
+ * keeps only the customised keys. An object emptied by the walk goes too,
+ * unless the file had it.
+ */
+function stripLoadTimeDefaultsInPlace(
+  candidate: Record<string, unknown>,
+  raw: unknown,
+  defaults: unknown,
+): void {
+  if (!isPlainObject(defaults)) {
+    return;
+  }
+  const rawObj = isPlainObject(raw) ? raw : undefined;
+  for (const key of Object.keys(candidate)) {
+    if (!(key in defaults)) {
+      continue;
+    }
+    const inFile = rawObj !== undefined && key in rawObj;
+    const value = candidate[key];
+    const defaultValue = defaults[key];
+    if (!inFile && configValuesEqual(value, defaultValue)) {
+      delete candidate[key];
+      continue;
+    }
+    if (isPlainObject(value) && isPlainObject(defaultValue)) {
+      stripLoadTimeDefaultsInPlace(value, inFile ? rawObj?.[key] : undefined, defaultValue);
+      if (!inFile && Object.keys(value).length === 0) {
+        delete candidate[key];
+      }
+    }
+  }
+}
+
+/**
+ * Drift-pass review HIGH-2: a write must never persist a value that exists
+ * only because the load-time defaults (applyLoadTimeDefaults: bootstrap
+ * peers, compaction/context-pruning modes, a2a caps, circles, ...) put it into
+ * the loaded config. Whatever path built the candidate (merge patch against
+ * the snapshot, a missing file, an invalid snapshot written best-effort), a
+ * value absent from the file that equals the default for that file is
+ * dropped. A value the caller changed differs from the default and stays; a
+ * caller "setting" a key to exactly its default is indistinguishable from
+ * the default and is not written (the effective config is the same).
+ */
+export function stripLoadTimeDefaults(candidate: unknown, fileRaw: unknown): unknown {
+  if (!isPlainObject(candidate)) {
+    return candidate;
+  }
+  const base = isPlainObject(fileRaw) ? (structuredClone(fileRaw) as BitterbotConfig) : {};
+  let defaults: unknown;
+  try {
+    defaults = applyLoadTimeDefaults(base);
+  } catch {
+    return candidate;
+  }
+  const out = structuredClone(candidate);
+  stripLoadTimeDefaultsInPlace(out, fileRaw, defaults);
+  return out;
+}
+
+/**
+ * Drop, in place, every key of `validated` that `candidate` does not have:
+ * schema validation may normalise values but must not add keys (zod
+ * `.default()`s such as `commands.native`, plugin schema defaults) to what is
+ * written. Walks plain objects only.
+ */
+function dropKeysAddedByValidation(validated: unknown, candidate: unknown): void {
+  if (!isPlainObject(validated) || !isPlainObject(candidate)) {
+    return;
+  }
+  for (const key of Object.keys(validated)) {
+    if (!(key in candidate)) {
+      delete validated[key];
+      continue;
+    }
+    dropKeysAddedByValidation(validated[key], candidate[key]);
+  }
+}
+
+export function createConfigIO(overrides: ConfigIoDeps = {}) {
+  const deps = normalizeDeps(overrides);
+  const requestedConfigPath = resolveConfigPathForDeps(deps);
+  const candidatePaths = deps.configPath
+    ? [requestedConfigPath]
+    : resolveDefaultConfigCandidates(deps.env, deps.homedir);
+  const configPath =
+    candidatePaths.find((candidate) => deps.fs.existsSync(candidate)) ?? requestedConfigPath;
+
+  function loadConfig(): BitterbotConfig {
+    try {
+      maybeLoadDotEnvForConfig(deps.env);
+      // PLAN-56 Phase 2: a missing file loads exactly like an empty `{}` file,
+      // through the same validation and apply*Defaults chain. It used to
+      // return a bare `{}`, so an unconfigured container silently ran with no
+      // P2P, circles or model defaults. "Not configured" detection (wizard,
+      // `gateway --allow-unconfigured`, doctor, onboard) keys off the FILE
+      // (readConfigFileSnapshot().exists / fs.existsSync), never this object.
+      let resolvedConfig: unknown = {};
+      if (deps.fs.existsSync(configPath)) {
+        const raw = deps.fs.readFileSync(configPath, "utf-8");
+        const parsed = deps.json5.parse(raw);
+        resolvedConfig = resolveConfigForRead(
+          resolveConfigIncludesForRead(parsed, configPath, deps),
+          deps.env,
+        ).resolvedConfigRaw;
+        warnOnConfigMiskeys(resolvedConfig, deps.logger);
+        // The installer reports deprecated keys once, as one line.
+        if (!installerOutputMode(deps.env)) {
+          warnOnDeprecatedConfigKeys(resolvedConfig, deps.logger);
+        }
+      }
+      if (typeof resolvedConfig !== "object" || resolvedConfig === null) {
+        return {};
+      }
+      const preValidationDuplicates = findDuplicateAgentDirs(resolvedConfig as BitterbotConfig, {
+        env: deps.env,
+        homedir: deps.homedir,
+      });
+      if (preValidationDuplicates.length > 0) {
+        throw new DuplicateAgentDirError(preValidationDuplicates);
+      }
+      const validated = validateConfigObjectWithPlugins(resolvedConfig);
+      if (!validated.ok) {
+        const details = validated.issues
+          .map((iss) => `- ${iss.path || "<root>"}: ${iss.message}`)
+          .join("\n");
+        if (!loggedInvalidConfigs.has(configPath)) {
+          loggedInvalidConfigs.add(configPath);
+          deps.logger.error(`Invalid config at ${configPath}:\\n${details}`);
+        }
+        const error = new Error("Invalid config");
+        (error as { code?: string; details?: string }).code = "INVALID_CONFIG";
+        (error as { code?: string; details?: string }).details = details;
+        throw error;
+      }
+      if (validated.warnings.length > 0) {
+        const details = validated.warnings
+          .map((iss) => `- ${iss.path || "<root>"}: ${iss.message}`)
+          .join("\n");
+        deps.logger.warn(`Config warnings:\\n${details}`);
+      }
+      warnIfConfigFromFuture(validated.config, deps.logger);
+      const cfg = applyLoadTimeDefaults(validated.config);
+
+      const duplicates = findDuplicateAgentDirs(cfg, {
+        env: deps.env,
+        homedir: deps.homedir,
+      });
+      if (duplicates.length > 0) {
+        throw new DuplicateAgentDirError(duplicates);
+      }
+
+      applyConfigEnvVars(cfg, deps.env);
+
+      const enabled = shouldEnableShellEnvFallback(deps.env) || cfg.env?.shellEnv?.enabled === true;
+      if (enabled && !shouldDeferShellEnvFallback(deps.env)) {
+        loadShellEnvFallback({
+          enabled: true,
+          env: deps.env,
+          expectedKeys: SHELL_ENV_EXPECTED_KEYS,
+          logger: deps.logger,
+          timeoutMs: cfg.env?.shellEnv?.timeoutMs ?? resolveShellEnvFallbackTimeoutMs(deps.env),
+        });
+      }
+
+      return applyConfigOverrides(cfg);
+    } catch (err) {
+      if (err instanceof DuplicateAgentDirError) {
+        deps.logger.error(err.message);
+        throw err;
+      }
+      const error = err as { code?: string };
+      if (error?.code === "INVALID_CONFIG") {
+        return {};
+      }
+      deps.logger.error(`Failed to read config at ${configPath}`, err);
+      return {};
+    }
+  }
+
+  async function readConfigFileSnapshotInternal(): Promise<ReadConfigFileSnapshotInternalResult> {
+    maybeLoadDotEnvForConfig(deps.env);
+    const exists = deps.fs.existsSync(configPath);
+    if (!exists) {
+      const hash = hashConfigRaw(null);
+      // PLAN-56 Phase 2: exactly what loadConfig() returns for a missing file
+      // (validation + the same defaults chain + path normalisation), so a
+      // write computes its merge patch against the same baseline the caller
+      // started from and persists only the caller's changes.
+      const validatedEmpty = validateConfigObjectWithPlugins({});
+      const config = applyTalkApiKey(
+        applyLoadTimeDefaults(validatedEmpty.ok ? validatedEmpty.config : {}),
+      );
+      const legacyIssues: LegacyConfigIssue[] = [];
+      return {
+        snapshot: {
+          path: configPath,
+          exists: false,
+          raw: null,
+          parsed: {},
+          resolved: {},
+          valid: true,
+          config,
+          hash,
+          issues: [],
+          warnings: [],
+          legacyIssues,
+        },
+      };
+    }
+
+    try {
+      const raw = deps.fs.readFileSync(configPath, "utf-8");
+      const hash = hashConfigRaw(raw);
+      const parsedRes = parseConfigJson5(raw, deps.json5);
+      if (!parsedRes.ok) {
+        return {
+          snapshot: {
+            path: configPath,
+            exists: true,
+            raw,
+            parsed: {},
+            resolved: {},
+            valid: false,
+            config: {},
+            hash,
+            issues: [{ path: "", message: `JSON5 parse failed: ${parsedRes.error}` }],
+            warnings: [],
+            legacyIssues: [],
+          },
+        };
+      }
+
+      // Resolve $include directives
+      let resolved: unknown;
+      try {
+        resolved = resolveConfigIncludesForRead(parsedRes.parsed, configPath, deps);
+      } catch (err) {
+        const message =
+          err instanceof ConfigIncludeError
+            ? err.message
+            : `Include resolution failed: ${String(err)}`;
+        return {
+          snapshot: {
+            path: configPath,
+            exists: true,
+            raw,
+            parsed: parsedRes.parsed,
+            resolved: coerceConfig(parsedRes.parsed),
+            valid: false,
+            config: coerceConfig(parsedRes.parsed),
+            hash,
+            issues: [{ path: "", message }],
+            warnings: [],
+            legacyIssues: [],
+          },
+        };
+      }
+
+      let readResolution: ConfigReadResolution;
+      try {
+        readResolution = resolveConfigForRead(resolved, deps.env);
+      } catch (err) {
+        const message =
+          err instanceof MissingEnvVarError
+            ? err.message
+            : `Env var substitution failed: ${String(err)}`;
+        return {
+          snapshot: {
+            path: configPath,
+            exists: true,
+            raw,
+            parsed: parsedRes.parsed,
+            resolved: coerceConfig(resolved),
+            valid: false,
+            config: coerceConfig(resolved),
+            hash,
+            issues: [{ path: "", message }],
+            warnings: [],
+            legacyIssues: [],
+          },
+        };
+      }
+
+      const resolvedConfigRaw = readResolution.resolvedConfigRaw;
+      const legacyIssues = findLegacyConfigIssues(resolvedConfigRaw);
+
+      const validated = validateConfigObjectWithPlugins(resolvedConfigRaw);
+      if (!validated.ok) {
+        return {
+          snapshot: {
+            path: configPath,
+            exists: true,
+            raw,
+            parsed: parsedRes.parsed,
+            resolved: coerceConfig(resolvedConfigRaw),
+            valid: false,
+            config: coerceConfig(resolvedConfigRaw),
+            hash,
+            issues: validated.issues,
+            warnings: validated.warnings,
+            legacyIssues,
+          },
+        };
+      }
+
+      warnIfConfigFromFuture(validated.config, deps.logger);
+      return {
+        snapshot: {
+          path: configPath,
+          exists: true,
+          raw,
+          parsed: parsedRes.parsed,
+          // Use resolvedConfigRaw (after $include and ${ENV} substitution but BEFORE runtime defaults)
+          // for config set/unset operations (issue #6070)
+          resolved: coerceConfig(resolvedConfigRaw),
+          valid: true,
+          // The same chain as loadConfig() (it used to skip the compaction
+          // and context-pruning defaults, so a loadConfig() -> write froze
+          // them into the file), plus the talk API key.
+          config: normalizeConfigPaths(applyTalkApiKey(applyLoadTimeDefaults(validated.config))),
+          hash,
+          issues: [],
+          warnings: validated.warnings,
+          legacyIssues,
+        },
+        envSnapshotForRestore: readResolution.envSnapshotForRestore,
+      };
+    } catch (err) {
+      return {
+        snapshot: {
+          path: configPath,
+          exists: true,
+          raw: null,
+          parsed: {},
+          resolved: {},
+          valid: false,
+          config: {},
+          hash: hashConfigRaw(null),
+          issues: [{ path: "", message: `read failed: ${String(err)}` }],
+          warnings: [],
+          legacyIssues: [],
+        },
+      };
+    }
+  }
+
+  async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
+    const result = await readConfigFileSnapshotInternal();
+    return result.snapshot;
+  }
+
+  async function readConfigFileSnapshotForWrite(): Promise<ReadConfigFileSnapshotForWriteResult> {
+    const result = await readConfigFileSnapshotInternal();
+    return {
+      snapshot: result.snapshot,
+      writeOptions: {
+        envSnapshotForRestore: result.envSnapshotForRestore,
+        expectedConfigPath: configPath,
+      },
+    };
+  }
+
+  async function writeConfigFile(cfg: BitterbotConfig, options: ConfigWriteOptions = {}) {
+    clearConfigCache();
+    let persistCandidate: unknown = cfg;
+    const { snapshot } = await readConfigFileSnapshotInternal();
+    let envRefMap: Map<string, string> | null = null;
+    let changedPaths: Set<string> | null = null;
+    if (snapshot.valid && !snapshot.exists) {
+      // PLAN-56 Phase 2: a missing file loads with every load-time default
+      // applied, so a caller's loadConfig() -> mutate -> write would
+      // otherwise freeze all of them (bootstrap peers, mailbox URL, a2a caps,
+      // ...) into the new file. Diff against that baseline and write only
+      // what the caller changed.
+      persistCandidate = applyMergePatch({}, createMergePatch(snapshot.config, cfg));
+    }
+    if (snapshot.valid && snapshot.exists) {
+      const patch = createMergePatch(snapshot.config, cfg);
+      persistCandidate = applyMergePatch(snapshot.resolved, patch);
+      try {
+        const resolvedIncludes = resolveConfigIncludes(snapshot.parsed, configPath, {
+          readFile: (candidate) => deps.fs.readFileSync(candidate, "utf-8"),
+          parseJson: (raw) => deps.json5.parse(raw),
+        });
+        const collected = new Map<string, string>();
+        collectEnvRefPaths(resolvedIncludes, "", collected);
+        if (collected.size > 0) {
+          envRefMap = collected;
+          changedPaths = new Set<string>();
+          collectChangedPaths(snapshot.config, cfg, "", changedPaths);
+        }
+      } catch {
+        envRefMap = null;
+      }
+    }
+
+    persistCandidate = stripLoadTimeDefaults(
+      persistCandidate,
+      snapshot.exists ? snapshot.resolved : {},
+    );
+
+    const validated = validateConfigObjectRawWithPlugins(persistCandidate);
+    if (!validated.ok) {
+      const issue = validated.issues[0];
+      const pathLabel = issue?.path ? issue.path : "<root>";
+      throw new Error(`Config validation failed: ${pathLabel}: ${issue?.message ?? "invalid"}`);
+    }
+    if (validated.warnings.length > 0) {
+      const details = validated.warnings
+        .map((warning) => `- ${warning.path}: ${warning.message}`)
+        .join("\n");
+      deps.logger.warn(`Config warnings:\n${details}`);
+    }
+
+    // Restore ${VAR} env var references that were resolved during config loading.
+    // Read the current file (pre-substitution) and restore any references whose
+    // resolved values match the incoming config — so we don't overwrite
+    // "${ANTHROPIC_API_KEY}" with "sk-ant-..." when the caller didn't change it.
+    //
+    // We use only the root file's parsed content (no $include resolution) to avoid
+    // pulling values from included files into the root config on write-back.
+    // Apply env restoration to validated.config (which has runtime defaults stripped
+    // per issue #6070) rather than the raw caller input.
+    let cfgToWrite = validated.config;
+    dropKeysAddedByValidation(cfgToWrite, persistCandidate);
+    try {
+      if (deps.fs.existsSync(configPath)) {
+        const currentRaw = await deps.fs.promises.readFile(configPath, "utf-8");
+        const parsedRes = parseConfigJson5(currentRaw, deps.json5);
+        if (parsedRes.ok) {
+          // Use env snapshot from when config was loaded (if available) to avoid
+          // TOCTOU issues where env changes between load and write. Falls back to
+          // live env if no snapshot exists (e.g., first write before any load).
+          const envForRestore = options.envSnapshotForRestore ?? deps.env;
+          cfgToWrite = restoreEnvVarRefs(
+            cfgToWrite,
+            parsedRes.parsed,
+            envForRestore,
+          ) as BitterbotConfig;
+        }
+      }
+    } catch {
+      // If reading the current file fails, write cfg as-is (no env restoration)
+    }
+
+    const dir = path.dirname(configPath);
+    await deps.fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+    const outputConfig =
+      envRefMap && changedPaths
+        ? (restoreEnvRefsFromMap(cfgToWrite, "", envRefMap, changedPaths) as BitterbotConfig)
+        : cfgToWrite;
+    // Do NOT apply runtime defaults when writing — user config should only contain
+    // explicitly set values. Runtime defaults are applied when loading (issue #6070).
+    const stampedOutputConfig = stampConfigVersion(outputConfig);
+    const json = JSON.stringify(stampedOutputConfig, null, 2).trimEnd().concat("\n");
+    const nextHash = hashConfigRaw(json);
+    const previousHash = resolveConfigSnapshotHash(snapshot);
+    const changedPathCount = changedPaths?.size;
+    const previousBytes =
+      typeof snapshot.raw === "string" ? Buffer.byteLength(snapshot.raw, "utf-8") : null;
+    const nextBytes = Buffer.byteLength(json, "utf-8");
+    const hasMetaBefore = hasConfigMeta(snapshot.parsed);
+    const hasMetaAfter = hasConfigMeta(stampedOutputConfig);
+    const gatewayModeBefore = resolveGatewayMode(snapshot.resolved);
+    const gatewayModeAfter = resolveGatewayMode(stampedOutputConfig);
+    const suspiciousReasons = resolveConfigWriteSuspiciousReasons({
+      existsBefore: snapshot.exists,
+      previousBytes,
+      nextBytes,
+      hasMetaBefore,
+      gatewayModeBefore,
+      gatewayModeAfter,
+    });
+    const logConfigOverwrite = () => {
+      if (!snapshot.exists) {
+        return;
+      }
+      const isVitest = deps.env.VITEST === "true";
+      const shouldLogInVitest = deps.env.BITTERBOT_TEST_CONFIG_OVERWRITE_LOG === "1";
+      if (isVitest && !shouldLogInVitest) {
+        return;
+      }
+      // During the interactive wizard, the user IS the one driving every write,
+      // so the sha256+backup forensic line is pure noise that bleeds into the
+      // polished clack output. Wizard sets BITTERBOT_WIZARD_QUIET=1 at entry
+      // and clears it on exit; non-wizard callers (daemon, doctor, direct
+      // config edits) still get the audit trail.
+      if (deps.env.BITTERBOT_WIZARD_QUIET === "1") {
+        return;
+      }
+      const changeSummary =
+        typeof changedPathCount === "number" ? `, changedPaths=${changedPathCount}` : "";
+      deps.logger.warn(
+        `Config overwrite: ${configPath} (sha256 ${previousHash ?? "unknown"} -> ${nextHash}, backup=${configPath}.bak${changeSummary})`,
+      );
+    };
+    const logConfigWriteAnomalies = () => {
+      if (suspiciousReasons.length === 0) {
+        return;
+      }
+      // Tests often write minimal configs (missing meta, etc); keep output quiet unless requested.
+      const isVitest = deps.env.VITEST === "true";
+      const shouldLogInVitest = deps.env.BITTERBOT_TEST_CONFIG_WRITE_ANOMALY_LOG === "1";
+      if (isVitest && !shouldLogInVitest) {
+        return;
+      }
+      deps.logger.warn(`Config write anomaly: ${configPath} (${suspiciousReasons.join(", ")})`);
+    };
+    const auditRecordBase = {
+      ts: new Date().toISOString(),
+      source: "config-io" as const,
+      event: "config.write" as const,
+      configPath,
+      pid: process.pid,
+      ppid: process.ppid,
+      cwd: process.cwd(),
+      argv: process.argv.slice(0, 8),
+      execArgv: process.execArgv.slice(0, 8),
+      watchMode: deps.env.BITTERBOT_WATCH_MODE === "1",
+      watchSession:
+        typeof deps.env.BITTERBOT_WATCH_SESSION === "string" &&
+        deps.env.BITTERBOT_WATCH_SESSION.trim().length > 0
+          ? deps.env.BITTERBOT_WATCH_SESSION.trim()
+          : null,
+      watchCommand:
+        typeof deps.env.BITTERBOT_WATCH_COMMAND === "string" &&
+        deps.env.BITTERBOT_WATCH_COMMAND.trim().length > 0
+          ? deps.env.BITTERBOT_WATCH_COMMAND.trim()
+          : null,
+      existsBefore: snapshot.exists,
+      previousHash: previousHash ?? null,
+      nextHash,
+      previousBytes,
+      nextBytes,
+      changedPathCount: typeof changedPathCount === "number" ? changedPathCount : null,
+      hasMetaBefore,
+      hasMetaAfter,
+      gatewayModeBefore,
+      gatewayModeAfter,
+      suspicious: suspiciousReasons,
+    };
+    const appendWriteAudit = async (result: ConfigWriteAuditResult, err?: unknown) => {
+      const errorCode =
+        err && typeof err === "object" && "code" in err && typeof err.code === "string"
+          ? err.code
+          : undefined;
+      const errorMessage =
+        err && typeof err === "object" && "message" in err && typeof err.message === "string"
+          ? err.message
+          : undefined;
+      await appendConfigWriteAuditRecord(deps, {
+        ...auditRecordBase,
+        result,
+        nextHash: result === "failed" ? null : auditRecordBase.nextHash,
+        nextBytes: result === "failed" ? null : auditRecordBase.nextBytes,
+        errorCode,
+        errorMessage,
+      });
+    };
+
+    const tmp = path.join(
+      dir,
+      `${path.basename(configPath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+
+    try {
+      await deps.fs.promises.writeFile(tmp, json, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+
+      if (deps.fs.existsSync(configPath)) {
+        await rotateConfigBackups(configPath, deps.fs.promises);
+        await deps.fs.promises.copyFile(configPath, `${configPath}.bak`).catch(() => {
+          // best-effort
+        });
+      }
+
+      try {
+        await deps.fs.promises.rename(tmp, configPath);
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        // Windows doesn't reliably support atomic replace via rename when dest exists.
+        if (code === "EPERM" || code === "EEXIST") {
+          await deps.fs.promises.copyFile(tmp, configPath);
+          await deps.fs.promises.chmod(configPath, 0o600).catch(() => {
+            // best-effort
+          });
+          await deps.fs.promises.unlink(tmp).catch(() => {
+            // best-effort
+          });
+          logConfigOverwrite();
+          logConfigWriteAnomalies();
+          await appendWriteAudit("copy-fallback");
+          return;
+        }
+        await deps.fs.promises.unlink(tmp).catch(() => {
+          // best-effort
+        });
+        throw err;
+      }
+      logConfigOverwrite();
+      logConfigWriteAnomalies();
+      await appendWriteAudit("rename");
+    } catch (err) {
+      await appendWriteAudit("failed", err);
+      throw err;
+    }
+  }
+
+  return {
+    configPath,
+    loadConfig,
+    readConfigFileSnapshot,
+    readConfigFileSnapshotForWrite,
+    writeConfigFile,
+  };
+}
+
+// NOTE: These wrappers intentionally do *not* cache the resolved config path at
+// module scope. `BITTERBOT_CONFIG_PATH` (and friends) are expected to work even
+// when set after the module has been imported (tests, one-off scripts, etc.).
+const DEFAULT_CONFIG_CACHE_MS = 200;
+let configCache: {
+  configPath: string;
+  expiresAt: number;
+  config: BitterbotConfig;
+} | null = null;
+
+function resolveConfigCacheMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.BITTERBOT_CONFIG_CACHE_MS?.trim();
+  if (raw === "" || raw === "0") {
+    return 0;
+  }
+  if (!raw) {
+    return DEFAULT_CONFIG_CACHE_MS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_CONFIG_CACHE_MS;
+  }
+  return Math.max(0, parsed);
+}
+
+function shouldUseConfigCache(env: NodeJS.ProcessEnv): boolean {
+  if (env.BITTERBOT_DISABLE_CONFIG_CACHE?.trim()) {
+    return false;
+  }
+  return resolveConfigCacheMs(env) > 0;
+}
+
+export function clearConfigCache(): void {
+  configCache = null;
+}
+
+export function loadConfig(): BitterbotConfig {
+  const io = createConfigIO();
+  const configPath = io.configPath;
+  const now = Date.now();
+  if (shouldUseConfigCache(process.env)) {
+    const cached = configCache;
+    if (cached && cached.configPath === configPath && cached.expiresAt > now) {
+      return cached.config;
+    }
+  }
+  const config = io.loadConfig();
+  if (shouldUseConfigCache(process.env)) {
+    const cacheMs = resolveConfigCacheMs(process.env);
+    if (cacheMs > 0) {
+      configCache = {
+        configPath,
+        expiresAt: now + cacheMs,
+        config,
+      };
+    }
+  }
+  return config;
+}
+
+/**
+ * Whether a config FILE exists (PLAN-56 Phase 2). loadConfig() applies the
+ * load-time defaults for a missing file too, so "is this node configured"
+ * must ask the filesystem, never the loaded object.
+ */
+export function configFileExists(): boolean {
+  try {
+    return fs.existsSync(createConfigIO().configPath);
+  } catch {
+    return false;
+  }
+}
+
+export async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
+  return await createConfigIO().readConfigFileSnapshot();
+}
+
+export async function readConfigFileSnapshotForWrite(): Promise<ReadConfigFileSnapshotForWriteResult> {
+  return await createConfigIO().readConfigFileSnapshotForWrite();
+}
+
+export async function writeConfigFile(
+  cfg: BitterbotConfig,
+  options: ConfigWriteOptions = {},
+): Promise<void> {
+  const io = createConfigIO();
+  const sameConfigPath =
+    options.expectedConfigPath === undefined || options.expectedConfigPath === io.configPath;
+  await io.writeConfigFile(cfg, {
+    envSnapshotForRestore: sameConfigPath ? options.envSnapshotForRestore : undefined,
+  });
+}

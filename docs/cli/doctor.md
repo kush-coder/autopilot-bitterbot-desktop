@@ -1,0 +1,269 @@
+---
+summary: "CLI reference for `bitterbot doctor` (health checks + guided repairs)"
+read_when:
+  - You have connectivity/auth issues and want guided fixes
+  - You updated and want a sanity check
+title: "doctor"
+---
+
+# `bitterbot doctor`
+
+Health checks + quick fixes for the gateway and channels.
+
+Related:
+
+- Troubleshooting: [Troubleshooting](/gateway/troubleshooting)
+- Security audit: [Security](/gateway/security)
+
+## Examples
+
+```bash
+bitterbot doctor
+bitterbot doctor --repair
+bitterbot doctor --deep
+bitterbot doctor --json
+```
+
+Notes:
+
+- Interactive prompts (like keychain/OAuth fixes) only run when stdin is a TTY and `--non-interactive` is **not** set. Headless runs (cron, Telegram, no terminal) will skip prompts.
+- `--fix` (alias for `--repair`) writes a backup to `~/.bitterbot/bitterbot.json.bak` and drops unknown config keys, listing each removal.
+- Deprecated config keys (`memory.backend`, `agents.defaults.runtime.engine`, `agents.list[].runtime.engine`, `agents.defaults.compaction.mode: "safeguard"`, `agents.defaults.contextPruning`, `update.uiRestart`) are listed by exact path as a warning in the **Config** section (and in `--json`). `--fix` removes them (all are inert). Without `--fix`, the planned change reads "Would remove ..."; only a run that writes says "Removed ...". It never rewrites a config that uses `$include` (remove the listed keys by hand; each path names the included file it lives in where the root file shows it). The interactive prompt for removing deprecated keys alone defaults to no. A config file with comments loses them when `--fix` rewrites it; doctor says so, and the previous file is kept as `.bak`.
+- No config file is not an error in itself: every default applies without one. But `gateway.mode` has no default, so outside the container image (which always starts with `--allow-unconfigured`) an unset `gateway.mode` is a warning: `bitterbot gateway` refuses to start until onboarding or `bitterbot config set gateway.mode local` sets it.
+
+## Install kind
+
+The **Runtime** section names how this Bitterbot is installed (source checkout, container image, release tarball from `install.sh`, or package), and the advice elsewhere follows it: the pnpm check runs only for a source checkout, a missing Control UI build or orchestrator binary points a container at `docker compose pull && docker compose up -d` and a tarball install at `bitterbot update --reinstall`, and a checkout at `pnpm ui:build` / `pnpm install` / `cargo build`. In a container, a `lan` gateway bind is a warning that says LAN exposure depends on the host port mapping (`-p 19001:19001` or `BITTERBOT_BIND_HOST=0.0.0.0` exposes it on the LAN); check it on the Docker host with `docker compose port bitterbot-gateway 19001`.
+
+For a release-tarball install, an **Install** section checks:
+
+- `~/.bitterbot/app/current` points at an installed version with a launcher. `--fix` repairs a missing or broken link (to the running version, or the newest intact one).
+- `previous` (the rollback target). `--fix` removes a link to a deleted version.
+- `~/.local/bin/bitterbot` links to `~/.bitterbot/app/current/bin/bitterbot`. `--fix` creates it when missing or dangling; a link to another install, or a regular file, is left alone.
+- The running version against its `manifest.json`: every file present with its recorded size, or with `--deep` its SHA-256. A mismatch is never patched in place; doctor names `bitterbot update --reinstall` (stop the gateway first), which downloads and verifies that version again.
+- Leftovers of an interrupted update (`.update-*`, `.replaced.*`), removed by `--fix` when no update is running, and the pre-update snapshots in `~/.bitterbot/snapshots`.
+- A stale update lock (`~/.bitterbot/app/.update.lock` whose owner has exited, whose pid now belongs to another process, or, with no start time to compare, older than six hours). `--fix` removes it; a lock held by a running update is left alone.
+- Files a rollback replaced, in `~/.bitterbot/update-displaced/<time>-<from>-to-<to>/`, with their sizes. Nothing deletes them for you, not even `--fix`; remove a folder with `rm -r` once you no longer need it.
+
+The **Update Health** section reports an automatic rollback after a failed update: for a tarball install, which version failed, which one runs now, and which files were restored from the snapshot.
+
+The **P2P Network** section also says where the orchestrator binary's integrity comes from: verified when the release tarball or image was built, verified at download by the postinstall fetch (a valid minisign signature against the pinned key is required from 1.5.0 on), built from source, or supplied by `p2p.orchestratorBinary` (not verified).
+
+## Exit code and the update gate
+
+Doctor exits **non-zero when any check reports an error-level finding**.
+Severity is the gate: `error` means "this node is broken enough that an
+update must not hand off to it" (corrupt memory DB, missing core tables, a
+provider actively rejecting well-formed model calls, invalid config,
+unsupported Node). Degraded-but-usable states (missing credentials, an
+unreachable relay, an embedding backlog) stay warnings and never fail the
+process.
+
+The update flow (`bitterbot update` and the `update.run` gateway RPC) runs
+`bitterbot doctor --non-interactive` after building and only restarts into
+the new build when doctor exits 0 — a failing doctor keeps the old process
+running.
+
+## `--json`
+
+`bitterbot doctor --json` (implies `--non-interactive`) emits a
+machine-readable report as the **last line of stdout**:
+
+```json
+{
+  "schema": 1,
+  "version": "…",
+  "worstLevel": "warn",
+  "hasError": false,
+  "blocksUpdate": false,
+  "errors": [],
+  "findings": [{ "section": "Runtime", "level": "ok", "message": "Node v22…" }],
+  "checkedAt": 1750000000000
+}
+```
+
+Sections on the shared check contract suppress their human output in JSON
+mode; a few legacy sections still print prose first, so consumers should
+parse the final stdout line rather than the whole stream. `worstLevel` is
+the max severity across all findings; `hasError`/`blocksUpdate` are true
+exactly when `worstLevel` is `"error"`.
+
+## Boot-health beacon and auto-rollback
+
+Both update paths (CLI and gateway RPC) arm a beacon file before restarting
+into a freshly-updated build; the gateway clears it the moment it binds. If
+a post-update boot never confirms healthy, the next `bitterbot doctor` run
+reports an error-level **Update Health** finding with the exact rollback
+command (`git reset --hard <previous-sha> && pnpm build && pnpm start gateway`)
+— and, being error-level, blocks further updates until resolved.
+
+On git installs the update flow also spawns a detached **boot watchdog**
+that acts on the same beacon: if the fresh build never confirms a healthy
+boot before the beacon deadline (default 30 min), the watchdog performs
+**one** guarded rollback — clean worktree only, `git reset --hard` to the
+pre-update sha, reinstall, rebuild, best-effort restart. Config and
+databases are never touched (schema migrations follow an N-1 compatibility
+policy, so pre-update code runs against the migrated DB). A once-only latch
+guarantees a rollback that itself fails to boot goes loud instead of
+looping. A performed rollback shows as a persistent warn-level **Update
+Health** finding until the next clean update; a failed rollback attempt is
+error-level with the manual recovery command, and clears automatically the
+next time a gateway boots healthy (so recovering the node also unblocks the
+update gate). State lives in `<stateDir>/rollback-performed.json`; the
+watchdog logs to `<stateDir>/boot-watchdog.log`. Disable with
+`update.autoRollback.enabled: false`. On systemd nodes the unit needs
+`KillMode=process` (current default; doctor's supervisor audit flags and
+repairs older units) or the watchdog is killed with the restarting gateway.
+
+## Model round-trip
+
+Doctor performs **one real end-to-end model call** ("Reply with the single
+word: OK") through the same clean call path production uses. "Configured"
+is not "works": a provider that actively rejects a well-formed request (the
+400-param class) is an error-level finding that blocks updates, while
+missing credentials, an unresolvable model ref, network failures, and 5xx
+responses only warn.
+
+## Agent-turn probe
+
+With the gateway running, doctor also sends **one real agent turn** through
+the full production pipeline (RPC ingress → session resolution → embedded
+runner → reply) on a throwaway `doctor-probe-*` session that is deleted
+afterward (orphans from interrupted runs are swept on the next doctor).
+A gateway that answers health checks but cannot run a turn is caught here
+and nowhere else. Failures are **warn-level during burn-in** — the probe has
+more moving parts than the model check, so it does not block updates. The
+pre-restart update gate skips it (the running gateway is still the outgoing
+build); the post-restart doctor after `bitterbot update` forces it, so the
+freshly installed build gets a real turn through its pipeline.
+
+## Subsystem checks
+
+Doctor opens the agent memory DB read-only and verifies live state:
+semantic embedding backlog, **search-index coverage** (crystals with
+embeddings vs rows actually present in `chunks_vec`/`chunks_fts` — a
+populated embedding column with an empty index means search finds nothing),
+knowledge-graph population, canonical facts ledger, and Circles tables on
+the resolved agent DB.
+
+## Retrieval health
+
+The wired-but-dead detector, finally consumed: with the gateway running,
+doctor asks the live `memory.retrievalHealth` detector and warns on any
+dead retrieval lane (a layer contributing nothing to recall). It also runs
+an offline sweep of recent `retrieval_trace` samples — a lane with zero
+hits across 20+ sampled retrievals in the last week warns even when the
+gateway is down.
+
+## Economy
+
+The money-moving surfaces: bounty settlements parked at `held_review`
+(money that does not move until a human reviews it), revenue payments past
+their dispute window or failed during payout, the A2A x402 payment gate
+(warns when the gate is armed with nowhere to receive payment, or when a
+public A2A URL has authentication `none`), and Forage Night Shift posture.
+
+## Long-horizon tasks
+
+The task spine's three stores, which doctor previously never opened:
+in-flight tasks in `tasks.sqlite` not seen for >24h **and** holding no
+pending cron wakeup (a stale task with a scheduled wakeup is suspended by
+design, not orphaned), event-journal growth, and the cron store (enabled
+jobs more than 2h past `nextRunAt` while the gateway is running and cron is
+not deliberately disabled mean the scheduler is wedged and suspended tasks
+are dead; repeated per-job failures are flagged).
+
+## Skill evolution
+
+Whether the skill-evolution loop can produce anything, read from its own
+files and a read-only query: the validation gate's effective mode (the
+promoting `tasks` gate needs capability tasks; with none, the loop can only
+run the diagnostic judge and warns), the loop heartbeat (last iteration
+against the configured cadence), the canary monitor backlog (an active
+canary with no exposure rows after three days, or past its 28-day maximum
+with no verdict, is a skill sitting in production with no decision on the
+way), evidence-record freshness (all records older than two days means
+housekeeping is not rebuilding them), and the crystallizer count (migration
+v63 purged the auto-minted chunks; any present means the retired minting
+path is writing again).
+
+## Dream-mode liveness
+
+The Dream Engine section also reports per-mode liveness: an enabled dream
+mode (e.g. `harness_evolve`, `relationship_mining`) that has never been
+selected across 40+ completed cycles is wired-but-never-scheduled, and its
+maintenance work is not happening.
+
+## Daily health sweep
+
+Doctor's read-only inspectors also run on a schedule inside the gateway
+(default 08:00 local, `memory.healthSweep.{enabled,time}`), persist their
+findings to `health_sweeps`, and **diff against the previous run** so a NEW
+problem logs at warn level instead of waiting to be discovered. Persistent
+issues stay quiet — finding identity ignores changing numbers, so "3,003
+crystals" and "2,781 crystals" are the same finding — and a resolved issue
+is reported too.
+
+This exists because writing checks was never the gap. On 2026-08-11 three
+separate silent failures were found in one session, and in every case the
+check that would have caught them was already written and correct: vector
+index coverage, dream-mode liveness, artifact liveness. Nobody had run
+`bitterbot doctor` recently enough, so vector search stayed dead for weeks
+and an embedding backlog silently rebuilt to 3,003 crystals. The sweep is
+free by construction — SQL only, no model round-trips or agent-turn probes,
+which stay in the interactive command.
+
+## Artifact liveness
+
+Born from the 2026-08-09 wired-but-dead audit: loops that run on schedule,
+throw nothing, and never produce their output artifact. The section asserts
+on the artifacts directly, so a silent regression announces itself:
+skill crystals born without a `skill_category` (invisible to
+`skills.metrics`), an interceptor guard chain that has never written an
+intervention record despite tool traffic, peers who have offered many skills
+with no accept/reject decision ever recorded (nobody can graduate out of
+manual review), curiosity targets that only expire and never resolve,
+curiosity progress rows keyed to region ids that no longer exist (region
+identity churn resets learning forever), doubled execution telemetry (the
+`after_tool_call` double-fire), skills past the publish maturity gate that
+were never published, and dream modes selected repeatedly that have never
+produced a single insight. All findings are warn/info — a dead loop is
+operator-attention state, never an update blocker.
+
+The section also reports the PLAN-40 **dream-utility funnel** (per-lane
+produced vs consumed artifacts over 28 days, via the same shared query
+module as the `dream.utility` RPC and the dashboard's Utility tab — one
+implementation, no divergent numbers) and the **hold wake counters** for
+the disabled fuel-starved modes (`harness_evolve` at ≥25 completed
+executions, `interceptor_harvest` at ≥10 outcome-tagged records,
+`relationship_reconsolidation` at ≥100 active relationships) so re-enabling
+them is a visible threshold, not a remembered chore.
+
+Memory-search (including the sqlite-vec probe) and Security sections are on
+the shared contract, so their findings appear in `--json` like everything
+else. Deliberate lockdown states (DMs disabled/locked) report as info, not
+warnings.
+
+## Agent runtime section
+
+Doctor includes an "Agent runtime" section that surfaces:
+
+- **Considerations log** — today's `~/.bitterbot/heartbeat/considerations-YYYY-MM-DD.ndjson` row count, total bytes, top decisions, and top categories. File-based, available even when the gateway is offline.
+- **Prompt cache hit ratios** — per-session lifetime + recent hit ratios and bust counts, ordered by turn count. Live state via the `agent.runtime.health` RPC; needs the gateway running.
+- **Compaction breaker state** — any session whose breaker is not `closed`, with consecutive-failure count and last reason. Same RPC.
+
+When the gateway is unreachable, doctor falls back quietly with a note
+that the live block is unavailable. The considerations log section
+still shows.
+
+## macOS: `launchctl` env overrides
+
+If you previously ran `launchctl setenv BITTERBOT_GATEWAY_TOKEN ...` (or `...PASSWORD`), the gateway and the CLI ignore it while your config sets `gateway.auth.token` (config wins over the environment), but anything that reads only the environment keeps sending the stale value and gets persistent “unauthorized” errors.
+
+```bash
+launchctl getenv BITTERBOT_GATEWAY_TOKEN
+launchctl getenv BITTERBOT_GATEWAY_PASSWORD
+
+launchctl unsetenv BITTERBOT_GATEWAY_TOKEN
+launchctl unsetenv BITTERBOT_GATEWAY_PASSWORD
+```

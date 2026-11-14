@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Bitterbot pre-commit hook: lint + format staged files.
+#
+# Uses NUL-delimited file lists to safely handle filenames with spaces,
+# newlines, or characters that look like git flags (e.g. "--all").
+# All paths are passed after "--" to prevent option injection.
+#
+# Installed via: git config core.hooksPath git-hooks
+# (wired by the `prepare` script in package.json)
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Collect staged files (NUL-delimited, only added/copied/modified/renamed).
+# Using `while read -d ''` instead of `mapfile -d ''` for bash 3.2 compatibility
+# (macOS ships bash 3.2 which lacks `mapfile -d`).
+files=()
+while IFS= read -r -d '' f; do
+  files+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+# Filter to lintable files and run oxlint.
+lint_files=()
+while IFS= read -r -d '' f; do
+  lint_files+=("$f")
+done < <(node "$ROOT_DIR/scripts/pre-commit/filter-staged-files.mjs" lint -- "${files[@]}")
+
+if [[ ${#lint_files[@]} -gt 0 ]]; then
+  # oxlint exits 1 with "No files found to lint" when EVERY staged file falls
+  # under .oxlintrc.json ignorePatterns (e.g. a commit touching only
+  # src/agents/skills/, which the root "skills/" pattern also matches). That
+  # is not a lint failure; CI's `pnpm lint` applies the same ignore list.
+  lint_out="$("$ROOT_DIR/scripts/pre-commit/run-node-tool.sh" oxlint --type-aware -- "${lint_files[@]}" 2>&1)" && lint_rc=0 || lint_rc=$?
+  if [[ $lint_rc -ne 0 ]] && ! grep -q "No files found to lint" <<<"$lint_out"; then
+    printf '%s\n' "$lint_out"
+    echo "Pre-commit lint failed. Fix the errors above, then re-stage and commit."
+    exit 1
+  fi
+  [[ -n "$lint_out" ]] && printf '%s\n' "$lint_out"
+fi
+
+# Filter to formattable files and run oxfmt.
+fmt_files=()
+while IFS= read -r -d '' f; do
+  fmt_files+=("$f")
+done < <(node "$ROOT_DIR/scripts/pre-commit/filter-staged-files.mjs" format -- "${files[@]}")
+
+if [[ ${#fmt_files[@]} -gt 0 ]]; then
+  "$ROOT_DIR/scripts/pre-commit/run-node-tool.sh" oxfmt --write -- "${fmt_files[@]}"
+fi
+
+# Re-stage formatted files so the commit includes the formatted versions.
+# Placed at column 0 — the pre-commit security test asserts /\ngit add -- /
+# to verify paths are always passed after "--" (option-injection hardening).
+[[ ${#fmt_files[@]} -gt 0 ]] &&
+git add -- "${fmt_files[@]}"
+
+exit 0

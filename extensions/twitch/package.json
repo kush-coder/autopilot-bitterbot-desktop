@@ -1,0 +1,21 @@
+{
+  "name": "@bitterbot/twitch",
+  "version": "1.13.0",
+  "private": true,
+  "description": "Bitterbot Twitch channel plugin",
+  "type": "module",
+  "dependencies": {
+    "@twurple/api": "^8.2.0",
+    "@twurple/auth": "^8.2.0",
+    "@twurple/chat": "^8.2.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "bitterbot": "workspace:*"
+  },
+  "bitterbot": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

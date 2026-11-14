@@ -1,0 +1,142 @@
+/**
+ * Top-level Skills (P2P) doctor section.
+ *
+ * Skills are discrete capabilities (tools, prompts, genomes) that the
+ * agent can publish and ingest over the P2P mesh. Ingestion is the
+ * dangerous direction — a hostile skill can poison the agent — so the
+ * `skills.p2p.ingestPolicy` gate decides whether new skills are:
+ *
+ *   - "review"  → quarantined, require manual approval (safe default)
+ *   - "auto"    → accepted automatically from trusted signers
+ *   - "deny"    → mesh-published skills are rejected entirely
+ *
+ * What we check:
+ *   1. Policy value is one of the three expected values
+ *   2. If "auto", a non-empty trust list is set (otherwise "auto" is
+ *      effectively "deny" and the operator probably meant review)
+ *   3. Quarantine directory exists and is writable
+ *
+ * What we deliberately don't check:
+ *   - Contents of the trust list (signing identities aren't verifiable
+ *     without network + gossipsub; that's orchestrator territory)
+ *   - Skill verifier binaries (loaded by plugin runtime)
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import { formatCliCommand } from "../cli/command-format.js";
+import type { BitterbotConfig } from "../config/config.js";
+import { CONFIG_DIR, resolveUserPath } from "../utils.js";
+import {
+  renderSection as renderDoctorSection,
+  type CheckResult,
+  ok,
+  warn,
+  info,
+} from "./doctor-check.js";
+
+// MUST match the runtime default in agents/skills/ingest.ts (listIncomingSkills)
+// — doctor previously checked ~/.bitterbot/skills/quarantine, a directory the
+// ingest path never uses, and green-lit an empty decoy while real quarantined
+// skills accumulated unreviewed in skills-incoming.
+const DEFAULT_QUARANTINE_DIR = path.join(CONFIG_DIR, "skills-incoming");
+
+export function runSkillsChecks(params: { config: BitterbotConfig }): void {
+  const { config } = params;
+  const p2p = config.skills?.p2p;
+  const results: CheckResult[] = [];
+
+  // ── Policy ──
+  const policy = p2p?.ingestPolicy ?? "review";
+  if (policy !== "review" && policy !== "auto" && policy !== "deny") {
+    results.push(warn(`Unknown skills.p2p.ingestPolicy "${String(policy)}"`));
+    renderSection(results);
+    return;
+  }
+
+  if (policy === "deny") {
+    results.push(info("Skill ingestion: deny (mesh-published skills will be rejected)"));
+  } else if (policy === "review") {
+    results.push(ok("Skill ingestion: review (quarantine + manual approval — safe default)"));
+  } else {
+    // auto
+    const trustList = p2p?.trustList ?? [];
+    if (trustList.length === 0) {
+      results.push(
+        warn(
+          [
+            'Skill ingestion is set to "auto" but no trust list is configured.',
+            "  Without trusted signers, auto-ingest will reject every skill — effectively deny.",
+            `  Fix: ${formatCliCommand("bitterbot config set skills.p2p.trustList '[\"<peer-id>\"]'")}`,
+            `  Or switch back to review: ${formatCliCommand(
+              "bitterbot config set skills.p2p.ingestPolicy review",
+            )}`,
+          ].join("\n"),
+        ),
+      );
+    } else {
+      results.push(
+        warn(
+          `Skill ingestion: auto (${trustList.length} trusted signer${
+            trustList.length === 1 ? "" : "s"
+          }). Poisoned skills from a trusted peer will run unattended — review recommended unless the trust list is audited.`,
+        ),
+      );
+    }
+  }
+
+  // ── Rate limit ──
+  if (p2p?.maxIngestedPerHour !== undefined) {
+    results.push(ok(`Ingest rate cap: ${p2p.maxIngestedPerHour}/hr`));
+  }
+
+  // ── Quarantine directory ──
+  if (policy !== "deny") {
+    const dirRaw = p2p?.quarantineDir?.trim() || DEFAULT_QUARANTINE_DIR;
+    const dir = resolveUserPath(dirRaw);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+      const pending = countPendingSkills(dir);
+      if (pending > 0) {
+        results.push(
+          warn(
+            `${pending} skill(s) held in quarantine awaiting review (${dir}). ` +
+              `Review with: ${formatCliCommand("bitterbot skills incoming list")}`,
+          ),
+        );
+      } else {
+        results.push(ok(`Quarantine dir: ${dir} (no skills awaiting review)`));
+      }
+    } catch (err) {
+      results.push(
+        warn(
+          `Quarantine dir ${dir} not writable: ` +
+            (err instanceof Error ? err.message : String(err)),
+        ),
+      );
+    }
+  }
+
+  renderSection(results);
+}
+
+/**
+ * Count quarantined skills awaiting review: one subdirectory per skill.
+ * Mirrors listIncomingSkills (agents/skills/ingest.ts), which lists EVERY
+ * subdirectory and tolerates a missing envelope — requiring `.envelope.json`
+ * here would report "nothing awaiting review" while `bitterbot skills
+ * incoming list` shows entries.
+ */
+function countPendingSkills(dir: string): number {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+  } catch {
+    // unreadable dir already surfaced by the writability check
+    return 0;
+  }
+}
+
+function renderSection(results: CheckResult[]): void {
+  renderDoctorSection("Skills (P2P ingest)", results);
+}

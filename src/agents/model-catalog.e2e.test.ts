@@ -1,0 +1,55 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { BitterbotConfig } from "../config/config.js";
+import {
+  __setModelCatalogImportForTest,
+  loadModelCatalog,
+  resetModelCatalogCacheForTest,
+} from "./model-catalog.js";
+
+type ModelsModule = typeof import("./runtime/models/index.js");
+
+vi.mock("./models-config.js", () => ({
+  ensureBitterbotModelsJson: vi.fn().mockResolvedValue({ agentDir: "/tmp", wrote: false }),
+}));
+
+vi.mock("./agent-paths.js", () => ({
+  resolveBitterbotAgentDir: () => "/tmp/bitterbot",
+}));
+
+describe("loadModelCatalog e2e smoke", () => {
+  beforeEach(() => {
+    resetModelCatalogCacheForTest();
+  });
+
+  afterEach(() => {
+    __setModelCatalogImportForTest();
+    resetModelCatalogCacheForTest();
+    vi.restoreAllMocks();
+  });
+
+  it("recovers after an import failure on the next load", async () => {
+    let call = 0;
+    __setModelCatalogImportForTest(async () => {
+      call += 1;
+      if (call === 1) {
+        throw new Error("boom");
+      }
+      return {
+        AuthStorage: { create: () => ({}) },
+        ModelRegistry: {
+          create: () => ({
+            getAll() {
+              return [{ id: "gpt-4.1", name: "GPT-4.1", provider: "openai" }];
+            },
+          }),
+        },
+      } as unknown as ModelsModule;
+    });
+
+    const cfg = {} as BitterbotConfig;
+    expect(await loadModelCatalog({ config: cfg })).toEqual([]);
+    expect(await loadModelCatalog({ config: cfg })).toEqual([
+      { id: "gpt-4.1", name: "GPT-4.1", provider: "openai" },
+    ]);
+  });
+});

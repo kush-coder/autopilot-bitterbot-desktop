@@ -1,0 +1,225 @@
+# User Knowledge — Session Extraction & Bond Evolution
+
+Bitterbot builds a layered understanding of its user through conversation analysis, explicit corrections, and cross-session continuity. This system extracts facts, preferences, and behavioral patterns from conversations, maintains a Theory of Mind ("The Bond"), and ensures continuity between sessions through handover briefs.
+
+**Key source files:** `session-extractor.ts`, `session-handover.ts`, `user-model.ts`, `working-memory-prompt.ts`, `manager.ts`, `endocrine-state.ts`, `system-prompt.ts`
+
+---
+
+## 5-Layer Architecture
+
+```
+Layer 1: Session Extraction
+  → Raw conversation → structured facts (per dream cycle)
+
+Layer 2: Epistemic Typing
+  → Facts classified by knowledge type (experience, directive, world_fact, mental_model)
+
+Layer 3: User Model
+  → Facts aggregated into user_preferences table by category
+
+Layer 4: Bond Drift Guard
+  → Theory of Mind validated against historical baseline
+
+Layer 5: Cross-Session Handover
+  → Compact briefs carry context between sessions
+```
+
+### Layer 1: Session Extraction
+
+During each dream cycle, the `SessionExtractor` processes **changed session transcripts** (sessions modified since the last extraction). For each session, a single LLM call extracts structured facts:
+
+```typescript
+interface ExtractedFact {
+  text: string; // "User prefers dark mode"
+  epistemicType: EpistemicType; // "directive"
+  confidence: number; // 0.9
+  category: string; // "ui_preference"
+}
+```
+
+**Cost control:** Extraction runs per-session, not per-message. Only sessions with new messages since the last dream cycle are processed. Typical cost: 1 LLM call per changed session.
+
+**Token-efficiency pass (2026-09-19)** — four gates in front of that call (`src/memory/session-transcript-prep.ts`, `src/memory/extraction-failures.ts`):
+
+- **Heartbeat turns are not memory.** The heartbeat runner's "Read HEARTBEAT.md ..." prompt and its `HEARTBEAT_OK` ack are stripped before the prompt is built (an alert reply that is not a bare ack is kept). Evidence line numbers are mapped back to the original transcript. A transcript with no non-heartbeat turns makes no extraction call and writes no handover brief — previously the daily main transcript carried 48 such pairs and the handover brief read "Purpose: Monitor workspace via HEARTBEAT.md protocol".
+- **Output cap fits the request.** `memory.extraction.maxTokens` (default 6144) replaces the 2048 lane default that truncated long transcripts into unparseable JSON.
+- **Long transcripts are windowed.** Above `memory.extraction.maxTranscriptChars` (default 48000 chars after heartbeat stripping) the transcript is split at turn boundaries; facts are merged (capped at `maxFactsPerSession`), milestones/decisions are merged across windows, blockers/next steps come from the last window.
+- **Failures do not retry forever.** A transcript whose extraction fails (LLM error or unparseable output) is recorded in `session_extraction_failures` per content hash and retried at most `memory.extraction.maxAttempts` times (default 2), then parked until its content changes or `memory.extraction.retryAfterDays` (default 7) elapses. On the reference node one Sep-3 transcript accounted for 27 of 52 extraction calls.
+
+### Layer 2: Epistemic Typing
+
+Each extracted fact is classified into one of four epistemic types:
+
+| Type           | Meaning                        | Example                             | Storage                                  |
+| -------------- | ------------------------------ | ----------------------------------- | ---------------------------------------- |
+| `experience`   | Autobiographical event         | "User deployed to prod on March 15" | Crystal with `epistemic_layer` column    |
+| `directive`    | Explicit preference/correction | "User prefers tabs over spaces"     | `user_preferences` table (high priority) |
+| `world_fact`   | External knowledge             | "Their company uses Kubernetes"     | Crystal with `epistemic_layer` column    |
+| `mental_model` | Inferred behavioral pattern    | "User works late on Wednesdays"     | Crystal with `epistemic_layer` column    |
+
+**Directives override inferred knowledge.** If the user explicitly says "I prefer X," this takes priority over any pattern the system has inferred. The `working_memory_note` tool takes the same four values in its `type` parameter (`experience`, `directive`, `world_fact`, `mental_model`); there is no `correction` type. Corrections the user states in conversation are picked up by the extractor's correction pass and the canonical ledger instead (see `session-extractor.ts`).
+
+### Layer 3: User Model
+
+Only the owner's own conversations teach preferences. Group chats, guests (anyone else in a direct chat), agent-to-agent tasks and subagents never do, whether the preference is found by the extraction model or by the simpler pattern match run at indexing time. The gate is the per-session trust resolver in the extraction pass (`buildSessionTrustResolver`; directive facts route to `user_preferences` only when `sessionTrust(path) === "first_party"`, `manager.ts`).
+
+The `UserModelManager` aggregates directive-type facts into a `user_preferences` table organized by category. Facts from the extraction model carry whatever category the extractor assigned; the built-in pattern matcher (`PREFERENCE_PATTERNS` in `user-model.ts`) uses a fixed set:
+
+| Category        | Keys                                                                   | Examples                                    |
+| --------------- | ---------------------------------------------------------------------- | ------------------------------------------- |
+| `language`      | `preferred_language`                                                   | "I prefer TypeScript"                       |
+| `tool`          | `preferred_editor`, `preferred_package_manager`, `preferred_framework` | "I use vim," "we use pnpm"                  |
+| `style`         | `code_style`                                                           | "Prefers tabs over spaces"                  |
+| `workflow`      | `preferred_workflow`                                                   | "Always run the tests first"                |
+| `communication` | `communication_style`                                                  | "Keep answers short," "Prefers casual tone" |
+
+The `upsertFromDirective()` method handles updates. Confidence calibration uses Bayesian-style updates:
+
+- **Corroboration:** `confidence = 1 - (1 - confidence) × decay_factor`. Same-session corroboration uses `decay_factor = 0.7`; cross-session uses `0.6` (stronger signal from independent confirmation). This creates logarithmic growth — first mentions matter most, subsequent ones have diminishing effect.
+- **Contradiction:** `confidence = confidence × 0.6`. When a new fact contradicts an existing one (detected via negation patterns and value comparison), confidence erodes quickly and the value is updated to the newer statement. Confidence never drops below 0.1.
+
+User preferences are fed into the dream engine's MEMORY.md synthesis as an `## Input: User Preferences` section, ensuring the Bond section reflects actual stated preferences.
+
+### Layer 4: Bond Drift Guard
+
+The Theory of Mind ("The Bond" section in MEMORY.md) evolves through dream cycles. To prevent catastrophic drift — where the Bond diverges from reality due to LLM hallucination during synthesis — a **term retention** guard validates each update (`validateWorkingMemory` in `working-memory-prompt.ts`). Terms are lowercased words longer than three characters; the ratio is the share of the old Bond's terms that survive, not a symmetric Jaccard overlap:
+
+```
+retention = |terms_old ∩ terms_new| / |terms_old|
+```
+
+The check runs only when the previous Bond is longer than 100 characters.
+
+| Retention | Action                                                                                               |
+| --------- | ---------------------------------------------------------------------------------------------------- |
+| ≥ 50%     | Accept new Bond (normal evolution)                                                                   |
+| 30-50%    | Accept with warning log                                                                              |
+| < 30%     | **Collapse**: the LLM synthesis is rejected; the heuristic builder carries the previous Bond forward |
+
+This prevents a single bad LLM call from erasing the accumulated understanding of the user.
+
+### Layer 5: Cross-Session Handover
+
+When a session ends (or during dream cycles), a **handover brief** is generated and stored:
+
+```markdown
+## Last Session Summary
+
+- Discussed GCCRF implementation, found 3 bugs
+- User was stressed about launch deadline (cortisol elevated)
+- Decided to defer P2P mesh delegation to post-launch
+- Emotional state: focused, slightly anxious, collaborative
+
+## Entities Touched
+
+- dream-engine.ts (file) — edited
+- computeGCCRFReward() (function) — debugged
+- CURIOSITY_THRESHOLD (config) — discussed
+```
+
+The brief is:
+
+1. **Written** to `memory/handover/*.md` and indexed as searchable chunks
+2. **Gated** by the Session Continuity Gate — cosine similarity between the brief's purpose and the user's opening message determines whether to inject it. Below 0.25 similarity = fresh start, brief skipped. This prevents stale context pollution (e.g., injecting database migration context when the user wants help writing an email).
+3. **Loaded** by `endocrine-state.ts` at next session start (if the gate passes)
+4. **Annotated** with staleness if older than 48 hours
+5. **Injected** into the system prompt as "Last session: [compact summary]"
+
+The **entity snapshot** (files, functions, config keys last touched) enables cross-session anaphora resolution. When the user says "change that parameter" in the next session, the agent has the referent available. Entity names are surfaced via proactive recall when deictic markers ("that", "the same", "it") are detected in the user's message.
+
+---
+
+## Data Flow
+
+```mermaid
+flowchart TB
+    A[Conversation] --> B[Session JSONL]
+    B -->|Dream cycle| C[SessionExtractor]
+    C --> D{Epistemic Type?}
+    D -->|directive| E[user_preferences table]
+    D -->|experience/world_fact/mental_model| F[Crystal with epistemic_layer]
+    E --> G[Working Memory Synthesis]
+    F --> G
+    G --> H[MEMORY.md - The Bond section]
+    H --> I{Bond Drift Guard}
+    I -->|overlap ≥ 30%| J[Accept]
+    I -->|overlap < 30%| K[Rollback to previous]
+
+    B -->|Dream cycle| L[Handover Brief Generator]
+    L --> M[memory/handover/*.md]
+    M -->|Next session| N[endocrine-state.ts]
+    N --> O[System Prompt injection]
+```
+
+### Open-question answers (PLAN-34 Phase 1)
+
+The extractor also receives the top open epistemic-directive questions (first-party sessions only) and watches the transcript for user-authored answers. A validated answer (verbatim quote on a cited user line, confidence >= 0.75) marks the question answered — it stops being injected immediately — and is stored as a `world_fact` crystal with transcript evidence. Canonical-shaped answers (questions born from `canonical_conflicts`) additionally route through the ledger reconciler at extraction tier with a >= 0.8 floor; trust tiers still apply, so a conversational answer corroborates or supersedes background beliefs but never overwrites a deliberate `memory_pin`. Full resolution (`resolved_at`) lands only after the answer survives the next extraction cycle uncontradicted. See `src/memory/directive-resolution.ts` and [plan9-memory-supremacy.md](./plan9-memory-supremacy.md) §8.
+
+---
+
+## Working Memory Note Tool
+
+The agent can explicitly record knowledge via the `working_memory_note` tool:
+
+```
+working_memory_note(
+  note: "User prefers dark mode in all editors",
+  type: "directive",           // epistemic type
+  importance: 0.8
+)
+```
+
+Notes are written to `memory/scratch.md` (the write-ahead log) and consumed by the next dream cycle; every note also becomes a crystal immediately so `memory_search` can find it before then. The `type` parameter sets the crystal's semantic type and epistemic layer:
+
+- `directive` → preference crystal, and also upserted into the `user_preferences` table (confidence = importance)
+- `experience` → episode crystal (natural decay)
+- `world_fact` → fact crystal
+- `mental_model` → insight crystal
+
+There is no `correction` type; a restated preference corroborates or contradicts the stored row through `upsertFromDirective()` as described above.
+
+---
+
+## Profile Queries
+
+The agent can query its accumulated user knowledge via the `fullUserProfile()` method on the memory manager, which returns:
+
+```typescript
+{
+  preferences: UserPreference[],    // From user_preferences table
+  patterns: UserPattern[],          // Behavioral patterns detected by the user model
+  latestHandover?: string,          // Compact summary of the most recent handover brief
+  stats: {
+    totalPreferences: number,
+    categories: Record<string, number>,  // preference count per category
+    avgConfidence: number,
+  },
+}
+```
+
+It returns `null` when the user model is disabled. The Bond section itself is read from MEMORY.md by the bootstrap loader, not through this method.
+
+---
+
+## Dormant Code That Was Wired
+
+The session extraction and handover systems existed as **scaffolded but unwired code** prior to Plan 4:
+
+| File                     | Was                                   | Now                                               |
+| ------------------------ | ------------------------------------- | ------------------------------------------------- |
+| `session-extractor.ts`   | Complete implementation, never called | Called during dream cycles for changed sessions   |
+| `session-handover.ts`    | `formatCompactSummary()` existed      | Called, briefs stored and loaded at session start |
+| `epistemic_layer` column | Column existed in schema              | Populated by extraction pipeline                  |
+| `user_preferences` table | Table existed                         | Fed into working memory synthesis                 |
+
+No new files were created — the infrastructure was activated and wired together.
+
+---
+
+## Related Documentation
+
+- [Working Memory](./working-memory.md) — MEMORY.md as recursive state vector
+- [Emotional System](./emotional-system.md) — hormonal state in handover briefs
+- [Biological Identity](./biological-identity.md) — Bond as part of the Phenotype
+- [Dream Engine](./dream-engine.md) — session extraction runs during dream cycles

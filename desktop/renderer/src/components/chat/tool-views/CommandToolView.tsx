@@ -1,0 +1,162 @@
+import { ChevronDown, ChevronUp, Info } from "lucide-react";
+import { useEffect, useRef, useState, useMemo } from "react";
+import { cn } from "../../../lib/utils";
+import { parseExitCode, isNonBlockingOutput, safeJsonParse } from "./tool-view-utils";
+import type { ToolViewProps } from "./ToolViewRegistry";
+
+const MAX_COLLAPSED_LINES = 15;
+
+/**
+ * Terminal-style tool view for command execution tools.
+ * Shows command with syntax highlighting, exit code, output truncation.
+ */
+export function CommandToolView({ toolCall }: ToolViewProps) {
+  const outputRef = useRef<HTMLPreElement>(null);
+  const [expanded, setExpanded] = useState(false);
+
+  // Extract command from args
+  const args = toolCall.args as Record<string, unknown> | undefined;
+  const command =
+    typeof args?.command === "string"
+      ? args.command
+      : typeof args?.cmd === "string"
+        ? args.cmd
+        : null;
+  const sessionName =
+    typeof args?.session_name === "string"
+      ? args.session_name
+      : typeof args?.sessionName === "string"
+        ? args.sessionName
+        : null;
+
+  const rawOutput = toolCall.result ?? toolCall.partialResult;
+  const isRunning = toolCall.status === "running";
+
+  // Process output
+  const processedOutput = useMemo(() => {
+    if (!rawOutput) return null;
+    let text = rawOutput;
+    // Unescape literal \n and \t if they look escaped
+    if (text.includes("\\n") && !text.includes("\n")) {
+      text = text.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+    }
+    // Try to pretty-print JSON output
+    const trimmed = text.trim();
+    if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && trimmed.length < 10000) {
+      const parsed = safeJsonParse(trimmed, null);
+      if (parsed !== null) {
+        return JSON.stringify(parsed, null, 2);
+      }
+    }
+    return text;
+  }, [rawOutput]);
+
+  // Exit code
+  const exitCode = rawOutput ? parseExitCode(rawOutput) : null;
+
+  // Non-blocking detection
+  const nonBlocking = rawOutput ? isNonBlockingOutput(rawOutput) : null;
+
+  // Line counting for truncation
+  const outputLines = processedOutput?.split("\n") ?? [];
+  const totalLines = outputLines.length;
+  const needsTruncation = !expanded && totalLines > MAX_COLLAPSED_LINES;
+  const visibleOutput = needsTruncation
+    ? outputLines.slice(0, MAX_COLLAPSED_LINES).join("\n")
+    : processedOutput;
+
+  // Auto-scroll to bottom when output updates (only when not truncated/manually viewing)
+  useEffect(() => {
+    if (outputRef.current && (expanded || totalLines <= MAX_COLLAPSED_LINES)) {
+      outputRef.current.scrollTop = outputRef.current.scrollHeight;
+    }
+  }, [processedOutput, expanded, totalLines]);
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Terminal header */}
+      <div className="flex items-center gap-2 px-3 py-2 bg-card/80 border-b border-border/50">
+        <div className="flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full bg-danger/80" />
+          <span className="w-2.5 h-2.5 rounded-full bg-warning/80" />
+          <span className="w-2.5 h-2.5 rounded-full bg-success/80" />
+        </div>
+        {sessionName && (
+          <span className="text-badge text-muted-foreground font-mono ml-2">{sessionName}</span>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          {/* Exit code badge */}
+          {exitCode !== null && (
+            <span
+              className={cn(
+                "text-badge font-semibold px-1.5 py-0.5 rounded border",
+                exitCode === 0
+                  ? "bg-success/10 text-success border-success/20"
+                  : "bg-danger/10 text-danger border-danger/20",
+              )}
+            >
+              Exit {exitCode}
+            </span>
+          )}
+          <span className="text-badge text-muted-foreground font-mono">bash</span>
+        </div>
+      </div>
+
+      {/* Command line */}
+      {command && (
+        <div className="px-3 py-2 bg-card/60 border-b border-border/50 font-mono text-xs">
+          <span className="text-success/80">$</span>{" "}
+          <span className="text-foreground">{command}</span>
+        </div>
+      )}
+
+      {/* Non-blocking info box */}
+      {nonBlocking && (
+        <div className="mx-3 mt-2 flex items-center gap-2 px-3 py-2 rounded-lg bg-info/10 border border-info/20">
+          <Info className="w-3.5 h-3.5 text-info flex-shrink-0" />
+          <span className="text-xs text-info">
+            Command sent to tmux session{" "}
+            <span className="font-mono font-semibold">{nonBlocking.sessionName}</span>
+          </span>
+        </div>
+      )}
+
+      {/* Output area */}
+      <pre
+        ref={outputRef}
+        className="flex-1 overflow-auto p-3 bg-card/80 font-mono text-xs text-foreground leading-relaxed whitespace-pre-wrap break-all"
+      >
+        {visibleOutput ? (
+          visibleOutput
+        ) : isRunning ? (
+          <span className="text-muted-foreground animate-pulse">Executing...</span>
+        ) : (
+          <span className="text-muted-foreground">No output</span>
+        )}
+        {isRunning && processedOutput && (
+          <span className="inline-block w-1.5 h-3.5 bg-success/80 ml-0.5 animate-pulse" />
+        )}
+      </pre>
+
+      {/* Show more/less toggle */}
+      {totalLines > MAX_COLLAPSED_LINES && (
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center justify-center gap-1.5 px-3 py-1.5 border-t border-border/50 bg-card/40 text-2xs text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+        >
+          {expanded ? (
+            <>
+              <ChevronUp className="w-3 h-3" />
+              Show less
+            </>
+          ) : (
+            <>
+              <ChevronDown className="w-3 h-3" />
+              Show {totalLines - MAX_COLLAPSED_LINES} more lines
+            </>
+          )}
+        </button>
+      )}
+    </div>
+  );
+}

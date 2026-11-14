@@ -1,0 +1,536 @@
+import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
+import { loadModelCatalog } from "../agents/model-catalog.js";
+import {
+  getModelRefStatus,
+  resolveConfiguredModelRef,
+  resolveHooksGmailModel,
+} from "../agents/model-selection.js";
+import type { CliDeps } from "../cli/deps.js";
+import type { loadConfig } from "../config/config.js";
+import {
+  a2aEnabled,
+  p2pEnabled,
+  walletCredentialsPresent,
+  walletToolEnabled,
+} from "../config/feature-switches.js";
+import { startCronEngine } from "../cron/runtime.js";
+import { startGmailWatcher } from "../hooks/gmail-watcher.js";
+import {
+  clearInternalHooks,
+  createInternalHookEvent,
+  triggerInternalHook,
+} from "../hooks/internal-hooks.js";
+import { loadInternalHooks } from "../hooks/loader.js";
+import { isTruthyEnvValue } from "../infra/env.js";
+import { getP2pStatus, patchP2pStatus } from "../infra/p2p-status.js";
+import { recordPeerWalletCapability, setLocalWalletCapability } from "../infra/wallet-discovery.js";
+import { startMonitorEngine } from "../monitors/runtime.js";
+import type { loadBitterbotPlugins } from "../plugins/loader.js";
+import { type PluginServicesHandle, startPluginServices } from "../plugins/services.js";
+import { createSkillReceivedHandler } from "./p2p-skill-receive.js";
+import { startBrowserControlServerIfEnabled } from "./server-browser.js";
+import {
+  scheduleRestartSentinelWake,
+  shouldWakeFromRestartSentinel,
+} from "./server-restart-sentinel.js";
+import { startGatewayMemoryBackend } from "./server-startup-memory.js";
+
+export async function startGatewaySidecars(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  pluginRegistry: ReturnType<typeof loadBitterbotPlugins>;
+  defaultWorkspaceDir: string;
+  deps: CliDeps;
+  startChannels: () => Promise<void>;
+  log: { warn: (msg: string) => void };
+  logHooks: {
+    info: (msg: string) => void;
+    warn: (msg: string) => void;
+    error: (msg: string) => void;
+  };
+  logChannels: { info: (msg: string) => void; error: (msg: string) => void };
+  logBrowser: { error: (msg: string) => void };
+  /**
+   * Optional callback fired when the SkillNetworkBridge becomes available.
+   * The memory backend init is fire-and-forget so the gateway boots fast,
+   * but callers (e.g. the request-context wiring) need to be notified once
+   * the bridge instance exists so they can patch their own references.
+   */
+  onSkillNetworkBridgeReady?: (
+    bridge: import("../memory/skill-network-bridge.js").SkillNetworkBridge,
+  ) => void;
+}) {
+  // Start Bitterbot browser control server (unless disabled via config).
+  let browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> = null;
+  try {
+    browserControl = await startBrowserControlServerIfEnabled();
+  } catch (err) {
+    params.logBrowser.error(`server failed to start: ${String(err)}`);
+  }
+
+  // Start Gmail watcher if configured (hooks.gmail.account).
+  if (!isTruthyEnvValue(process.env.BITTERBOT_SKIP_GMAIL_WATCHER)) {
+    try {
+      const gmailResult = await startGmailWatcher(params.cfg);
+      if (gmailResult.started) {
+        params.logHooks.info("gmail watcher started");
+      } else if (
+        gmailResult.reason &&
+        gmailResult.reason !== "hooks not enabled" &&
+        gmailResult.reason !== "no gmail account configured"
+      ) {
+        params.logHooks.warn(`gmail watcher not started: ${gmailResult.reason}`);
+      }
+    } catch (err) {
+      params.logHooks.error(`gmail watcher failed to start: ${String(err)}`);
+    }
+  }
+
+  // Validate hooks.gmail.model if configured.
+  if (params.cfg.hooks?.gmail?.model) {
+    const hooksModelRef = resolveHooksGmailModel({
+      cfg: params.cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+    });
+    if (hooksModelRef) {
+      const { provider: defaultProvider, model: defaultModel } = resolveConfiguredModelRef({
+        cfg: params.cfg,
+        defaultProvider: DEFAULT_PROVIDER,
+        defaultModel: DEFAULT_MODEL,
+      });
+      const catalog = await loadModelCatalog({ config: params.cfg });
+      const status = getModelRefStatus({
+        cfg: params.cfg,
+        catalog,
+        ref: hooksModelRef,
+        defaultProvider,
+        defaultModel,
+      });
+      if (!status.allowed) {
+        params.logHooks.warn(
+          `hooks.gmail.model "${status.key}" not in agents.defaults.models allowlist (will use primary instead)`,
+        );
+      }
+      if (!status.inCatalog) {
+        params.logHooks.warn(
+          `hooks.gmail.model "${status.key}" not in the model catalog (may fail at runtime)`,
+        );
+      }
+    }
+  }
+
+  // Load internal hook handlers from configuration and directory discovery.
+  try {
+    // Clear any previously registered hooks to ensure fresh loading
+    clearInternalHooks();
+    const loadedCount = await loadInternalHooks(params.cfg, params.defaultWorkspaceDir);
+    if (loadedCount > 0) {
+      params.logHooks.info(
+        `loaded ${loadedCount} internal hook handler${loadedCount > 1 ? "s" : ""}`,
+      );
+    }
+  } catch (err) {
+    params.logHooks.error(`failed to load hooks: ${String(err)}`);
+  }
+
+  // Launch configured channels so gateway replies via the surface the message came from.
+  // Tests can opt out via BITTERBOT_SKIP_CHANNELS or BITTERBOT_SKIP_PROVIDERS.
+  const skipChannels =
+    isTruthyEnvValue(process.env.BITTERBOT_SKIP_CHANNELS) ||
+    isTruthyEnvValue(process.env.BITTERBOT_SKIP_PROVIDERS);
+  if (!skipChannels) {
+    try {
+      await params.startChannels();
+    } catch (err) {
+      params.logChannels.error(`channel startup failed: ${String(err)}`);
+    }
+  } else {
+    params.logChannels.info("skipping channel start (BITTERBOT_SKIP_CHANNELS=1)");
+  }
+
+  if (params.cfg.hooks?.internal?.enabled) {
+    setTimeout(() => {
+      const hookEvent = createInternalHookEvent("gateway", "startup", "gateway:startup", {
+        cfg: params.cfg,
+        deps: params.deps,
+        workspaceDir: params.defaultWorkspaceDir,
+      });
+      void triggerInternalHook(hookEvent);
+    }, 250);
+  }
+
+  let pluginServices: PluginServicesHandle | null = null;
+  try {
+    pluginServices = await startPluginServices({
+      registry: params.pluginRegistry,
+      config: params.cfg,
+      workspaceDir: params.defaultWorkspaceDir,
+    });
+  } catch (err) {
+    params.log.warn(`plugin services failed to start: ${String(err)}`);
+  }
+
+  if (shouldWakeFromRestartSentinel()) {
+    setTimeout(() => {
+      void scheduleRestartSentinelWake({ deps: params.deps });
+    }, 750);
+  }
+
+  // Start P2P orchestrator bridge if configured.
+  let orchestratorBridge: import("../infra/orchestrator-bridge.js").OrchestratorBridge | null =
+    null;
+  let skillNetworkBridge: import("../memory/skill-network-bridge.js").SkillNetworkBridge | null =
+    null;
+  let computeMesh: import("../compute/mesh-service.js").ComputeMeshService | undefined;
+  let peerRpcTransport: { stop(): void } | undefined;
+  const p2pCfg = params.cfg.p2p;
+  if (p2pCfg && p2pEnabled(params.cfg)) {
+    try {
+      const { OrchestratorBridge: Bridge, setActiveOrchestratorBridge } =
+        await import("../infra/orchestrator-bridge.js");
+      orchestratorBridge = new Bridge(p2pCfg);
+      await orchestratorBridge.start();
+      // PLAN-14 Pillar 4: register the bridge for tool-side accessors
+      // (computer_use IPC, etc.) without threading it through every
+      // tool factory.
+      setActiveOrchestratorBridge(orchestratorBridge);
+      try {
+        const { startComputeMesh } = await import("../compute/mesh-runtime.js");
+        computeMesh = await startComputeMesh(orchestratorBridge, params.cfg);
+      } catch {
+        params.log.warn("Compute mesh unavailable; matching orchestrator and runtime are required");
+      }
+      // Publish initial status snapshot for system prompt / doctor / UI consumers.
+      // peer_connected/peer_disconnected callbacks below maintain peerCount live.
+      // Use patch (not set) so the census/identity defaults from p2p-status.ts
+      // initial state stay intact while the bridge fills them in async.
+      patchP2pStatus({
+        enabled: true,
+        connected: false,
+        peerCount: 0,
+        lastError: null,
+      });
+      orchestratorBridge.onPeerConnected(() => {
+        const next = getP2pStatus().peerCount + 1;
+        patchP2pStatus({ peerCount: next, connected: next > 0 });
+      });
+      orchestratorBridge.onPeerDisconnected(() => {
+        const next = Math.max(0, getP2pStatus().peerCount - 1);
+        patchP2pStatus({ peerCount: next, connected: next > 0 });
+      });
+
+      // The key this node publishes skills under. Passed to ingestSkill so our
+      // own skill echoed back by a re-publishing peer is dropped instead of
+      // landing in review as an anonymous peer skill (audit finding F15; the
+      // guard existed in ingest.ts but was never wired here).
+      let skillReceiveHandler: ReturnType<typeof createSkillReceivedHandler> | undefined;
+      // Cache the orchestrator's identity once at startup. Stable until
+      // restart, so a single fetch is enough — the system prompt then sees
+      // peerId + tier on every turn without an IPC round-trip.
+      void orchestratorBridge
+        .getIdentity()
+        .then((identity) => {
+          skillReceiveHandler?.setOwnPublishPubkey(identity.pubkey);
+          patchP2pStatus({ peerId: identity.peerId, nodeTier: identity.nodeTier });
+        })
+        .catch((err) => {
+          params.log.warn(`failed to fetch orchestrator identity: ${String(err)}`);
+        });
+
+      // Periodic census poll. Refreshes the agent-visible network state
+      // (tier mix, health score, telemetry counts, anomaly count) every
+      // 30s. The census IPC is cheap; the agent feeling embedded in the
+      // network is worth the once-per-30s cost. Edge nodes return null
+      // (no management state) — that's fine, defaults stay empty.
+      const censusPollMs = 30_000;
+      const bridgeRef = orchestratorBridge;
+      const pollCensus = async () => {
+        const census = await bridgeRef.getNetworkCensus();
+        if (census) {
+          patchP2pStatus({
+            peersByTier: census.peers_by_tier ?? {},
+            networkHealthScore:
+              typeof census.network_health_score === "number" ? census.network_health_score : null,
+            skillsPublishedNetworkWide:
+              typeof census.skills_published_network_wide === "number"
+                ? census.skills_published_network_wide
+                : null,
+            telemetryCountsByType: census.telemetry_counts_by_type ?? {},
+            censusUpdatedAt: Date.now(),
+          });
+        }
+        const alerts = await bridgeRef.getAnomalyAlerts();
+        patchP2pStatus({ anomalyAlertCount: alerts.length });
+      };
+      const censusTimer = setInterval(() => {
+        void pollCensus();
+      }, censusPollMs);
+      // Run once after a short delay so identity has time to land first.
+      setTimeout(() => void pollCensus(), 5_000);
+      // Stop the poller when the bridge tears down. Stash the timer on
+      // the bridge so a future stop() can clear it cleanly.
+      (bridgeRef as unknown as { __censusPollTimer?: NodeJS.Timeout }).__censusPollTimer =
+        censusTimer;
+      // Lifetime peer accounting: every identify event upserts the peer into
+      // the local peer_reputation table so SELECT COUNT(*) is the true count
+      // of unique peers ever seen, not just peers we've received skills from.
+      //
+      // Identify can fire before the memory backend (and therefore the
+      // SkillNetworkBridge) is ready — buffer those events keyed on pubkey
+      // and drain once the bridge becomes available.
+      const pendingPeerSeen = new Map<string, { pubkey: string; peerId: string }>();
+      orchestratorBridge.onPeerIdentified((event) => {
+        if (!event.pubkey) {
+          return;
+        }
+        if (skillNetworkBridge) {
+          skillNetworkBridge.recordPeerSeen(event.pubkey, event.peer_id);
+          return;
+        }
+        pendingPeerSeen.set(event.pubkey, {
+          pubkey: event.pubkey,
+          peerId: event.peer_id,
+        });
+      });
+      // Compose with caller's onSkillNetworkBridgeReady so we can drain the
+      // buffer the moment the bridge is wired by the memory backend init.
+      const callerReady = params.onSkillNetworkBridgeReady;
+      params.onSkillNetworkBridgeReady = (bridge) => {
+        for (const { pubkey, peerId } of pendingPeerSeen.values()) {
+          bridge.recordPeerSeen(pubkey, peerId);
+        }
+        pendingPeerSeen.clear();
+        callerReady?.(bridge);
+      };
+      // Wire skill_received → ingestion pipeline (src/gateway/p2p-skill-receive.ts).
+      const identityBridge = orchestratorBridge;
+      skillReceiveHandler = createSkillReceivedHandler({
+        getIdentity: () => identityBridge.getIdentity(),
+        workspaceDir: params.defaultWorkspaceDir,
+        getSkillNetworkBridge: () => skillNetworkBridge,
+        log: params.log,
+      });
+      const receiver = skillReceiveHandler;
+      orchestratorBridge.onSkillReceived((event) => void receiver.handle(event));
+      // Cache bootnode census snapshots received over gossipsub. Buffer if
+      // the bridge isn't ready yet — same pattern as peer-identified above.
+      const pendingCensus = new Map<string, { source: string; snapshot: unknown }>();
+      orchestratorBridge.onCensusReceived((event) => {
+        if (!event?.source_peer_id || !event?.snapshot) {
+          return;
+        }
+        if (skillNetworkBridge) {
+          skillNetworkBridge.recordCensusSnapshot(
+            event.source_peer_id,
+            event.snapshot as Parameters<typeof skillNetworkBridge.recordCensusSnapshot>[1],
+          );
+          return;
+        }
+        pendingCensus.set(event.source_peer_id, {
+          source: event.source_peer_id,
+          snapshot: event.snapshot,
+        });
+      });
+      const callerReadyForCensus = params.onSkillNetworkBridgeReady;
+      params.onSkillNetworkBridgeReady = (bridge) => {
+        for (const { source, snapshot } of pendingCensus.values()) {
+          bridge.recordCensusSnapshot(
+            source,
+            snapshot as Parameters<typeof bridge.recordCensusSnapshot>[1],
+          );
+        }
+        pendingCensus.clear();
+        callerReadyForCensus?.(bridge);
+      };
+      orchestratorBridge.onWeatherReceived((event) => {
+        skillNetworkBridge?.handleWeatherEvent(event);
+      });
+      orchestratorBridge.onBountyReceived((event) => {
+        skillNetworkBridge?.handleBountyEvent(event);
+      });
+      orchestratorBridge.onTelemetryReceived((event) => {
+        // Learn peer wallet addresses advertised via `wallet_capability`
+        // telemetry so the agent can pay a peer by peerId (no-op for other
+        // signal types).
+        recordPeerWalletCapability(event);
+        skillNetworkBridge?.handleTelemetryEvent(event);
+      });
+      orchestratorBridge.onQueryReceived((event) => {
+        skillNetworkBridge?.handleQueryEvent(event).catch((err) => {
+          params.log.warn(`Query event handling failed: ${String(err)}`);
+        });
+      });
+      // PLAN-36 Phase 4: circle messages over the mesh. Wire inbound per-circle
+      // topic frames into the circles DB; the send side + subscriptions are
+      // driven by the circles service (fast scheduler ensures subscriptions).
+      // Requires the circles.meshTopic kill switch (default OFF — frames are
+      // signed but not encrypted; see types.circles.ts) on top of circles
+      // being enabled; degrades cleanly if the orchestrator build lacks the
+      // topic primitive (subscribe/publish just error at debug).
+      if (params.cfg.circles?.enabled === true && params.cfg.circles?.meshTopic?.enabled === true) {
+        void (async () => {
+          try {
+            const [
+              { startCircleTopicTransport },
+              { MemoryIndexManager },
+              { resolveDefaultAgentId },
+            ] = await Promise.all([
+              import("../circles/circle-topic-transport.js"),
+              import("../memory/manager.js"),
+              import("../agents/agent-scope.js"),
+            ]);
+            startCircleTopicTransport({
+              bridge: orchestratorBridge,
+              resolveCirclesDb: async () => {
+                const mgr = await MemoryIndexManager.get({
+                  cfg: params.cfg,
+                  agentId: resolveDefaultAgentId(params.cfg),
+                  purpose: "status",
+                });
+                return mgr?.getCirclesDb();
+              },
+            });
+          } catch (err) {
+            params.log.warn(`circle topic transport failed to start: ${String(err)}`);
+          }
+        })();
+      }
+      // Stage 4: point-to-point circle RPC over libp2p request-response.
+      // Wired whenever circles run — unlike the broadcast topic path it is
+      // per-connection noise-encrypted, so it needs no meshTopic gate;
+      // circles.p2pDial.enabled=false turns off outbound dialing (inbound
+      // dispatch stays: answering members over the mesh costs nothing and
+      // every verb re-checks membership auth).
+      {
+        await (async () => {
+          try {
+            const [{ startCircleP2pTransport }, { MemoryIndexManager }, { resolveDefaultAgentId }] =
+              await Promise.all([
+                import("../circles/circle-p2p-transport.js"),
+                import("../memory/manager.js"),
+                import("../agents/agent-scope.js"),
+              ]);
+            peerRpcTransport = startCircleP2pTransport({
+              bridge: orchestratorBridge,
+              compute: computeMesh,
+              resolveCirclesDb: async () => {
+                if (params.cfg.circles?.enabled !== true) return undefined;
+                const mgr = await MemoryIndexManager.get({
+                  cfg: params.cfg,
+                  agentId: resolveDefaultAgentId(params.cfg),
+                  purpose: "status",
+                });
+                return mgr?.getCirclesDb();
+              },
+            });
+          } catch (err) {
+            params.log.warn(`circle p2p transport failed to start: ${String(err)}`);
+          }
+        })();
+      }
+      // Phase 2 wallet discoverability: advertise our receiving address to the
+      // mesh so peers can pay us by peerId without an out-of-band exchange.
+      // Best-effort and gated on CDP credentials being present — nodes without
+      // a configured wallet stay silent (no noisy init attempts). Addresses are
+      // public; advertising one exposes no signing capability.
+      const walletCfg = params.cfg.tools?.wallet;
+      const hasWalletCreds = walletCredentialsPresent(walletCfg);
+      // V1 default flip (PLAN-41 D-D): wallet surfaces are opt-in.
+      if (walletToolEnabled(walletCfg) && hasWalletCreds) {
+        const advertiseBridge = orchestratorBridge;
+        const a2aIsEnabled = a2aEnabled(params.cfg);
+        // Advertise the A2A endpoint URL alongside the wallet so peers can
+        // resolve peerId -> URL and hire this node without an out-of-band
+        // exchange. Only an explicitly configured public URL is useful to
+        // peers; a localhost fallback would just pollute the mesh.
+        const a2aUrl = a2aIsEnabled ? params.cfg.a2a?.url : undefined;
+        const advertiseWallet = async () => {
+          try {
+            const { createWalletService } = await import("../services/wallet-service.js");
+            const svc = createWalletService(walletCfg ?? {});
+            const address = await svc.getAddress();
+            const network = svc.getNetwork();
+            setLocalWalletCapability({
+              address,
+              network,
+              acceptsPayments: true,
+              a2aEnabled: a2aIsEnabled,
+              a2aUrl,
+              updatedAt: Date.now(),
+            });
+            await advertiseBridge.publishTelemetry("wallet_capability", {
+              address,
+              network,
+              acceptsPayments: true,
+              a2aEnabled: a2aIsEnabled,
+              a2aUrl,
+            });
+          } catch (err) {
+            params.log.warn(`wallet capability advertise skipped: ${String(err)}`);
+          }
+        };
+        // First advertise after a short delay so wallet/CDP init doesn't
+        // compete with the rest of startup; then refresh every 30 min so
+        // freshly-joined peers still learn our address.
+        const walletAdvertiseTimer = setInterval(() => void advertiseWallet(), 30 * 60 * 1000);
+        setTimeout(() => void advertiseWallet(), 10_000);
+        (
+          advertiseBridge as unknown as { __walletAdvertiseTimer?: NodeJS.Timeout }
+        ).__walletAdvertiseTimer = walletAdvertiseTimer;
+      }
+      params.log.warn(
+        `P2P orchestrator bridge started (binary: ${orchestratorBridge.getHealth().binaryPath})`,
+      );
+    } catch (err) {
+      // P2P is core, not optional. Surface the failure loudly with the
+      // operator-facing hint already embedded in the thrown error.
+      params.log.warn(
+        `P2P orchestrator bridge FAILED to start — node will be isolated from the network.\n${String(err)}`,
+      );
+      patchP2pStatus({
+        enabled: true,
+        connected: false,
+        peerCount: 0,
+        lastError: String(err),
+      });
+    }
+  }
+
+  // Start memory backend — now that P2P bridge is available, pass it for skill network wiring.
+  void startGatewayMemoryBackend({
+    cfg: params.cfg,
+    log: params.log,
+    orchestratorBridge: orchestratorBridge ?? undefined,
+  })
+    .then(async (result) => {
+      if (result.skillNetworkBridge) {
+        skillNetworkBridge = result.skillNetworkBridge;
+        // PLAN-45 4.2: the validation gate writes the peer chunk at promotion.
+        const { setActiveSkillNetworkBridge } = await import("../memory/skill-network-bridge.js");
+        setActiveSkillNetworkBridge(skillNetworkBridge);
+        params.onSkillNetworkBridgeReady?.(result.skillNetworkBridge);
+      }
+    })
+    .catch((err) => {
+      params.log.warn(`memory startup initialization failed: ${String(err)}`);
+    });
+
+  // Start the cron engine. Failures here are non-fatal — the rest of the
+  // gateway should boot even if cron jobs fail to load.
+  void startCronEngine(params.cfg).catch((err) => {
+    params.log.warn(`cron engine failed to start: ${String(err)}`);
+  });
+
+  // Monitors (PLAN-53 E5). Non-fatal, like cron.
+  void startMonitorEngine(params.cfg).catch((err) => {
+    params.log.warn(`monitor engine failed to start: ${String(err)}`);
+  });
+
+  return {
+    browserControl,
+    pluginServices,
+    orchestratorBridge,
+    skillNetworkBridge,
+    computeMesh,
+    peerRpcTransport,
+  };
+}

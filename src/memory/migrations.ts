@@ -1,0 +1,2957 @@
+/**
+ * Simple version-based migration runner for the memory database.
+ *
+ * Reads `schema_version` from the `meta` table and runs migrations
+ * sequentially. Each migration is idempotent via ALTER TABLE IF NOT EXISTS
+ * and ensureColumn.
+ *
+ * ── N-1 COMPATIBILITY POLICY (auto-rollback contract) ─────────────────────
+ * Migrations are FORWARD-ONLY: there are no down-migrations, and the boot
+ * watchdog (infra/boot-watchdog.ts) may automatically roll CODE back one
+ * release while leaving the DB schema as-is. Every migration must therefore
+ * keep the PREVIOUS release's code working against the migrated schema:
+ *
+ *   - ADD tables/columns/indexes freely (old code ignores what it doesn't
+ *     know about — the ensureColumn/IF NOT EXISTS style already gives this).
+ *   - NEVER drop or rename a table/column the previous release reads, and
+ *     never change a column's meaning, in the same release that introduces
+ *     the replacement. Deprecate first; remove one release later.
+ *   - Backfills must leave old readers functional mid-backfill.
+ *
+ * Breaking this policy turns an automatic rollback into a crash loop the
+ * watchdog's once-only latch will stop but not fix.
+ */
+
+import type { DatabaseSync } from "node:sqlite";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { looksLikePersonName } from "./knowledge-graph.js";
+import { ensureColumn } from "./memory-schema.js";
+import { backfillSkillCategories } from "./skill-category.js";
+
+const log = createSubsystemLogger("memory/migrations");
+
+const SCHEMA_VERSION_KEY = "schema_version";
+
+export type Migration = {
+  version: number;
+  description: string;
+  up: (db: DatabaseSync) => void;
+};
+
+export const MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    description: "Knowledge Crystal columns + indexes",
+    up: (db: DatabaseSync) => {
+      // New crystal metadata columns (all have defaults for backward compat)
+      ensureColumn(db, "chunks", "semantic_type", "TEXT DEFAULT 'general'");
+      ensureColumn(db, "chunks", "lifecycle", "TEXT DEFAULT 'generated'");
+      ensureColumn(db, "chunks", "hormonal_dopamine", "REAL DEFAULT 0");
+      ensureColumn(db, "chunks", "hormonal_cortisol", "REAL DEFAULT 0");
+      ensureColumn(db, "chunks", "hormonal_oxytocin", "REAL DEFAULT 0");
+      ensureColumn(db, "chunks", "governance_json", "TEXT DEFAULT '{}'");
+      ensureColumn(db, "chunks", "provenance_chain", "TEXT DEFAULT '[]'");
+      ensureColumn(db, "chunks", "created_at", "INTEGER");
+      ensureColumn(db, "chunks", "last_consolidated_at", "INTEGER");
+
+      // Migrate existing lifecycle_state values to the new lifecycle column
+      db.exec(`
+        UPDATE chunks SET lifecycle = CASE
+          WHEN COALESCE(lifecycle_state, 'active') = 'active'
+               AND COALESCE(memory_type, 'plaintext') = 'skill'
+            THEN 'frozen'
+          WHEN COALESCE(lifecycle_state, 'active') = 'active'
+               AND importance_score >= 0.8
+            THEN 'activated'
+          WHEN COALESCE(lifecycle_state, 'active') = 'active'
+            THEN 'generated'
+          WHEN lifecycle_state = 'forgotten'
+            THEN 'expired'
+          WHEN lifecycle_state = 'archived'
+            THEN 'archived'
+          WHEN lifecycle_state = 'consolidating'
+            THEN 'consolidated'
+          ELSE 'generated'
+        END
+        WHERE lifecycle IS NULL OR lifecycle = 'generated'
+      `);
+
+      // Backfill created_at from updated_at where missing
+      db.exec(`UPDATE chunks SET created_at = updated_at WHERE created_at IS NULL`);
+
+      // New indexes
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_lifecycle_v2 ON chunks(lifecycle)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_semantic_type ON chunks(semantic_type)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_created_at ON chunks(created_at)`);
+    },
+  },
+  {
+    version: 2,
+    description:
+      "Skill execution tracking, peer reputation, versioning, provenance DAG, " +
+      "multi-perspective embeddings, marketplace, skill hierarchy, discovery edges, mutation queue",
+    up: (db: DatabaseSync) => {
+      // ── Phase 3: Skill Execution Tracker ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS skill_executions (
+          id TEXT PRIMARY KEY,
+          skill_crystal_id TEXT NOT NULL,
+          session_id TEXT,
+          started_at INTEGER NOT NULL,
+          completed_at INTEGER,
+          success INTEGER,
+          reward_score REAL,
+          error_type TEXT,
+          error_detail TEXT,
+          execution_time_ms INTEGER,
+          tool_calls_count INTEGER,
+          user_feedback INTEGER,
+          context_json TEXT DEFAULT '{}'
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_skill_executions_crystal ON skill_executions(skill_crystal_id)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_skill_executions_time ON skill_executions(started_at)`,
+      );
+
+      // Steering reward on chunks
+      ensureColumn(db, "chunks", "steering_reward", "REAL DEFAULT 0");
+
+      // ── Phase 4: Peer Reputation ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS peer_reputation (
+          peer_pubkey TEXT PRIMARY KEY,
+          peer_id TEXT,
+          display_name TEXT,
+          skills_received INTEGER DEFAULT 0,
+          skills_accepted INTEGER DEFAULT 0,
+          skills_rejected INTEGER DEFAULT 0,
+          avg_skill_quality REAL DEFAULT 0,
+          reputation_score REAL DEFAULT 0.5,
+          first_seen_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          is_trusted INTEGER DEFAULT 0,
+          metadata_json TEXT DEFAULT '{}'
+        )
+      `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS peer_skill_ratings (
+          id TEXT PRIMARY KEY,
+          peer_pubkey TEXT NOT NULL,
+          skill_crystal_id TEXT NOT NULL,
+          rating REAL NOT NULL,
+          rated_at INTEGER NOT NULL
+        )
+      `);
+
+      // ── Phase 5: Provenance DAG ──
+      ensureColumn(db, "chunks", "provenance_dag", "TEXT");
+
+      // ── Phase 6: Skill Versioning ──
+      ensureColumn(db, "chunks", "stable_skill_id", "TEXT");
+      ensureColumn(db, "chunks", "skill_version", "INTEGER DEFAULT 1");
+      ensureColumn(db, "chunks", "previous_version_id", "TEXT");
+      ensureColumn(db, "chunks", "deprecated", "INTEGER DEFAULT 0");
+      ensureColumn(db, "chunks", "deprecated_by", "TEXT");
+      ensureColumn(db, "chunks", "skill_tags", "TEXT DEFAULT '[]'");
+      ensureColumn(db, "chunks", "skill_category", "TEXT");
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_stable_skill ON chunks(stable_skill_id)`);
+
+      // ── Phase 7: Mutation Queue ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS mutation_queue (
+          id TEXT PRIMARY KEY,
+          skill_crystal_id TEXT NOT NULL,
+          strategy TEXT NOT NULL,
+          priority REAL DEFAULT 0.5,
+          attempts INTEGER DEFAULT 0,
+          max_attempts INTEGER DEFAULT 3,
+          last_attempt_at INTEGER,
+          created_at INTEGER NOT NULL
+        )
+      `);
+
+      // ── Phase 8: Multi-Perspective Embeddings ──
+      ensureColumn(db, "chunks", "embedding_procedural", "TEXT");
+      ensureColumn(db, "chunks", "embedding_causal", "TEXT");
+      ensureColumn(db, "chunks", "embedding_entity", "TEXT");
+
+      // ── Phase 9: Marketplace ──
+      ensureColumn(db, "chunks", "marketplace_listed", "INTEGER DEFAULT 0");
+      ensureColumn(db, "chunks", "marketplace_description", "TEXT");
+      ensureColumn(db, "chunks", "download_count", "INTEGER DEFAULT 0");
+
+      // ── Phase 10: Skill Hierarchy ──
+      ensureColumn(db, "chunks", "skill_hierarchy", "TEXT");
+
+      // ── Phase 11: Skill Edges (Discovery Agent) ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS skill_edges (
+          id TEXT PRIMARY KEY,
+          source_skill_id TEXT NOT NULL,
+          target_skill_id TEXT NOT NULL,
+          edge_type TEXT NOT NULL,
+          weight REAL DEFAULT 0.5,
+          steering_reward REAL DEFAULT 0,
+          confidence REAL DEFAULT 0.5,
+          discovered_by TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_edges_source ON skill_edges(source_skill_id)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_edges_target ON skill_edges(target_skill_id)`);
+    },
+  },
+  {
+    version: 3,
+    description: "Peer ban/blocklist, EigenTrust trust edges, activity log",
+    up: (db: DatabaseSync) => {
+      // ── Task 5: Peer ban/blocklist ──
+      ensureColumn(db, "peer_reputation", "is_banned", "INTEGER DEFAULT 0");
+
+      // ── Task 6: EigenTrust anti-Sybil ──
+      ensureColumn(db, "peer_reputation", "eigentrust_score", "REAL DEFAULT 0.5");
+      ensureColumn(db, "peer_reputation", "anomaly_flag", "INTEGER DEFAULT 0");
+      ensureColumn(db, "peer_reputation", "last_eigentrust_at", "INTEGER");
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS peer_trust_edges (
+          id TEXT PRIMARY KEY,
+          truster_pubkey TEXT NOT NULL,
+          trustee_pubkey TEXT NOT NULL,
+          trust_weight REAL NOT NULL,
+          evidence_count INTEGER DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE(truster_pubkey, trustee_pubkey)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_trust_edges_truster ON peer_trust_edges(truster_pubkey)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_trust_edges_trustee ON peer_trust_edges(trustee_pubkey)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS peer_activity_log (
+          id TEXT PRIMARY KEY,
+          peer_pubkey TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_log_peer ON peer_activity_log(peer_pubkey)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_log_time ON peer_activity_log(timestamp)`);
+    },
+  },
+  {
+    version: 4,
+    description: "Management node verification, bounty tracking",
+    up: (db: DatabaseSync) => {
+      // Task 2: Verified Safe marketplace tier
+      ensureColumn(db, "chunks", "is_verified", "INTEGER DEFAULT 0");
+      ensureColumn(db, "chunks", "verified_by", "TEXT");
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_verified ON chunks(is_verified)`);
+
+      // Task 4: Bounty tracking
+      ensureColumn(db, "chunks", "bounty_match_id", "TEXT");
+      ensureColumn(db, "chunks", "bounty_priority_boost", "REAL DEFAULT 0");
+    },
+  },
+  {
+    version: 5,
+    description: "Skill version conflict resolution — lineage tracking and peer origin",
+    up: (db: DatabaseSync) => {
+      // Lineage hash uniquely identifies a branch (skill × parent × author)
+      ensureColumn(db, "chunks", "lineage_hash", "TEXT");
+      // Origin peer pubkey (denormalized from provenance_dag for fast queries)
+      ensureColumn(db, "chunks", "peer_origin", "TEXT");
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunks_lineage ON chunks(stable_skill_id, skill_version, lineage_hash)`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_peer_origin ON chunks(peer_origin)`);
+    },
+  },
+  {
+    version: 6,
+    description: "Bitemporal columns for temporal-aware retrieval and fact supersession",
+    up: (db: DatabaseSync) => {
+      // Valid time: when the fact was true in the real world.
+      // NULL valid_time_end means the fact is still current.
+      ensureColumn(db, "chunks", "valid_time_start", "INTEGER");
+      ensureColumn(db, "chunks", "valid_time_end", "INTEGER");
+
+      // Transaction time: when the agent ingested the information.
+      // Distinct from created_at (chunk indexing time) — transaction_time
+      // represents when the knowledge entered the system.
+      ensureColumn(db, "chunks", "transaction_time", "INTEGER");
+
+      // Backfill from existing timestamps
+      db.exec(`
+        UPDATE chunks
+        SET valid_time_start = COALESCE(created_at, updated_at),
+            transaction_time = COALESCE(created_at, updated_at)
+        WHERE valid_time_start IS NULL
+      `);
+
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunks_valid_time ON chunks(valid_time_start, valid_time_end)`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_transaction_time ON chunks(transaction_time)`);
+    },
+  },
+  {
+    version: 7,
+    description: "Session extraction tracking + epistemic layer for fact stratification",
+    up: (db: DatabaseSync) => {
+      // Track which sessions have been processed by the extraction pipeline
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS session_extractions (
+          session_path TEXT PRIMARY KEY,
+          last_extracted_at INTEGER NOT NULL,
+          last_extracted_hash TEXT NOT NULL,
+          fact_count INTEGER DEFAULT 0
+        )
+      `);
+
+      // Epistemic layer: classifies extracted facts into Hindsight-inspired
+      // categories (world_fact, experience, mental_model, directive).
+      // NULL = legacy/unclassified chunk (not extracted, just indexed).
+      ensureColumn(db, "chunks", "epistemic_layer", "TEXT");
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_epistemic ON chunks(epistemic_layer)`);
+    },
+  },
+  {
+    version: 8,
+    description: "Persistent emotional anchors table",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS emotional_anchors (
+          id TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          description TEXT DEFAULT '',
+          dopamine REAL NOT NULL,
+          cortisol REAL NOT NULL,
+          oxytocin REAL NOT NULL,
+          created_at INTEGER NOT NULL,
+          recall_count INTEGER DEFAULT 0,
+          last_recalled_at INTEGER,
+          trigger_event TEXT,
+          associated_crystal_ids TEXT
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_emotional_anchors_created ON emotional_anchors(created_at)`,
+      );
+    },
+  },
+  {
+    version: 9,
+    description:
+      "PLAN-9 Memory Supremacy: Knowledge Graph (GAP-1/2), Reconsolidation (GAP-5), " +
+      "Spacing Effect (GAP-7), Prospective Memory (GAP-9), Zeigarnik open loops (GAP-8), " +
+      "Synaptic Tagging (GAP-10)",
+    up: (db: DatabaseSync) => {
+      // ── GAP-1: Knowledge Graph — entities table ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS entities (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          entity_type TEXT NOT NULL,
+          properties TEXT DEFAULT '{}',
+          first_seen_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          mention_count INTEGER DEFAULT 1,
+          importance REAL DEFAULT 0.5,
+          UNIQUE(name, entity_type)
+        )
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type)`);
+
+      // ── GAP-1/2: Knowledge Graph — relationships table with temporal validity ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS relationships (
+          id TEXT PRIMARY KEY,
+          source_entity_id TEXT NOT NULL REFERENCES entities(id),
+          target_entity_id TEXT NOT NULL REFERENCES entities(id),
+          relation_type TEXT NOT NULL,
+          weight REAL DEFAULT 1.0,
+          valid_from INTEGER,
+          valid_until INTEGER,
+          evidence_chunk_ids TEXT DEFAULT '[]',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_rel_source ON relationships(source_entity_id)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_entity_id)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_rel_type ON relationships(relation_type)`);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_rel_temporal ON relationships(valid_from, valid_until)`,
+      );
+
+      // ── GAP-5: Memory Reconsolidation — labile state tracking ──
+      ensureColumn(db, "chunks", "labile_until", "INTEGER");
+      ensureColumn(db, "chunks", "reconsolidation_count", "INTEGER DEFAULT 0");
+
+      // ── GAP-7: Spacing Effect — access interval tracking ──
+      ensureColumn(db, "chunks", "access_timestamps", "TEXT DEFAULT '[]'");
+      ensureColumn(db, "chunks", "spacing_score", "REAL DEFAULT 0");
+
+      // ── GAP-8: Zeigarnik Effect — open loop detection ──
+      ensureColumn(db, "chunks", "open_loop", "INTEGER DEFAULT 0");
+      ensureColumn(db, "chunks", "open_loop_context", "TEXT");
+
+      // ── GAP-10: Synaptic Tagging & Capture ──
+      ensureColumn(db, "chunks", "captured_by", "TEXT");
+
+      // ── GAP-9: Prospective Memory — event-triggered future recall ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS prospective_memories (
+          id TEXT PRIMARY KEY,
+          trigger_condition TEXT NOT NULL,
+          trigger_embedding TEXT,
+          action TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER,
+          triggered_at INTEGER,
+          source_session TEXT,
+          priority REAL DEFAULT 0.5
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_prospective_active ON prospective_memories(triggered_at)`,
+      );
+
+      // ── GAP-11: Active Inference — epistemic directives ──
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS epistemic_directives (
+          id TEXT PRIMARY KEY,
+          directive_type TEXT NOT NULL,
+          question TEXT NOT NULL,
+          context TEXT DEFAULT '',
+          priority REAL DEFAULT 0.5,
+          created_at INTEGER NOT NULL,
+          resolved_at INTEGER,
+          resolution TEXT,
+          source_entity_ids TEXT DEFAULT '[]',
+          attempts INTEGER DEFAULT 0
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_epistemic_active ON epistemic_directives(resolved_at)`,
+      );
+    },
+  },
+  {
+    version: 10,
+    description: "PLAN-13 Phase B: per-skill capability grants table, keyed on content hash",
+    up: (db: DatabaseSync) => {
+      // Persists operator decisions on capability requests from ingested
+      // skills. Keyed on content_hash (not skill name) so a swap-out of a
+      // malicious update under the same name does not inherit grants.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS skill_capability_grants (
+          content_hash TEXT NOT NULL,
+          capability TEXT NOT NULL,
+          decision TEXT NOT NULL CHECK(decision IN ('allow', 'deny')),
+          scope_json TEXT DEFAULT '{}',
+          granted_at INTEGER NOT NULL,
+          granted_by TEXT,
+          PRIMARY KEY (content_hash, capability)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_skill_grants_hash ON skill_capability_grants(content_hash)`,
+      );
+    },
+  },
+  {
+    version: 11,
+    description:
+      "Network census history: persist gossipsub-received bootnode snapshots " +
+      "so dashboards can render network growth over time across restarts.",
+    up: (db: DatabaseSync) => {
+      // One row per (publishing-bootnode, generated_at). PRIMARY KEY de-dups
+      // identical snapshots; an UPSERT path in the writer makes re-receipts
+      // a no-op. by_tier/by_address_type are stored as JSON to preserve the
+      // full breakdown without paying for an extra table.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS network_census_history (
+          source_peer_id TEXT NOT NULL,
+          generated_at INTEGER NOT NULL,
+          snapshot_at INTEGER NOT NULL,
+          lifetime_unique_peers INTEGER NOT NULL,
+          active_last_24h INTEGER NOT NULL,
+          active_last_7d INTEGER NOT NULL,
+          by_tier_json TEXT NOT NULL DEFAULT '{}',
+          by_address_type_json TEXT NOT NULL DEFAULT '{}',
+          PRIMARY KEY (source_peer_id, generated_at)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_network_census_snapshot_at ON network_census_history(snapshot_at)`,
+      );
+    },
+  },
+  {
+    version: 12,
+    description:
+      "PLAN-15 procedural-memory curator: per-SKILL.md lifecycle table " +
+      "(origin, state, usage/error counts, last_used_at, pinned). Backfilled " +
+      "from skill_executions joined on chunks.skill_category.",
+    up: (db: DatabaseSync) => {
+      // One row per SKILL.md (keyed on the canonical skill_name slug). A
+      // single SKILL.md may map to N memory chunks (versions, mutations);
+      // lifecycle is tracked at the SKILL.md level because that is what the
+      // curator's heuristic + LLM-judge passes operate on.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS skill_lifecycle (
+          skill_name         TEXT PRIMARY KEY,
+          origin             TEXT NOT NULL DEFAULT 'unknown',
+          state              TEXT NOT NULL DEFAULT 'active',
+          created_at         INTEGER NOT NULL,
+          last_used_at       INTEGER,
+          usage_count        INTEGER NOT NULL DEFAULT 0,
+          success_count      INTEGER NOT NULL DEFAULT 0,
+          error_count        INTEGER NOT NULL DEFAULT 0,
+          consolidated_into  TEXT,
+          pinned             INTEGER NOT NULL DEFAULT 0,
+          updated_at         INTEGER NOT NULL
+        )
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_lifecycle_state ON skill_lifecycle(state)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_lifecycle_origin ON skill_lifecycle(origin)`);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_skill_lifecycle_last_used ON skill_lifecycle(last_used_at)`,
+      );
+
+      // Backfill from skill_executions. A skill_category is treated as the
+      // canonical skill_name slug; rows are aggregated to last_used_at /
+      // counts. origin defaults to 'unknown' on backfill — fresh writes via
+      // the gateway set it correctly.
+      db.exec(`
+        INSERT OR IGNORE INTO skill_lifecycle (
+          skill_name, origin, state, created_at, last_used_at,
+          usage_count, success_count, error_count, pinned, updated_at
+        )
+        SELECT
+          c.skill_category                       AS skill_name,
+          'unknown'                              AS origin,
+          'active'                               AS state,
+          MIN(se.started_at)                     AS created_at,
+          MAX(se.started_at)                     AS last_used_at,
+          COUNT(*)                               AS usage_count,
+          SUM(CASE WHEN se.success = 1 THEN 1 ELSE 0 END) AS success_count,
+          SUM(CASE WHEN se.success = 0 THEN 1 ELSE 0 END) AS error_count,
+          0                                      AS pinned,
+          CAST(strftime('%s','now') AS INTEGER) * 1000 AS updated_at
+        FROM skill_executions se
+        JOIN chunks c ON c.id = se.skill_crystal_id
+        WHERE c.skill_category IS NOT NULL
+          AND c.skill_category != ''
+          AND se.completed_at IS NOT NULL
+        GROUP BY c.skill_category
+      `);
+    },
+  },
+  {
+    version: 13,
+    description:
+      "PLAN-18 SAGE-style graph memory: per-edge gate value + cached topology " +
+      "features, training-pair table for the offline gate optimizer, and a " +
+      "dream_cycles column for graph-reward telemetry.",
+    up: (db: DatabaseSync) => {
+      // gate_value defaults to 1.0 so Phase 2 (uniform-gate) is the
+      // observable baseline; the optimizer overwrites it once Phase 3
+      // training pairs exist. gate_features holds an 8-Float32 BLOB.
+      addColumnIfMissing(db, "relationships", "gate_value", "REAL DEFAULT 1.0");
+      addColumnIfMissing(db, "relationships", "gate_features", "BLOB");
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS graph_gate_training_pairs (
+          id                     TEXT PRIMARY KEY,
+          query                  TEXT NOT NULL,
+          ground_truth_chunk_id  TEXT NOT NULL,
+          collected_at           INTEGER NOT NULL,
+          source                 TEXT NOT NULL DEFAULT 'access_log'
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_graph_gate_training_pairs_collected ` +
+          `ON graph_gate_training_pairs(collected_at)`,
+      );
+
+      addColumnIfMissing(db, "dream_cycles", "graph_reward_delta", "REAL");
+    },
+  },
+  {
+    version: 14,
+    description:
+      "PLAN-20 executable skill interceptors: append-only intervention_records " +
+      "table capturing every pre-action interceptor activation with state " +
+      "snapshot, action diff, Ed25519 signature, and a later-patched outcome " +
+      "signal.",
+    up: (db: DatabaseSync) => {
+      // One row per non-NOOP interceptor activation. Outcome signal is
+      // backfilled 1-3 turns later by the experience-signal-collector;
+      // until then `outcome_tag` is NULL. We never UPDATE other columns
+      // after the initial insert (append-only invariant). Signed JSON in
+      // `record_json` is the canonical, transportable form for marketplace
+      // outcome statistics.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS intervention_records (
+          id                       TEXT PRIMARY KEY,
+          ts                       INTEGER NOT NULL,
+          session_key              TEXT NOT NULL,
+          skill                    TEXT NOT NULL,
+          interceptor_id           TEXT NOT NULL,
+          channel                  TEXT NOT NULL DEFAULT 'internal',
+          tool_name                TEXT NOT NULL,
+          intervention_type        TEXT NOT NULL,
+          action_original_json     TEXT NOT NULL,
+          action_final_json        TEXT,
+          intervention_json        TEXT NOT NULL,
+          state_summary_json       TEXT NOT NULL,
+          activation_latency_ms    REAL NOT NULL DEFAULT 0,
+          intervention_latency_ms  REAL NOT NULL DEFAULT 0,
+          outcome_tag              TEXT,
+          outcome_evidence         TEXT,
+          ed25519_sig              TEXT NOT NULL DEFAULT '',
+          pubkey_id                TEXT NOT NULL DEFAULT 'unsigned-local',
+          record_json              TEXT NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_intervention_records_skill_ts ` +
+          `ON intervention_records(skill, ts)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_intervention_records_interceptor_ts ` +
+          `ON intervention_records(interceptor_id, ts)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_intervention_records_session_ts ` +
+          `ON intervention_records(session_key, ts)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_intervention_records_outcome ` +
+          `ON intervention_records(skill, outcome_tag)`,
+      );
+
+      // Per-skill rollup view used by the marketplace + Active Guards UI.
+      // Drops and recreates idempotently — sqlite has no CREATE OR REPLACE
+      // VIEW so we drop first.
+      db.exec(`DROP VIEW IF EXISTS skill_interceptor_stats`);
+      db.exec(`
+        CREATE VIEW skill_interceptor_stats AS
+        SELECT
+          skill,
+          interceptor_id,
+          COUNT(*)                                                                  AS fire_count,
+          SUM(CASE WHEN outcome_tag = 'downstream-success' THEN 1 ELSE 0 END)       AS success_count,
+          SUM(CASE WHEN outcome_tag = 'downstream-failure' THEN 1 ELSE 0 END)       AS failure_count,
+          SUM(CASE WHEN outcome_tag = 'user-confirmed-block' THEN 1 ELSE 0 END)     AS user_confirmed_count,
+          SUM(CASE WHEN outcome_tag = 'user-overrode-block' THEN 1 ELSE 0 END)      AS user_override_count,
+          AVG(activation_latency_ms + intervention_latency_ms)                       AS avg_latency_ms,
+          MIN(ts)                                                                    AS first_seen_ts,
+          MAX(ts)                                                                    AS last_seen_ts
+        FROM intervention_records
+        GROUP BY skill, interceptor_id
+      `);
+    },
+  },
+  {
+    version: 15,
+    description:
+      "PLAN-20 follow-up: persistent interceptor_strikes table so the " +
+      "3-strikes auto-disable counter survives gateway restarts.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS interceptor_strikes (
+          interceptor_id      TEXT PRIMARY KEY,
+          strikes             INTEGER NOT NULL DEFAULT 0,
+          disabled            INTEGER NOT NULL DEFAULT 0,
+          last_failure_ts     INTEGER,
+          last_failure_reason TEXT
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_interceptor_strikes_disabled ` +
+          `ON interceptor_strikes(disabled)`,
+      );
+    },
+  },
+  {
+    version: 16,
+    description:
+      "PLAN-23 SABM: relationship belief history (non-destructive audit of " +
+      "every reinforce / flag / supersede) + a last_reinforced_at column on " +
+      "relationships. Relationship temporal columns stay valid_from/valid_until " +
+      "(NOT the chunks valid_time_* vocabulary).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS relationship_belief_history (
+          id                 TEXT PRIMARY KEY,
+          relationship_id    TEXT NOT NULL,
+          action             TEXT NOT NULL,
+          prev_weight        REAL,
+          new_weight         REAL,
+          evidence_chunk_ids TEXT DEFAULT '[]',
+          valid_from         INTEGER,
+          valid_until        INTEGER,
+          created_at         INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_rel_belief_history_rel ` +
+          `ON relationship_belief_history(relationship_id)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_rel_belief_history_action ` +
+          `ON relationship_belief_history(action)`,
+      );
+      // Transaction-time / reinforcement bookkeeping on relationships.
+      // Idempotent: addColumnIfMissing no-ops on an already-upgraded DB.
+      addColumnIfMissing(db, "relationships", "last_reinforced_at", "INTEGER");
+    },
+  },
+  {
+    version: 17,
+    description:
+      "PLAN-24 HORMA Phase 0: provenance pointers. evidence_refs is a JSON array " +
+      "of {kind:'session',path,line} | {kind:'journal',runId,seq} anchoring an " +
+      "extracted fact / dream insight back to its raw source so memory_expand can " +
+      "recover verbatim ground truth and reconsolidation can check faithfulness.",
+    up: (db: DatabaseSync) => {
+      // Null-tolerant: legacy chunks have no provenance and stay NULL.
+      addColumnIfMissing(db, "chunks", "evidence_refs", "TEXT");
+    },
+  },
+  {
+    version: 18,
+    description:
+      "PLAN-24 HORMA Phase 3: construction_rules — the evolving memory-architect " +
+      "rule library. Natural-language rules promoted from contrastive construction " +
+      "failures and injected into the extraction prompt. Birth-hormone columns " +
+      "support Phase 4 state-conditional activation.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS construction_rules (
+          id             TEXT PRIMARY KEY,
+          rule_text      TEXT NOT NULL,
+          category       TEXT,
+          status         TEXT NOT NULL DEFAULT 'active',
+          source         TEXT NOT NULL DEFAULT 'textgrad',
+          version        INTEGER NOT NULL DEFAULT 1,
+          ci95_low       REAL,
+          birth_dopamine REAL,
+          birth_cortisol REAL,
+          birth_oxytocin REAL,
+          created_at     INTEGER NOT NULL,
+          updated_at     INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_construction_rules_status ` +
+          `ON construction_rules(status)`,
+      );
+    },
+  },
+  {
+    version: 19,
+    description:
+      "PLAN-24 HORMA Phase 5: parent_entity_id on entities so members can point " +
+      "at the summary entity that abstracts their community (coarse-to-fine graph " +
+      "navigation). entity_type 'summary' and relation_type 'summarizes' are TEXT " +
+      "values — no schema change needed for those.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "entities", "parent_entity_id", "TEXT");
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_parent ON entities(parent_entity_id)`);
+    },
+  },
+  {
+    version: 20,
+    description:
+      "PLAN-26 Aubaine group-buy coordination layer: offer/intent directory, " +
+      "demand-matched syndicates, members, and non-custodial threshold settlements. " +
+      "Local index over signed offers/intents gossiped on aubaine/{offers,intents}/v1; " +
+      "settlement is many-buyers-to-one-supplier via EIP-3009, never custodied here.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS group_buy_offers (
+          id              TEXT PRIMARY KEY,
+          sku_canonical   TEXT NOT NULL,
+          sku_description TEXT NOT NULL,
+          unit_price_usdc REAL NOT NULL,
+          moq             INTEGER NOT NULL,
+          lead_time_days  INTEGER NOT NULL,
+          supplier_peer_id  TEXT,
+          supplier_pubkey   TEXT NOT NULL,
+          supplier_a2a_url  TEXT NOT NULL,
+          supplier_wallet   TEXT,
+          deposit_bps     INTEGER NOT NULL DEFAULT 4000,
+          expires_at      INTEGER NOT NULL,
+          created_at      INTEGER NOT NULL,
+          updated_at      INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_gbo_sku ON group_buy_offers(sku_canonical, expires_at)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS group_buy_intents (
+          id                 TEXT PRIMARY KEY,
+          sku_canonical      TEXT NOT NULL,
+          sku_description    TEXT NOT NULL,
+          max_price_usdc     REAL NOT NULL,
+          qty                INTEGER NOT NULL,
+          lead_time_max_days INTEGER NOT NULL,
+          buyer_peer_id      TEXT,
+          buyer_pubkey       TEXT NOT NULL,
+          is_local           INTEGER NOT NULL DEFAULT 0,
+          mandate_json       TEXT DEFAULT '{}',
+          expires_at         INTEGER NOT NULL,
+          created_at         INTEGER NOT NULL,
+          updated_at         INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_gbi_sku ON group_buy_intents(sku_canonical, expires_at)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS group_buy_syndicates (
+          id               TEXT PRIMARY KEY,
+          offer_id         TEXT NOT NULL,
+          sku_canonical    TEXT NOT NULL,
+          unit_price_usdc  REAL NOT NULL,
+          moq              INTEGER NOT NULL,
+          committed_qty    INTEGER NOT NULL DEFAULT 0,
+          status           TEXT NOT NULL DEFAULT 'forming',
+          supplier_pubkey  TEXT NOT NULL,
+          supplier_a2a_url TEXT NOT NULL,
+          coordinator_peer_id TEXT,
+          strike_deadline  INTEGER NOT NULL,
+          created_at       INTEGER NOT NULL,
+          updated_at       INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_gbsy_sku ON group_buy_syndicates(sku_canonical, status)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS group_buy_members (
+          id            TEXT PRIMARY KEY,
+          syndicate_id  TEXT NOT NULL,
+          intent_id     TEXT NOT NULL,
+          buyer_pubkey  TEXT NOT NULL,
+          buyer_peer_id TEXT,
+          qty           INTEGER NOT NULL,
+          amount_usdc   REAL NOT NULL,
+          commit_status TEXT NOT NULL DEFAULT 'invited',
+          auth_token    TEXT,
+          updated_at    INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_gbm_syndicate ` +
+          `ON group_buy_members(syndicate_id, commit_status)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS group_buy_settlements (
+          id               TEXT PRIMARY KEY,
+          syndicate_id     TEXT NOT NULL,
+          member_id        TEXT NOT NULL,
+          buyer_pubkey     TEXT NOT NULL,
+          supplier_address TEXT NOT NULL,
+          amount_usdc      REAL NOT NULL,
+          leg              TEXT NOT NULL DEFAULT 'deposit',
+          auth_token       TEXT,
+          tx_hash          TEXT,
+          status           TEXT NOT NULL DEFAULT 'pending',
+          error            TEXT,
+          created_at       INTEGER NOT NULL,
+          settled_at       INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_gbs_syndicate ` +
+          `ON group_buy_settlements(syndicate_id, status)`,
+      );
+    },
+  },
+  {
+    version: 21,
+    description: "PLAN-28 Part B: retrieval_trace observability table",
+    up: (db: DatabaseSync) => {
+      // Sampled per-retrieval layer-contribution trace. One row per sampled
+      // search/recall; `extra` carries the full typed counts as JSON so the
+      // schema stays stable as layers are added. Lets the LongMemEval harness
+      // (and ad-hoc analysis) answer "is each retrieval layer pulling its
+      // weight" without a live DB probe. Written best-effort behind a sampling
+      // rate; never on the hot path's critical section.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS retrieval_trace (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind         TEXT NOT NULL,
+          query_len    INTEGER NOT NULL DEFAULT 0,
+          vector_hits  INTEGER NOT NULL DEFAULT 0,
+          keyword_hits INTEGER NOT NULL DEFAULT 0,
+          graph_hits   INTEGER NOT NULL DEFAULT 0,
+          fused        INTEGER NOT NULL DEFAULT 0,
+          extra        TEXT,
+          created_at   INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_retrieval_trace_kind_created ` +
+          `ON retrieval_trace(kind, created_at)`,
+      );
+    },
+  },
+  {
+    version: 22,
+    description:
+      "PLAN-29 Forage bounty economy: bounty directory (posts/claims/settlements) " +
+      "and heartbeat streams. Local index over funded BountyEnvelope v2 objects " +
+      "gossiped on bitterbot/bounties/v1; payouts ride the existing " +
+      "revenue_payment_queue, settlement is poster-wallet -> hunter-wallet " +
+      "(never custodied here).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bounty_posts (
+          bounty_id         TEXT PRIMARY KEY,
+          poster_pubkey     TEXT NOT NULL,
+          poster_peer_id    TEXT,
+          poster_wallet     TEXT NOT NULL,
+          kind              TEXT NOT NULL DEFAULT 'oneshot',
+          category          TEXT NOT NULL,
+          spec_public       TEXT NOT NULL,
+          oracle_commitment TEXT NOT NULL,
+          oracle_type       TEXT NOT NULL DEFAULT 'mechanical',
+          reward_usdc       REAL NOT NULL,
+          funding_proof     TEXT,
+          claim_stake_usdc  REAL NOT NULL DEFAULT 0,
+          max_claims        INTEGER NOT NULL DEFAULT 1,
+          is_local          INTEGER NOT NULL DEFAULT 0,
+          status            TEXT NOT NULL DEFAULT 'open',
+          deadline          INTEGER,
+          expires_at        INTEGER NOT NULL,
+          created_at        INTEGER NOT NULL,
+          updated_at        INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_posts_scan ` +
+          `ON bounty_posts(category, status, deadline)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_posts_expiry ON bounty_posts(status, expires_at)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bounty_claims (
+          id             TEXT PRIMARY KEY,
+          bounty_id      TEXT NOT NULL,
+          hunter_pubkey  TEXT NOT NULL,
+          hunter_peer_id TEXT,
+          hunter_wallet  TEXT NOT NULL,
+          stake_usdc     REAL NOT NULL DEFAULT 0,
+          stake_tx_hash  TEXT,
+          commit_hash    TEXT,
+          status         TEXT NOT NULL DEFAULT 'claimed',
+          deliverable_ref TEXT,
+          claimed_at     INTEGER NOT NULL,
+          delivered_at   INTEGER,
+          updated_at     INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_claims_bounty ` +
+          `ON bounty_claims(bounty_id, status)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_claims_hunter ` +
+          `ON bounty_claims(hunter_pubkey, status)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bounty_settlements (
+          id              TEXT PRIMARY KEY,
+          bounty_id       TEXT NOT NULL,
+          claim_id        TEXT NOT NULL,
+          poster_pubkey   TEXT NOT NULL,
+          hunter_pubkey   TEXT NOT NULL,
+          hunter_wallet   TEXT NOT NULL,
+          amount_usdc     REAL NOT NULL,
+          oracle_verdict  TEXT NOT NULL,
+          oracle_evidence TEXT,
+          judge_capped    INTEGER NOT NULL DEFAULT 0,
+          payment_queue_id INTEGER,
+          tx_hash         TEXT,
+          status          TEXT NOT NULL DEFAULT 'pending',
+          error           TEXT,
+          created_at      INTEGER NOT NULL,
+          settled_at      INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_settlements_bounty ` +
+          `ON bounty_settlements(bounty_id, status)`,
+      );
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_bounty_settlements_claim ` +
+          `ON bounty_settlements(claim_id)`,
+      );
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bounty_streams (
+          id                TEXT PRIMARY KEY,
+          bounty_id         TEXT NOT NULL,
+          poster_pubkey     TEXT NOT NULL,
+          hunter_pubkey     TEXT NOT NULL,
+          cadence_seconds   INTEGER NOT NULL,
+          per_check_usdc    REAL NOT NULL,
+          alert_bonus_usdc  REAL NOT NULL DEFAULT 0,
+          observation_head  TEXT,
+          checks_total      INTEGER NOT NULL DEFAULT 0,
+          checks_paid       INTEGER NOT NULL DEFAULT 0,
+          audits_total      INTEGER NOT NULL DEFAULT 0,
+          audits_failed     INTEGER NOT NULL DEFAULT 0,
+          status            TEXT NOT NULL DEFAULT 'active',
+          last_check_at     INTEGER,
+          created_at        INTEGER NOT NULL,
+          updated_at        INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_streams_active ` +
+          `ON bounty_streams(status, last_check_at)`,
+      );
+    },
+  },
+  {
+    version: 23,
+    description:
+      "PLAN-29 Phase 1.3: poster-side sealed oracle spec. The commitment " +
+      "hash travels in the envelope; the spec itself (with salt) stays " +
+      "local to the posting node until verification time.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "bounty_posts", "oracle_spec_private", "TEXT");
+    },
+  },
+  {
+    version: 24,
+    description:
+      "PLAN-29 Phase 5 (Night Shift): hunter-side claim mirror. Claims live " +
+      "poster-side; forage_hunts is this node's own record of work it has " +
+      "taken on across the mesh — what it claimed, delivered, and earned.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS forage_hunts (
+          claim_id       TEXT PRIMARY KEY,
+          bounty_id      TEXT NOT NULL,
+          poster_pubkey  TEXT NOT NULL,
+          poster_a2a_url TEXT NOT NULL,
+          category       TEXT NOT NULL,
+          kind           TEXT NOT NULL,
+          reward_usdc    REAL NOT NULL,
+          per_check_usdc REAL,
+          monitor_url    TEXT,
+          cadence_seconds INTEGER,
+          status         TEXT NOT NULL DEFAULT 'claimed',
+          checks_sent    INTEGER NOT NULL DEFAULT 0,
+          earned_usdc    REAL NOT NULL DEFAULT 0,
+          last_action_at INTEGER,
+          claimed_at     INTEGER NOT NULL,
+          updated_at     INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_forage_hunts_active ON forage_hunts(status, last_action_at)`,
+      );
+    },
+  },
+  {
+    version: 25,
+    description:
+      "PLAN-29 Phase 4 (legal-gated): bounty pool funder authorizations. " +
+      "Each row is one funder's signed EIP-3009 auth toward a pool bounty; " +
+      "capture is confirm-then-capture (quorum + oracle pass) and " +
+      "structurally non-custodial (funds move funder -> hunter, never here).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bounty_pool_auths (
+          id            TEXT PRIMARY KEY,
+          bounty_id     TEXT NOT NULL,
+          funder_pubkey TEXT NOT NULL,
+          funder_wallet TEXT NOT NULL,
+          amount_usdc   REAL NOT NULL,
+          auth_json     TEXT NOT NULL,
+          status        TEXT NOT NULL DEFAULT 'pledged',
+          tx_hash       TEXT,
+          error         TEXT,
+          created_at    INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_pool_auths ON bounty_pool_auths(bounty_id, status)`,
+      );
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_bounty_pool_auths_funder ` +
+          `ON bounty_pool_auths(bounty_id, funder_wallet)`,
+      );
+    },
+  },
+  {
+    version: 26,
+    description:
+      "PLAN-30 G0.1: per-check observation log + per-hunter audit state. " +
+      "forage/checkin previously folded every check into one rolling head, " +
+      "leaving nothing to audit against; bounty_stream_checks preserves each " +
+      "check's digest so an auditor can re-observe and compare, and " +
+      "forage_hunter_audit carries the BOINC-style consecutive-valid counter " +
+      "that drives the adaptive audit rate and gates payment release.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bounty_stream_checks (
+          stream_id      TEXT NOT NULL,
+          seq            INTEGER NOT NULL,
+          content_digest TEXT NOT NULL,
+          digest_scheme  TEXT NOT NULL DEFAULT 'raw-v1',
+          sealed_digest  TEXT,
+          simhash        TEXT,
+          alert          INTEGER NOT NULL DEFAULT 0,
+          observed_at    INTEGER NOT NULL,
+          prev_head      TEXT,
+          head           TEXT NOT NULL,
+          audit_status   TEXT NOT NULL DEFAULT 'unaudited',
+          audited_at     INTEGER,
+          auditor_note   TEXT,
+          PRIMARY KEY (stream_id, seq)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_bounty_stream_checks_audit ` +
+          `ON bounty_stream_checks(audit_status, observed_at)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS forage_hunter_audit (
+          hunter_pubkey        TEXT PRIMARY KEY,
+          cv                   INTEGER NOT NULL DEFAULT 0,
+          audits_total         INTEGER NOT NULL DEFAULT 0,
+          audits_passed        INTEGER NOT NULL DEFAULT 0,
+          audits_failed        INTEGER NOT NULL DEFAULT 0,
+          audits_unverifiable  INTEGER NOT NULL DEFAULT 0,
+          frauds               INTEGER NOT NULL DEFAULT 0,
+          last_audit_at        INTEGER,
+          updated_at           INTEGER NOT NULL
+        )
+      `);
+      // G0.3 lands the poster-issued per-claim nonce on this column; added
+      // here so the claim handler can start issuing nonces without a second
+      // migration.
+      addColumnIfMissing(db, "bounty_claims", "claim_nonce", "TEXT");
+      // Hunter-side change detection (alert path): remember the previous
+      // digest so Night Shift can set observation.alert on content change.
+      addColumnIfMissing(db, "forage_hunts", "last_content_digest", "TEXT");
+    },
+  },
+  {
+    version: 27,
+    description:
+      "PLAN-30 G0.3: hunter-side storage of the poster-issued claim nonce. " +
+      "The nonce authenticates check-ins (only its holder can check in on " +
+      "the stream) via sealedDigest = sha256(nonce || contentHash).",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "forage_hunts", "claim_nonce", "TEXT");
+    },
+  },
+  {
+    version: 28,
+    description:
+      "PLAN-30 G0.5: precise stream budget accounting (spent_usdc, needed " +
+      "once alert bonuses ride the same budget as per-check pay and once " +
+      "multiple claims share one bounty budget) + hunter-side settlement " +
+      "reconciliation columns for the verified-earnings morning report.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "bounty_streams", "spent_usdc", "REAL NOT NULL DEFAULT 0");
+      // Backfill: everything paid so far was per-check pay only.
+      db.exec(`UPDATE bounty_streams SET spent_usdc = checks_paid * per_check_usdc`);
+      addColumnIfMissing(db, "forage_hunts", "settlement_status", "TEXT");
+      addColumnIfMissing(db, "forage_hunts", "settlement_tx", "TEXT");
+    },
+  },
+  {
+    version: 29,
+    description:
+      "PLAN-31 C1: circles (collective-agency substrate). A circle is a " +
+      "closed, mutually-paired member set with a shared encrypted channel. " +
+      "Deliberately domain-agnostic: `kind` distinguishes expense/care/team/... " +
+      "so the same tables carry every coordination domain (sections 11-12). " +
+      "Members pin a payout wallet at pair time (settlements refuse any other " +
+      "payTo) and hold an extensible scope set (default-deny). `key_epoch` " +
+      "bumps on every membership change so the channel key rotates.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circles (
+          circle_id     TEXT PRIMARY KEY,
+          name          TEXT NOT NULL,
+          kind          TEXT NOT NULL DEFAULT 'expense',
+          creator_pubkey TEXT NOT NULL,
+          key_epoch     INTEGER NOT NULL DEFAULT 0,
+          status        TEXT NOT NULL DEFAULT 'active',
+          created_at    INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_members (
+          circle_id     TEXT NOT NULL,
+          member_pubkey TEXT NOT NULL,
+          display_name  TEXT,
+          pinned_wallet TEXT,
+          a2a_url       TEXT,
+          role          TEXT NOT NULL DEFAULT 'member',
+          scopes_json   TEXT NOT NULL DEFAULT '[]',
+          status        TEXT NOT NULL DEFAULT 'active',
+          joined_at     INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL,
+          PRIMARY KEY (circle_id, member_pubkey)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_members_member ` +
+          `ON circle_members(member_pubkey, status)`,
+      );
+    },
+  },
+  {
+    version: 30,
+    description:
+      "PLAN-31 C1/C2: circle connection + social tables. Invites store only " +
+      "sha256(secret) — the secret lives in the invite code, never at rest. " +
+      "circle_events is the typed, domain-agnostic shared-state ledger (the " +
+      "tab is event_type 'expense.*'; a care shift or co-op order is another " +
+      "namespace, section 11): per-author signed hash chains, append-only, " +
+      "with heads_json for fork detection. NO settlement columns — money " +
+      "movement is Phase 2, dark. circle_messages buffers hostile-principal " +
+      "agent conversation for digest-batching (humans see summaries). " +
+      "circle_disclosure_grants is the default-deny per-category consent " +
+      "model (presence + free/busy are the only built-in allowances, in " +
+      "code). circle_peer_presence is last-seen liveness for the People UI.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_invites (
+          invite_id        TEXT PRIMARY KEY,
+          circle_id        TEXT NOT NULL,
+          inviter_pubkey   TEXT NOT NULL,
+          token_hash       TEXT NOT NULL,
+          scopes_json      TEXT NOT NULL DEFAULT '[]',
+          max_uses         INTEGER NOT NULL DEFAULT 1,
+          uses             INTEGER NOT NULL DEFAULT 0,
+          expires_at       INTEGER NOT NULL,
+          status           TEXT NOT NULL DEFAULT 'open',
+          created_at       INTEGER NOT NULL,
+          last_redeemed_at INTEGER,
+          last_redeemed_by TEXT
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_invites_circle ` +
+          `ON circle_invites(circle_id, status)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_events (
+          event_id      TEXT PRIMARY KEY,
+          circle_id     TEXT NOT NULL,
+          author_pubkey TEXT NOT NULL,
+          seq           INTEGER NOT NULL,
+          prev_hash     TEXT,
+          event_type    TEXT NOT NULL,
+          body_json     TEXT NOT NULL,
+          heads_json    TEXT NOT NULL DEFAULT '{}',
+          envelope_json TEXT NOT NULL,
+          event_hash    TEXT NOT NULL,
+          claimed_at    INTEGER NOT NULL,
+          received_at   INTEGER NOT NULL,
+          UNIQUE (circle_id, author_pubkey, seq)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_events_circle ` +
+          `ON circle_events(circle_id, received_at)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_messages (
+          message_id    TEXT PRIMARY KEY,
+          circle_id     TEXT NOT NULL,
+          author_pubkey TEXT NOT NULL,
+          direction     TEXT NOT NULL,
+          kind          TEXT NOT NULL DEFAULT 'message',
+          thread_id     TEXT,
+          content       TEXT NOT NULL,
+          scan_severity TEXT,
+          envelope_id   TEXT,
+          created_at    INTEGER NOT NULL,
+          digested_at   INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_messages_circle ` +
+          `ON circle_messages(circle_id, created_at)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_messages_undigested ` +
+          `ON circle_messages(circle_id, digested_at)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_disclosure_grants (
+          category   TEXT NOT NULL,
+          circle_id  TEXT NOT NULL DEFAULT '*',
+          allowed    INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (category, circle_id)
+        )
+      `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_peer_presence (
+          peer_pubkey  TEXT PRIMARY KEY,
+          a2a_url      TEXT,
+          last_seen_at INTEGER NOT NULL,
+          last_status  TEXT
+        )
+      `);
+    },
+  },
+  {
+    version: 31,
+    description:
+      "PLAN-31 C1 transport: the store-and-forward mailbox (§3.2) + sealed-" +
+      "box endpoints. Members publish an X25519 box pubkey + mailbox URL in " +
+      "signed join/presence envelopes; mailbox blobs are sealed per-recipient " +
+      "(ephemeral ECDH + HKDF + AES-256-GCM) so a mailbox host stores what it " +
+      "cannot read ('no server that can read your messages'). mailbox_blobs " +
+      "is the HOST side (nodes with circles.mailbox.serve=true): sender-" +
+      "signature required, per-sender rate limits, per-recipient quotas, " +
+      "~30d TTL.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_members", "box_pubkey", "TEXT");
+      addColumnIfMissing(db, "circle_members", "mailbox_url", "TEXT");
+      addColumnIfMissing(db, "circle_peer_presence", "box_pubkey", "TEXT");
+      addColumnIfMissing(db, "circle_peer_presence", "mailbox_url", "TEXT");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS mailbox_blobs (
+          blob_id          TEXT PRIMARY KEY,
+          recipient_pubkey TEXT NOT NULL,
+          sender_pubkey    TEXT NOT NULL,
+          blob_json        TEXT NOT NULL,
+          created_at       INTEGER NOT NULL,
+          expires_at       INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_mailbox_blobs_recipient ` +
+          `ON mailbox_blobs(recipient_pubkey, created_at)`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_mailbox_blobs_expiry ON mailbox_blobs(expires_at)`);
+    },
+  },
+  {
+    version: 32,
+    description:
+      "PLAN-31 C3: the weekly briefing (§1 verb 6) — one synchronized digest " +
+      "of the connections' shared life, compiled LOCALLY per node from " +
+      "consented data (presence, reciprocity, tab fold, pending asks). " +
+      "Replaces the feed; never fanned out (each node compiles its own view).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_briefings (
+          briefing_id TEXT PRIMARY KEY,
+          compiled_at INTEGER NOT NULL,
+          window_ms   INTEGER NOT NULL,
+          content     TEXT NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_briefings_time ON circle_briefings(compiled_at)`,
+      );
+    },
+  },
+  {
+    version: 33,
+    description:
+      "PLAN-33 Phase 1: canonical_facts — the semantic ledger. A small, " +
+      "hard-capped tier of exact key-value facts (repo names, endpoints, " +
+      "identities, standing choices) injected unconditionally into every " +
+      "system prompt, addressed by key instead of embedding similarity. " +
+      "Bitemporal: contradictions close the old row's validity window " +
+      "(valid_until + superseded_by) instead of deleting, so point-in-time " +
+      "queries and provenance survive. The partial unique index enforces " +
+      "one current belief per key.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS canonical_facts (
+          id                 TEXT PRIMARY KEY,
+          key                TEXT NOT NULL,
+          value              TEXT NOT NULL,
+          statement          TEXT NOT NULL,
+          category           TEXT NOT NULL,
+          confidence         REAL NOT NULL,
+          mention_count      INTEGER NOT NULL DEFAULT 1,
+          first_seen_at      INTEGER NOT NULL,
+          last_confirmed_at  INTEGER NOT NULL,
+          valid_from         INTEGER NOT NULL,
+          valid_until        INTEGER,
+          superseded_by      TEXT,
+          source             TEXT NOT NULL,
+          evidence_chunk_ids TEXT NOT NULL DEFAULT '[]',
+          status             TEXT NOT NULL DEFAULT 'active'
+        )
+      `);
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_current ` +
+          `ON canonical_facts(key) WHERE valid_until IS NULL`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_canonical_status ON canonical_facts(status, category)`,
+      );
+    },
+  },
+  {
+    version: 34,
+    description:
+      "PLAN-34 Phase 0: closed-loop cognition schema slots + containment " +
+      "sweeps. (1) chunks.session_trust — session trust persisted at write " +
+      "time so first-party determinability never depends on re-resolving " +
+      "prunable sessions.json history (Phase 4 promotion gate reads it). " +
+      "(2) canonical_conflicts — pin() records tier-rejections and rapid " +
+      "same-key supersedes here; the Phase 1 extraction path sweeps them " +
+      "into contradiction directives ('Which is current for <key>?'). " +
+      "(3) epistemic_directives.status — 'open' | 'answered' | 'expired'; " +
+      "Phase 1's two-tier resolution and the softened expireOld flip this " +
+      "instead of DELETEing. (4) One-time reset of attempts on unresolved " +
+      "directives: the old read path incremented per run attempt and per " +
+      "compaction (the live attempts=491 artifact), so historical counts " +
+      "are meaningless under increment-only-on-injection. The reset lands " +
+      "in the SAME commit as the read-side fix (Phase 0 adversarial pass " +
+      "caught the original sequencing, where the reset would have been " +
+      "consumed by the old incrementer before the semantics existed). " +
+      "(5) canonical_facts.corroboration_count — tier-0 (promotion/web) " +
+      "same-value confirmations count here, never into confidence/recency. " +
+      "(6) research_findings — the persisted queue behind deterministic " +
+      "research surfacing (Phase 2b).",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "chunks", "session_trust", "TEXT");
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS canonical_conflicts (
+          id              TEXT PRIMARY KEY,
+          key             TEXT NOT NULL,
+          kind            TEXT NOT NULL,
+          current_value   TEXT NOT NULL,
+          proposed_value  TEXT NOT NULL,
+          current_source  TEXT NOT NULL,
+          proposed_source TEXT NOT NULL,
+          created_at      INTEGER NOT NULL,
+          consumed_at     INTEGER,
+          directive_id    TEXT
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_canonical_conflicts_open ` +
+          `ON canonical_conflicts(consumed_at, created_at)`,
+      );
+
+      addColumnIfMissing(db, "epistemic_directives", "status", "TEXT NOT NULL DEFAULT 'open'");
+
+      db.exec(`UPDATE epistemic_directives SET attempts = 0 WHERE resolved_at IS NULL`);
+
+      // PLAN-34 Phase 2b: (5) tier-0 corroboration counter — web/promotion
+      // agreement is tracked separately and can never move confidence — and
+      // (6) research_findings, the small persisted queue behind the
+      // deterministic "while you were away, I looked into X" surfacing.
+      addColumnIfMissing(
+        db,
+        "canonical_facts",
+        "corroboration_count",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS research_findings (
+          id          TEXT PRIMARY KEY,
+          target_id   TEXT,
+          finding     TEXT NOT NULL,
+          source_url  TEXT,
+          relevance   REAL,
+          created_at  INTEGER NOT NULL,
+          surfaced_at INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_research_findings_unsurfaced ` +
+          `ON research_findings(surfaced_at, created_at)`,
+      );
+
+      // PLAN-34 Phase 2c: (7) research_egress_log — one audit row per
+      // network seam (search-query, fetch-host, transport-post) with
+      // destination and payload hash/length. The dashboard renders it; the
+      // log must never understate the real network footprint.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS research_egress_log (
+          id           TEXT PRIMARY KEY,
+          seam         TEXT NOT NULL,
+          destination  TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          payload_len  INTEGER NOT NULL,
+          created_at   INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_research_egress_time ON research_egress_log(created_at)`,
+      );
+    },
+  },
+  {
+    version: 35,
+    description:
+      "Event-loop stall audit: index the heavy read paths that were " +
+      "full-scanning/full-sorting large tables on the gateway loop. " +
+      "(1) chunks(curiosity_reward) + chunks(updated_at), both PARTIAL on " +
+      "curiosity_reward IS NOT NULL (a small subset, so negligible write " +
+      "overhead) — dream.curiosityReward's AVG/MIN/MAX aggregate and its " +
+      "ORDER BY updated_at DESC LIMIT 50 both scanned/sorted the whole chunks " +
+      "table. (2) intervention_records(ts) — guards.status' ORDER BY ts DESC " +
+      "LIMIT 25 had no usable index (existing ones are skill/interceptor " +
+      "composites), so it full-sorted the unpruned table for 25 rows.",
+    up: (db: DatabaseSync) => {
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunks_curiosity_reward ` +
+          `ON chunks(curiosity_reward) WHERE curiosity_reward IS NOT NULL`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunks_curiosity_updated ` +
+          `ON chunks(updated_at) WHERE curiosity_reward IS NOT NULL`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_intervention_records_ts ON intervention_records(ts)`);
+    },
+  },
+  {
+    version: 36,
+    description:
+      "Census pre-aggregation: network_census_hourly. The skills.networkHistory " +
+      "RPC was GROUP-BYing the ~90k-row network_census_history table into hourly " +
+      "buckets on every read (~16s synchronous on the gateway loop -> UI " +
+      "timeouts). This maintains a per-hour rollup (max across sources per hour, " +
+      "the same 'stable lower bound' aggregate the read already used) so the " +
+      "dashboard's default (no sourcePeerId) read is a bounded <=720-row lookup " +
+      "instead of a full scan. Backfilled once from existing history; the raw " +
+      "table stays for the per-source drilldown + its 30-day prune.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS network_census_hourly (
+          hour_bucket           INTEGER PRIMARY KEY,
+          generated_at          INTEGER NOT NULL,
+          snapshot_at           INTEGER NOT NULL,
+          lifetime_unique_peers INTEGER NOT NULL,
+          active_last_24h       INTEGER NOT NULL,
+          active_last_7d        INTEGER NOT NULL,
+          by_tier_json          TEXT,
+          by_address_type_json  TEXT
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_network_census_hourly_snapshot ` +
+          `ON network_census_hourly(snapshot_at)`,
+      );
+      // One-time backfill from raw history (max across sources per hour bucket).
+      db.exec(`
+        INSERT INTO network_census_hourly
+          (hour_bucket, generated_at, snapshot_at, lifetime_unique_peers,
+           active_last_24h, active_last_7d, by_tier_json, by_address_type_json)
+        SELECT generated_at / 3600 AS hour_bucket,
+               max(generated_at), max(snapshot_at), max(lifetime_unique_peers),
+               max(active_last_24h), max(active_last_7d),
+               by_tier_json, by_address_type_json
+          FROM network_census_history
+         GROUP BY generated_at / 3600
+        ON CONFLICT(hour_bucket) DO NOTHING
+      `);
+    },
+  },
+  {
+    version: 37,
+    description:
+      "PLAN-36 §5.3 (Phase 0): circle_pending_outbound — server-enforced two-" +
+      "phase gate for agent circle writes. The `circles` agent tool's confirm " +
+      "was prompt-convention only (confirm=true executed on the first call), so " +
+      "a prompt-injected agent could send/ask/log_expense with no preview. Now " +
+      "the preview mints a single-use, params-bound token persisted here; the " +
+      "confirm leg must present a matching, unused, unexpired token or it is " +
+      "refused. Bound to the exact action+params so an innocuous preview cannot " +
+      "authorize a different send.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_pending_outbound (
+          token       TEXT PRIMARY KEY,
+          action      TEXT NOT NULL,
+          params_hash TEXT NOT NULL,
+          created_at  INTEGER NOT NULL,
+          expires_at  INTEGER NOT NULL,
+          used_at     INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_pending_outbound_expires ` +
+          `ON circle_pending_outbound(expires_at)`,
+      );
+    },
+  },
+  {
+    version: 38,
+    description:
+      "PLAN-36 Phase 0 (B5): circle_messages.delivery_status. The outbound row " +
+      "was inserted BEFORE fan-out with no delivery column, and the UI discarded " +
+      "the SendReport — so an all-failed send rendered identically to a delivered " +
+      "one. This per-message aggregate ('pending' | 'delivered' | 'partial' | " +
+      "'failed'; NULL on inbound and legacy rows) lets the UI show the truth.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_messages", "delivery_status", "TEXT");
+    },
+  },
+  {
+    version: 39,
+    description:
+      "PLAN-36 §4 (mailbox-mediated join): circle_pending_join — the INVITEE " +
+      "side of an async join. When the inviter has no reachable a2a URL (or is " +
+      "offline), the invitee seals its join request into the inviter's mailbox " +
+      "and records the pending join here. It is re-posted each drain cycle until " +
+      "a signed `welcome` roster arrives (matched by circle_id + inviter_pubkey), " +
+      "or the invite expires. Holds only the invitee's OWN single-use secret + " +
+      "join envelope, so it can rebuild the request without re-parsing the code.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_pending_join (
+          invite_id           TEXT PRIMARY KEY,
+          circle_id           TEXT NOT NULL,
+          inviter_pubkey      TEXT NOT NULL,
+          inviter_mailbox_url TEXT NOT NULL,
+          inviter_box_pubkey  TEXT NOT NULL,
+          secret              TEXT NOT NULL,
+          join_envelope_json  TEXT NOT NULL,
+          attempts            INTEGER NOT NULL DEFAULT 1,
+          next_attempt_at     INTEGER NOT NULL DEFAULT 0,
+          expires_at          INTEGER NOT NULL,
+          created_at          INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_circle_pending_join_circle ` +
+          `ON circle_pending_join(circle_id, inviter_pubkey)`,
+      );
+    },
+  },
+  {
+    version: 40,
+    description:
+      "PLAN-36 Phase A2 (chat shell): circle_read_state — this node's per-circle " +
+      "read marker (last_read_at). Unread = inbound circle_messages newer than the " +
+      "marker; the rail badges it and opening a circle marks it read. Node-local " +
+      "(my view), so one row per circle, no signing. Seeds every EXISTING circle " +
+      "as fully read at migration time so the upgrade shows no false backlog; " +
+      "circles joined afterwards start unread until first opened.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_read_state (
+          circle_id    TEXT PRIMARY KEY,
+          last_read_at INTEGER NOT NULL
+        )
+      `);
+      // Seed existing circles as read up to their newest message → no backlog.
+      db.exec(`
+        INSERT OR IGNORE INTO circle_read_state (circle_id, last_read_at)
+          SELECT circle_id, MAX(created_at) FROM circle_messages GROUP BY circle_id
+      `);
+    },
+  },
+  {
+    version: 41,
+    description:
+      "PLAN-36 Phase A3 (chat shell): circle_messages.reply_to — the envelope_id " +
+      "of the message a reply answers. The envelope id is stable across all nodes " +
+      "(it is the dedupe key), so a reply resolves to its parent on every member's " +
+      "node. Carried in the message body (reply_to), stored on both the outbound " +
+      "and inbound rows; the UI renders a quoted parent. NULL on non-replies.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_messages", "reply_to", "TEXT");
+    },
+  },
+  {
+    version: 42,
+    description:
+      "PLAN-36 Phase B (agent in the room, summon-only): circle_agent_drafts — " +
+      "node-LOCAL drafts the member's own agent writes on a quarantined tool-less " +
+      "path when a circle message summons it with @agent. A draft is visible only " +
+      "to this node's human and NEVER fans out on its own; publishing it goes " +
+      "through the normal human-initiated send RPC (the consent tap). Rows are " +
+      "private state, not circle content: they ride no envelope and no sync.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_agent_drafts (
+          draft_id             TEXT PRIMARY KEY,
+          circle_id            TEXT NOT NULL,
+          summon_envelope_id   TEXT,
+          summon_author_pubkey TEXT,
+          kind                 TEXT NOT NULL DEFAULT 'reply',
+          status               TEXT NOT NULL DEFAULT 'queued',
+          content              TEXT NOT NULL DEFAULT '',
+          error                TEXT,
+          created_at           INTEGER NOT NULL,
+          updated_at           INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_circle_agent_drafts_circle
+          ON circle_agent_drafts (circle_id, status);
+      `);
+    },
+  },
+  {
+    version: 43,
+    description:
+      "PLAN-36 Phase B2 (agent-drafted card slices): circle_agent_drafts gains " +
+      "target_card_id + target_slot. A kind='slice' draft is the agent " +
+      "pre-filling the member's OWN contribution to a canvas card slot (a vote, " +
+      "a study-guide section) on the same quarantined path; publishing it ships " +
+      "through the normal circles.canvas.slice consent path. NULL on chat-reply " +
+      "drafts.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_agent_drafts", "target_card_id", "TEXT");
+      addColumnIfMissing(db, "circle_agent_drafts", "target_slot", "TEXT");
+    },
+  },
+  {
+    version: 44,
+    description:
+      "PLAN-36 Phase D (unfreeze): circles.freeze_reason — JSON fork evidence " +
+      "(author, seq, held/offered hashes, detected_at) recorded when a ledger " +
+      "fork freezes the circle, shown to the human by the recovery UI, cleared " +
+      "on unfreeze. Previously the evidence lived only in the log.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circles", "freeze_reason", "TEXT");
+    },
+  },
+  {
+    version: 45,
+    description:
+      "PLAN-36 Phase D (review follow-up): circles.forgiven_forks — JSON audit " +
+      "of fork evidence the human reviewed when unfreezing (author, seq, hashes, " +
+      "forgiven_at; capped list). A forgiven author's fork REPLAYS are rejected " +
+      "without re-freezing, so a member restored from backup (or a naive " +
+      "griefer) cannot re-freeze the circle after review; a fork from a NEW " +
+      "author still freezes. Doubles as the retained evidence trail (evidence " +
+      "is moved here on unfreeze, not destroyed).",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circles", "forgiven_forks", "TEXT");
+    },
+  },
+  {
+    version: 46,
+    description:
+      "PLAN-36 §5.3 completed: circle_pending_outbound becomes the HUMAN " +
+      "approval queue. The v37 interim minted the confirm token at preview " +
+      "time, so a prompt-injected agent could self-serve preview→confirm with " +
+      "no human. Now an agent write (send/ask/log_expense) only QUEUES here " +
+      "(full params + human-facing preview persisted); the inline approval " +
+      "card in the Circles UI is the ONLY path that executes (circles.outbound." +
+      "approve) or rejects it. status: pending|approved|rejected|expired.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_pending_outbound", "circle_id", "TEXT");
+      addColumnIfMissing(db, "circle_pending_outbound", "params_json", "TEXT");
+      addColumnIfMissing(db, "circle_pending_outbound", "preview_json", "TEXT");
+      addColumnIfMissing(
+        db,
+        "circle_pending_outbound",
+        "status",
+        "TEXT NOT NULL DEFAULT 'pending'",
+      );
+      addColumnIfMissing(db, "circle_pending_outbound", "resolved_at", "INTEGER");
+      // Legacy v37 token rows carry no params/preview and can never execute —
+      // resolve them out of the pending set defensively.
+      db.exec(`UPDATE circle_pending_outbound SET status = 'expired' WHERE params_json IS NULL`);
+    },
+  },
+  {
+    version: 47,
+    description:
+      "PLAN-36 §5.2: circle_rate_hits — PERSISTED per-member A2A rate buckets. " +
+      "The friend-branch rate limiter was an in-memory sliding window that reset " +
+      "(more permissively) on every gateway restart, so a worm could span a " +
+      "restart to refresh its budget. Now each accepted request records a hit " +
+      "row; the window count survives restart. Rows are GC'd past the max " +
+      "window (bounded to ~a minute of traffic).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_rate_hits (
+          bucket_key TEXT NOT NULL,
+          hit_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_circle_rate_hits_key
+          ON circle_rate_hits (bucket_key, hit_at);
+        CREATE INDEX IF NOT EXISTS idx_circle_rate_hits_at
+          ON circle_rate_hits (hit_at);
+      `);
+    },
+  },
+  {
+    version: 48,
+    description:
+      "PLAN-36 §5.6 (petname layer): circle_petnames — a NODE-LOCAL, per-person " +
+      "label the human assigns to a member (keyed by member_pubkey, so naming " +
+      "someone names them in every shared circle). The petname overrides the " +
+      "member's self-asserted display_name for THIS node's eyes only; it never " +
+      "syncs or fans out (the peer never learns it). This is the anti-" +
+      "impersonation anchor: the label is bound to the ed25519 key, not the " +
+      "spoofable name string.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_petnames (
+          member_pubkey TEXT PRIMARY KEY,
+          petname       TEXT NOT NULL,
+          created_at    INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 49,
+    description:
+      "PLAN-36 §5.6 (self identity): circle_settings — node-local key/value for " +
+      "this node's own circle profile. First key: 'display_name', the name YOU " +
+      "are introduced by (the self-asserted name friends see, previously buried " +
+      "in config and defaulting to 'Bitterbot agent'). Set in-app now; carried " +
+      "in presence so existing friends' rosters refresh, not just new joins.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_settings (
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 50,
+    description:
+      "PLAN-36 mockup pin 3 (agent posture in the roster): " +
+      "circle_peer_presence.agent_posture — a peer's self-reported agent " +
+      "posture ('summon-only' | 'off'), carried on the presence beat so the " +
+      "roster can answer 'who and what can hear this' in one glance. " +
+      "Allowlist-validated on receipt; absent on old-binary beats (null).",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_peer_presence", "agent_posture", "TEXT");
+    },
+  },
+  {
+    version: 51,
+    description:
+      "PLAN-36 mockup pin 2 (agent provenance in the stream): " +
+      "circle_messages.agent_authored — 1 when the message text was written " +
+      "by the author's AGENT (a published @agent draft or an approved agent " +
+      "tool send) rather than typed by the human. Presentation-layer " +
+      "provenance: rows render as '<name>'s agent' with the violet agent " +
+      "treatment. Carried in the message body; absent = human-authored.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_messages", "agent_authored", "INTEGER");
+    },
+  },
+  {
+    version: 52,
+    description:
+      "Target-bound invites (adversarial review of send-to-connection): " +
+      "circle_invites.target_pubkey — when set, ONLY that pubkey can redeem. " +
+      "Closes interception (roster-poisoned delivery) and co-member races on " +
+      "codes delivered through a shared circle: the code stops being a " +
+      "bearer token.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_invites", "target_pubkey", "TEXT");
+    },
+  },
+  {
+    version: 53,
+    description:
+      "Circle message deletion: circle_messages.deleted_at/deleted_by. " +
+      "Tombstone, not row removal — reply threads keep their anchor and the " +
+      "row proves a message existed. deleted_by is the requesting pubkey: " +
+      "the author (propagated via the signed circle/message.delete verb, " +
+      "honored by honest peer nodes) or the local human (node-local hide of " +
+      "someone else's message; nothing fans out). Content is blanked on " +
+      "tombstone so deleted text does not linger at rest.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_messages", "deleted_at", "INTEGER");
+      addColumnIfMissing(db, "circle_messages", "deleted_by", "TEXT");
+    },
+  },
+  {
+    version: 54,
+    description:
+      "PLAN-36 Phase 4b (the study loop): circle_study_state — THIS member's " +
+      "own mastery + spaced-repetition state per study-guide section, keyed " +
+      "(circle_id, card_id, slot). Node-local and member-own by construction: " +
+      "derived only from the human's own quiz results, never fanned out, and " +
+      "never entering recall-eligible memory (the §5.2 taint rule holds — the " +
+      "shared artifact is processed per draft; what accumulates is ours). " +
+      "`box` is the Leitner ladder position (0-4) driving the 1d/3d/7d/14d/30d " +
+      "review schedule (PLAN-9 GAP-7 spacing applied to member mastery).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_study_state (
+          circle_id        TEXT NOT NULL,
+          card_id          TEXT NOT NULL,
+          slot             TEXT NOT NULL,
+          box              INTEGER NOT NULL DEFAULT 0,
+          correct_count    INTEGER NOT NULL DEFAULT 0,
+          miss_count       INTEGER NOT NULL DEFAULT 0,
+          last_result      TEXT,
+          last_reviewed_at INTEGER,
+          due_at           INTEGER NOT NULL,
+          updated_at       INTEGER NOT NULL,
+          PRIMARY KEY (circle_id, card_id, slot)
+        );
+      `);
+    },
+  },
+  {
+    version: 55,
+    description:
+      "PLAN-38 P1(a) (canvas sandbox): circle_sandbox_enrollments — the " +
+      "PRIVATE half of sandbox enrollment (I4/R4: consent is node-local-" +
+      "authoritative). Peers learn only `mode` via the signed " +
+      "sandbox.enroll.put event; budgets, guidance, and pause state live " +
+      "here on member-own hardware and never fan out. This row gates ALL " +
+      "spend: turns and tokens are claimed/recorded consumption-side " +
+      "(guarded UPDATE, the claimAgentDraft pattern) and only the enrolling " +
+      "human can refill them (R5/R10/M2/M3). mode is 'off'|'propose' until " +
+      "P2 ships auto-append behind its own opt-in (R19).",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_sandbox_enrollments (
+          circle_id    TEXT NOT NULL,
+          card_id      TEXT NOT NULL,
+          mode         TEXT NOT NULL DEFAULT 'off',
+          turn_budget  INTEGER NOT NULL DEFAULT 10,
+          turns_used   INTEGER NOT NULL DEFAULT 0,
+          token_budget INTEGER NOT NULL DEFAULT 200000,
+          tokens_used  INTEGER NOT NULL DEFAULT 0,
+          guidance     TEXT NOT NULL DEFAULT '',
+          paused_at    INTEGER,
+          pause_reason TEXT,
+          expires_at   INTEGER,
+          created_at   INTEGER NOT NULL,
+          updated_at   INTEGER NOT NULL,
+          PRIMARY KEY (circle_id, card_id)
+        );
+      `);
+    },
+  },
+  {
+    version: 56,
+    description:
+      "PLAN-38 P1 reshape (cards are alive by nature): sandbox participation " +
+      "moves from PER-CARD to PER-CIRCLE. 'My agent works this circle's " +
+      "canvas' is one standing choice, not a ceremony repeated on every card " +
+      "— the per-card enrollment step was pure friction between a person and " +
+      "the thing working. Consent is unchanged in kind: still node-local and " +
+      "authoritative (I4/R4), still the only gate on spend (R5/R10), still " +
+      "propose-mode so every generated move waits for its human's tap (I7). " +
+      "Existing rows collapse to their circle, keeping the largest budgets " +
+      "and any guidance, so nothing a human configured is silently dropped.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_sandbox_participation (
+          circle_id    TEXT PRIMARY KEY,
+          mode         TEXT NOT NULL DEFAULT 'off',
+          turn_budget  INTEGER NOT NULL DEFAULT 20,
+          turns_used   INTEGER NOT NULL DEFAULT 0,
+          token_budget INTEGER NOT NULL DEFAULT 400000,
+          tokens_used  INTEGER NOT NULL DEFAULT 0,
+          guidance     TEXT NOT NULL DEFAULT '',
+          paused_at    INTEGER,
+          pause_reason TEXT,
+          expires_at   INTEGER,
+          created_at   INTEGER NOT NULL,
+          updated_at   INTEGER NOT NULL
+        );
+      `);
+      // Collapse any per-card rows into one row per circle. 'propose' wins
+      // over 'off' (a human who turned it on anywhere meant it), budgets take
+      // the max, spend takes the sum so nothing already spent is forgiven.
+      const hasOld = db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name='circle_sandbox_enrollments'`,
+        )
+        .get();
+      if (hasOld) {
+        db.exec(`
+          INSERT OR IGNORE INTO circle_sandbox_participation
+            (circle_id, mode, turn_budget, turns_used, token_budget, tokens_used,
+             guidance, paused_at, pause_reason, expires_at, created_at, updated_at)
+          SELECT circle_id,
+                 CASE WHEN MAX(mode = 'propose') = 1 THEN 'propose' ELSE 'off' END,
+                 MAX(turn_budget), SUM(turns_used),
+                 MAX(token_budget), SUM(tokens_used),
+                 COALESCE(MAX(NULLIF(guidance, '')), ''),
+                 MAX(paused_at), MAX(pause_reason), MAX(expires_at),
+                 MIN(created_at), MAX(updated_at)
+            FROM circle_sandbox_enrollments
+           GROUP BY circle_id;
+        `);
+        db.exec(`DROP TABLE circle_sandbox_enrollments;`);
+      }
+    },
+  },
+  {
+    version: 57,
+    description:
+      "Audit 2026-08-09 F12 (remaining half): backfill skill_category on " +
+      "peer/dream skill crystals. The peer-ingest inserts (skill-network-" +
+      "bridge, mem-store) never set skill_category and the dream refiner " +
+      "copied its original's NULL, so every non-bootstrap crystal was " +
+      "invisible to skills.metrics / skill_lifecycle grouping (584 rows on " +
+      "the live node). Derives the canonical key from each crystal's " +
+      "frontmatter name (stripping the forage response-<hex>- prefix), then " +
+      "inherits down parent_id chains to a fixpoint, then falls back to " +
+      "stable_skill_id / path basename. The creation paths now set the key " +
+      "at insert time; this heals rows created before that fix. Only fills " +
+      "NULLs — never rewrites an existing category.",
+    up: (db: DatabaseSync) => {
+      const { updated, unresolved } = backfillSkillCategories(db);
+      log.info(`v57 skill_category backfill: updated=${updated} unresolved=${unresolved}`);
+    },
+  },
+  {
+    version: 58,
+    description:
+      "PLAN-40 Phase 0: the dream-utility substrate. dream_utility is the " +
+      "honest funnel — one row per artifact any dream lane produces, with a " +
+      "set-once first_consumed_at stamped ONLY where content provably enters " +
+      "a model prompt or a skill executes (the evaluation found the engine's " +
+      "entire lifetime output had zero consumption, partly because nothing " +
+      "could measure it). dream_briefs holds Phase-3 anticipatory briefs " +
+      "OUTSIDE the chunks/retrieval surface (adversarial pass: briefs as " +
+      "chunks leak cross-session synthesis into group prompts via recall). " +
+      "chunks.hygiene_done is the one-shot rewrite guard (bounded-rewriting " +
+      "rule as schema). skill_executions.tool_name/recorded_by give Lane 1 " +
+      "the provenance the adversarial pass proved missing. canonical_facts " +
+      "staleness-ask columns give the hygiene lane its 3-asks-then-" +
+      "unconfirmed terminal state. mutation_queue is DROPPED: it has " +
+      "writers and no reader anywhere (wired-but-dead, evaluation E9) — " +
+      "the one destructive change, safe because no code can observe it. " +
+      "Existing origin='dream' insight chunks get backfilled funnel rows " +
+      "(lane='legacy') so pre-plan artifacts are measurable too.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS dream_utility (
+          id                TEXT PRIMARY KEY,
+          lane              TEXT NOT NULL,
+          artifact_kind     TEXT NOT NULL,
+          artifact_id       TEXT NOT NULL,
+          produced_at       INTEGER NOT NULL,
+          first_consumed_at INTEGER,
+          consumed_kind     TEXT,
+          cycle_id          TEXT,
+          rating            INTEGER,
+          rated_at          INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_utility_artifact
+          ON dream_utility (artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_dream_utility_lane
+          ON dream_utility (lane, produced_at);
+      `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS dream_briefs (
+          id            TEXT PRIMARY KEY,
+          context_kind  TEXT NOT NULL,
+          context_ref   TEXT,
+          question      TEXT NOT NULL,
+          answer_sketch TEXT NOT NULL,
+          evidence_json TEXT NOT NULL DEFAULT '[]',
+          status        TEXT NOT NULL DEFAULT 'open',
+          created_at    INTEGER NOT NULL,
+          surfaced_at   INTEGER,
+          referenced_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_briefs_status
+          ON dream_briefs (status, created_at);
+      `);
+      addColumnIfMissing(db, "chunks", "hygiene_done", "INTEGER NOT NULL DEFAULT 0");
+      addColumnIfMissing(db, "skill_executions", "tool_name", "TEXT");
+      addColumnIfMissing(db, "skill_executions", "recorded_by", "TEXT");
+      addColumnIfMissing(
+        db,
+        "canonical_facts",
+        "staleness_asked_count",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+      addColumnIfMissing(db, "canonical_facts", "last_staleness_ask_at", "INTEGER");
+      // Writers-only queue: queueForRetry + slow-update enqueue exist, no
+      // reader ever shipped. Dropping is observable by nothing.
+      db.exec(`DROP TABLE IF EXISTS mutation_queue`);
+      // Backfill funnel rows for pre-plan promoted insight chunks so the
+      // Utility surfaces can report on them (they are 'legacy', not a lane).
+      db.exec(`
+        INSERT OR IGNORE INTO dream_utility
+          (id, lane, artifact_kind, artifact_id, produced_at, cycle_id)
+        SELECT 'legacy_' || id, 'legacy', 'insight_chunk', id, created_at, NULL
+          FROM chunks
+         WHERE origin = 'dream' AND COALESCE(semantic_type, '') = 'insight'
+      `);
+    },
+  },
+  {
+    version: 59,
+    description:
+      "Daily health sweep (2026-08-11): health_sweeps stores each scheduled " +
+      "run's read-only doctor findings so the NEXT run can diff against it and " +
+      "warn about what is new. Motivation: three silent failures surfaced in a " +
+      "single session and in every case the check already existed and was " +
+      "correct (vector-index coverage, dream-mode liveness, artifact liveness) " +
+      "— nobody had run doctor, so vector search stayed dead for weeks and an " +
+      "embedding backlog silently rebuilt. Writing checks was never the gap; " +
+      "running them was. History capped at 30 rows; the diff needs only the " +
+      "previous row.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS health_sweeps (
+          id             TEXT PRIMARY KEY,
+          swept_at       INTEGER NOT NULL,
+          findings_json  TEXT NOT NULL,
+          new_count      INTEGER NOT NULL DEFAULT 0,
+          resolved_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_health_sweeps_at ON health_sweeps (swept_at DESC);
+      `);
+    },
+  },
+  {
+    version: 60,
+    description:
+      "Mailbox anti-wedge hardening (2026-08-13, PLAN-36 §4 follow-up (a)): " +
+      "mailbox_post_log persists the per-sender post-rate window so a host " +
+      "restart no longer resets the limiter (it was an in-memory Map). The " +
+      "handler pairs this with a per-(sender,recipient) sub-quota and " +
+      "largest-sender eviction at the recipient ceiling, closing the live " +
+      "DoS where attacker-minted throwaway keypairs pre-filled an offline " +
+      "recipient's RECIPIENT_QUOTA and wedged their delivery.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS mailbox_post_log (
+          sender_pubkey TEXT    NOT NULL,
+          ts            INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mailbox_post_log_sender
+          ON mailbox_post_log (sender_pubkey, ts);
+        CREATE INDEX IF NOT EXISTS idx_mailbox_post_log_ts ON mailbox_post_log (ts);
+      `);
+    },
+  },
+  {
+    version: 61,
+    description:
+      "Circles P2P transport Stage 2 (2026-08-14): per-circle SENDER KEYS — " +
+      "the confidentiality layer for gossip-topic frames. Each member " +
+      "encrypts mesh frames with their own symmetric key and distributes it " +
+      "sealed to every member's X25519 box key over the reliable HTTP paths " +
+      "(sender-keys, not one group key: rosters are node-local and removal " +
+      "is per-node consent, so there is no key authority to agree with). " +
+      "circle_own_sender_keys holds this node's sending keys per circle " +
+      "(rotated when this node removes a member; delivered_json tracks which " +
+      "members have been sent the current key). circle_sender_keys holds " +
+      "keys RECEIVED from peers, keyed (circle, sender, key_id) so retired " +
+      "keys still decrypt in-flight frames.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS circle_own_sender_keys (
+          circle_id      TEXT    NOT NULL,
+          key_id         TEXT    NOT NULL,
+          key_b64        TEXT    NOT NULL,
+          created_at     INTEGER NOT NULL,
+          retired_at     INTEGER,
+          delivered_json TEXT    NOT NULL DEFAULT '[]',
+          PRIMARY KEY (circle_id, key_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_circle_own_sender_keys_current
+          ON circle_own_sender_keys (circle_id, retired_at, created_at);
+        CREATE TABLE IF NOT EXISTS circle_sender_keys (
+          circle_id     TEXT    NOT NULL,
+          sender_pubkey TEXT    NOT NULL,
+          key_id        TEXT    NOT NULL,
+          key_b64       TEXT    NOT NULL,
+          created_at    INTEGER NOT NULL,
+          PRIMARY KEY (circle_id, sender_pubkey, key_id)
+        );
+      `);
+    },
+  },
+  {
+    version: 62,
+    description:
+      "Circles P2P transport Stage 4 (2026-08-14): circle_members.peer_id — " +
+      "the device-key↔libp2p-PeerId binding (PLAN-35 B-1). A member's " +
+      "PeerId arrives inside their Ed25519-SIGNED join/presence envelope " +
+      "body, so the claim is bound to the circle identity by the same " +
+      "signature chain as everything else; it lets circleRpc dial the " +
+      "member point-to-point over the mesh (request-response) before " +
+      "falling back to HTTP dial and mailbox.",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "circle_members", "peer_id", "TEXT");
+    },
+  },
+  {
+    version: 63,
+    description:
+      "PLAN-45 Phase 0 (2026-09-05): retire the SkillCrystallizer and purge its " +
+      "output. Its dedup looked for lifecycle='frozen' while it inserted " +
+      "'generated', and its pattern query LEFT-JOINed chunks, so 13 " +
+      "skill_executions rows whose source crystals were deleted in August kept " +
+      "minting a new crystallizer/auto chunk on every consolidation pass (572 " +
+      "on the reference node, 44 per day). Deletes every crystallizer/auto " +
+      "chunk (all were tool-name-keyed restatements of the same execution " +
+      "rows, never skills), the skill_executions rows whose crystal no longer " +
+      "exists (the poison source), and marketplace_listings rows whose crystal " +
+      "no longer exists (76 stale rows advertising tool-level successes at 1.0). " +
+      "chunks_vec is NOT touched here: sqlite-vec is not loaded on the connection " +
+      "when migrations run, so the vector rows are swept by the manager's " +
+      "one-time orphan sweep after the extension is ready (sweepVectorOrphansOnce).",
+    up: (db: DatabaseSync) => {
+      const hasTable = (name: string): boolean =>
+        db
+          .prepare(`SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?`)
+          .get(name) !== undefined;
+      // The crystallizer wrote path='crystallizer/auto', source='skills',
+      // origin='inferred'; `model` is not usable because the embedding
+      // backfill rewrites it (482 of the reference node's 572 rows carried
+      // the embedding model name).
+      const CRYSTALLIZER_ROWS =
+        `SELECT id FROM chunks WHERE path = 'crystallizer/auto' AND source = 'skills' ` +
+        `AND COALESCE(origin, '') = 'inferred'`;
+      if (hasTable("chunks_fts")) {
+        try {
+          db.exec(`DELETE FROM chunks_fts WHERE id IN (${CRYSTALLIZER_ROWS})`);
+        } catch {
+          /* FTS disabled or a contentless variant: nothing to purge */
+        }
+      }
+      db.exec(`DELETE FROM chunks WHERE id IN (${CRYSTALLIZER_ROWS})`);
+      if (hasTable("skill_executions")) {
+        db.exec(
+          `DELETE FROM skill_executions WHERE skill_crystal_id NOT IN (SELECT id FROM chunks)`,
+        );
+      }
+      if (hasTable("marketplace_listings")) {
+        db.exec(
+          `DELETE FROM marketplace_listings WHERE skill_crystal_id NOT IN (SELECT id FROM chunks)`,
+        );
+      }
+    },
+  },
+  {
+    version: 64,
+    description:
+      "PLAN-45 Phase 1.1 (2026-09-05): one outcome substrate. skill_executions rows " +
+      "written by the after_tool_call hook are TOOL-level evidence (a tool did not " +
+      "report an error) and carry the run they happened in (run_id, tool_call_id). " +
+      "A housekeeping back-fill (skill-evolution/execution-outcomes.ts) stamps each " +
+      "run's grounded outcome (labeler + L0-L4 hierarchy) into run_outcome_label / " +
+      "run_outcome_level and lifts `evidence` from 'tool' to 'run' | 'task' | 'human'. " +
+      "Competence consumers read only run-or-better rows (RUN_EVIDENCE_WHERE).",
+    up: (db: DatabaseSync) => {
+      addColumnIfMissing(db, "skill_executions", "run_id", "TEXT");
+      addColumnIfMissing(db, "skill_executions", "tool_call_id", "TEXT");
+      addColumnIfMissing(db, "skill_executions", "evidence", "TEXT");
+      addColumnIfMissing(db, "skill_executions", "run_outcome_level", "INTEGER");
+      addColumnIfMissing(db, "skill_executions", "run_outcome_label", "TEXT");
+      addColumnIfMissing(db, "skill_executions", "run_outcome_at", "INTEGER");
+      db.exec(
+        `UPDATE skill_executions SET evidence = 'tool' WHERE evidence IS NULL AND recorded_by = 'after_tool_call'`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_executions_run ON skill_executions (run_id)`);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_skill_executions_outcome_pending
+           ON skill_executions (started_at) WHERE run_outcome_level IS NULL`,
+      );
+    },
+  },
+  {
+    version: 65,
+    description:
+      "Memory audit 2026-09-07 (P0.1/C1): index chunks(updated_at) so the dream " +
+      "extrapolation seed no longer full-scans, and reconcile the two lifecycle " +
+      "columns (chunks.lifecycle vs chunks.lifecycle_state). consolidation.ts wrote " +
+      "only `lifecycle` on merge-winner promotion, so rows drifted to " +
+      "lifecycle='consolidated' + lifecycle_state='active'. Derive lifecycle_state " +
+      "from lifecycle for the diverged rows; the writer now sets both.",
+    up: (db: DatabaseSync) => {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_updated_at ON chunks(updated_at)`);
+      // consolidated in `lifecycle` but still active in `lifecycle_state`
+      db.exec(
+        `UPDATE chunks SET lifecycle_state = 'consolidated'
+           WHERE lifecycle = 'consolidated' AND COALESCE(lifecycle_state, 'active') = 'active'`,
+      );
+      // archived/expired in `lifecycle` but not reflected in `lifecycle_state`
+      db.exec(
+        `UPDATE chunks SET lifecycle_state = 'archived'
+           WHERE lifecycle IN ('archived', 'expired')
+             AND COALESCE(lifecycle_state, 'active') = 'active'`,
+      );
+    },
+  },
+  {
+    version: 66,
+    description:
+      "Memory audit 2026-09-07 (P1.5): store embeddings as compact float32 BLOBs " +
+      "instead of JSON text (~29 KB -> ~6 KB per 1536-dim vector, ~4.8x). Converts " +
+      "existing chunks.embedding and embedding_cache.embedding rows in place. Readers " +
+      "use parseEmbedding(), which decodes both forms, so the conversion is safe even " +
+      "if interrupted. A follow-up VACUUM returns the freed pages to disk.",
+    up: (db: DatabaseSync) => {
+      const convert = (table: string): number => {
+        const sel = db.prepare(
+          `SELECT rowid AS rid, embedding FROM ${table} WHERE typeof(embedding) = 'text' LIMIT 500`,
+        );
+        const upd = db.prepare(`UPDATE ${table} SET embedding = ? WHERE rowid = ?`);
+        let converted = 0;
+        for (;;) {
+          const rows = sel.all() as Array<{ rid: number | bigint; embedding: string }>;
+          if (rows.length === 0) {
+            break;
+          }
+          for (const r of rows) {
+            let blob: Buffer;
+            try {
+              const arr = JSON.parse(r.embedding) as unknown;
+              blob =
+                Array.isArray(arr) && arr.length > 0
+                  ? Buffer.from(new Float32Array(arr as number[]).buffer)
+                  : Buffer.alloc(0);
+            } catch {
+              // Malformed JSON: write an empty blob so it stops matching
+              // typeof='text' and parseEmbedding returns [] for it.
+              blob = Buffer.alloc(0);
+            }
+            upd.run(blob, r.rid);
+            converted += 1;
+          }
+        }
+        return converted;
+      };
+      const tables = ["chunks", "embedding_cache"];
+      for (const t of tables) {
+        try {
+          convert(t);
+        } catch {
+          // Table may not exist on a minimal DB; skip.
+        }
+      }
+    },
+  },
+  {
+    version: 67,
+    description:
+      "PLAN-46 Phase 1 (D-4): drop the orphaned skill_text_history table. It has " +
+      "zero references anywhere in src (no writer, no reader, no CREATE) — it is " +
+      "residue of a removed migration. Verified dead by grep, not just empty on one " +
+      "node, so no load-stress gate is needed. skill_executions and skill_lifecycle " +
+      "were also audit 'dead' candidates but are load-bearing (execution-evidence and " +
+      "the skills lifecycle store) and are KEPT.",
+    up: (db: DatabaseSync) => {
+      db.exec(`DROP TABLE IF EXISTS skill_text_history`);
+    },
+  },
+  {
+    version: 68,
+    description:
+      "PLAN-46 dead-code pass: drop the empty multi-perspective embedding columns " +
+      "(embedding_procedural/causal/entity). They were NULL on every row — written " +
+      "only by a perspective backfill and read only by a multi-perspective search, " +
+      "both removed as dead code (no runtime callers). SQLite 3.35+ DROP COLUMN.",
+    up: (db: DatabaseSync) => {
+      for (const col of ["embedding_procedural", "embedding_causal", "embedding_entity"]) {
+        try {
+          db.exec(`ALTER TABLE chunks DROP COLUMN ${col}`);
+        } catch {
+          // Column already absent (fresh DB / re-run): no-op.
+        }
+      }
+    },
+  },
+  {
+    version: 69,
+    description:
+      "Skill-receive accounting repair (2026-09-28): a peer re-broadcasting legacy dream " +
+      "crystals with new bytes each time was penalized once per COPY (965 rejections " +
+      "against 154 receipts on the reference node). Every decided skill is also a " +
+      "received one, so rejections are capped at receipts minus acceptances. Anomaly flags are cleared: " +
+      "the detector never un-flagged a peer that went quiet, and re-flags any peer that " +
+      "is genuinely spiking on its next hourly pass.",
+    up: (db: DatabaseSync) => {
+      const hasTable = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'peer_reputation'`)
+        .get();
+      if (!hasTable) {
+        return;
+      }
+      db.exec(
+        `UPDATE peer_reputation SET skills_rejected = MAX(0, skills_received - skills_accepted)
+           WHERE skills_accepted + skills_rejected > skills_received`,
+      );
+      db.exec(`UPDATE peer_reputation SET anomaly_flag = 0 WHERE anomaly_flag = 1`);
+    },
+  },
+  {
+    version: 70,
+    description:
+      "Maintenance-tick cold scans (2026-10-03 soak): every 30-minute tick ran two full " +
+      "scans of chunks that matched nothing. scorePendingChunks filters on " +
+      "curiosity_reward IS NULL, which the v35 partial index (IS NOT NULL) cannot serve; " +
+      "governance.enforceLifespan filters on governance_json LIKE '%ttl%' and this install " +
+      "has no TTL crystal. On a cold page cache each scan of the 6k-row table cost about " +
+      "5 s of synchronous I/O on the gateway loop (16 ms warm). Partial indexes on exactly " +
+      "those predicates make both queries touch only the matching rows.",
+    up: (db: DatabaseSync) => {
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunks_curiosity_pending ` +
+          `ON chunks(id) WHERE curiosity_reward IS NULL`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunks_governance_ttl ` +
+          `ON chunks(id) WHERE governance_json LIKE '%ttl%'`,
+      );
+    },
+  },
+  {
+    version: 71,
+    description:
+      "Circles security pass (2026-10-06). M3: circle_members.last_presence_ts is the " +
+      "per-(circle, member) high-water mark of signed presence beats, so a replayed older " +
+      "beat can no longer roll a member's endpoints back. M2: circle_messages.system_target " +
+      "holds the pubkey a removal notice names, so the UI can offer the one-tap 'remove on " +
+      "my node too' that completes a removal (and rotates this node's sender key).",
+    up: (db: DatabaseSync) => {
+      const has = (name: string) =>
+        db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
+      if (has("circle_members")) {
+        addColumnIfMissing(db, "circle_members", "last_presence_ts", "INTEGER");
+      }
+      if (has("circle_messages")) {
+        addColumnIfMissing(db, "circle_messages", "system_target", "TEXT");
+      }
+    },
+  },
+  {
+    version: 72,
+    description:
+      "Lifecycle column repair (Agent Memory Atlas review, 2026-09-19). The coarse " +
+      "lifecycle_state used to be derived from lifecycle 'expired' as 'archived', so a " +
+      "forgotten chunk that round-tripped came back merely archived. Expired rows get " +
+      "lifecycle_state 'forgotten', and a NULL in either column is filled from the other " +
+      "so single-column reads no longer drop rows under three-valued logic.",
+    up: (db: DatabaseSync) => {
+      const cols = new Set(
+        (db.prepare(`PRAGMA table_info(chunks)`).all() as Array<{ name: string }>).map(
+          (r) => r.name,
+        ),
+      );
+      if (!cols.has("lifecycle") || !cols.has("lifecycle_state")) {
+        return;
+      }
+      db.exec(
+        `UPDATE chunks SET lifecycle_state = 'forgotten'
+          WHERE lifecycle = 'expired' AND COALESCE(lifecycle_state, '') <> 'forgotten'`,
+      );
+      db.exec(
+        `UPDATE chunks SET lifecycle_state = CASE lifecycle
+            WHEN 'consolidated' THEN 'consolidated'
+            WHEN 'archived' THEN 'archived'
+            ELSE 'active' END
+          WHERE lifecycle_state IS NULL AND lifecycle IS NOT NULL`,
+      );
+      db.exec(
+        `UPDATE chunks SET lifecycle = CASE lifecycle_state
+            WHEN 'forgotten' THEN 'expired'
+            WHEN 'archived' THEN 'archived'
+            WHEN 'consolidated' THEN 'consolidated'
+            ELSE 'generated' END
+          WHERE lifecycle IS NULL`,
+      );
+    },
+  },
+  {
+    version: 73,
+    description:
+      "PLAN-54 curiosity loop (2026-10-07). curiosity_findings holds what the agent went and " +
+      "learned on its own: the question, the depersonalized query that left the node, the " +
+      "cited answer, confidence, hormonal state at acquisition, cost, the chunk it became, and " +
+      "whether a conversation ever used it. curiosity_targets gains an attempt counter and an " +
+      "embedding for dedupe, so the same question is never asked twice.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS curiosity_findings (
+          id            TEXT PRIMARY KEY,
+          target_id     TEXT NOT NULL,
+          question      TEXT NOT NULL,
+          query_phrase  TEXT NOT NULL,
+          answer        TEXT NOT NULL,
+          confidence    REAL NOT NULL,
+          sources_json  TEXT NOT NULL DEFAULT '[]',
+          hormonal_json TEXT,
+          cost_usd      REAL NOT NULL DEFAULT 0,
+          chunk_id      TEXT,
+          region_id     TEXT,
+          created_at    INTEGER NOT NULL,
+          first_used_at INTEGER,
+          used_count    INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_curiosity_findings_chunk ON curiosity_findings (chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_curiosity_findings_created ON curiosity_findings (created_at);
+      `);
+      const has = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'curiosity_targets'`)
+        .get();
+      if (has) {
+        addColumnIfMissing(db, "curiosity_targets", "attempts", "INTEGER NOT NULL DEFAULT 0");
+        addColumnIfMissing(db, "curiosity_targets", "embedding_json", "TEXT");
+        // The emerging-skill "frontier" generator is deleted in this release;
+        // its open rows were never researchable (handover briefs, READMEs).
+        db.exec(
+          `DELETE FROM curiosity_targets WHERE resolved_at IS NULL
+             AND json_extract(metadata, '$.source') = 'emerging_skill'`,
+        );
+      }
+    },
+  },
+  {
+    version: 74,
+    description:
+      "PLAN-54 follow-up (2026-10-07): curiosity_findings.verified marks findings that cleared " +
+      "the two-source / confidence gate and became memory. An answer the agent found but was " +
+      "not confident enough to remember is kept (verified = 0, no chunk) so the Curiosity page " +
+      "can show what it saw instead of a bare 'unanswered'.",
+    up: (db: DatabaseSync) => {
+      const has = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'curiosity_findings'`)
+        .get();
+      if (has) {
+        addColumnIfMissing(db, "curiosity_findings", "verified", "INTEGER NOT NULL DEFAULT 1");
+      }
+    },
+  },
+  {
+    version: 75,
+    description:
+      "Knowledge-graph person hygiene (2026-10-07): entities filed as 'person' that are not " +
+      "names ('here', 'commands', a peer id) are reclassified as 'concept'. The curiosity " +
+      "egress filter blocks every known person's name from outgoing search phrases, so noise " +
+      "there blocked ordinary words; identity recall read the same rows.",
+    up: (db: DatabaseSync) => {
+      const has = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entities'`)
+        .get();
+      if (!has) {
+        return;
+      }
+      const rows = db
+        .prepare(`SELECT id, name, mention_count FROM entities WHERE entity_type = 'person'`)
+        .all() as Array<{ id: string; name: string; mention_count: number }>;
+      const findConcept = db.prepare(
+        `SELECT id FROM entities WHERE name = ? AND entity_type = 'concept'`,
+      );
+      const demote = db.prepare(`UPDATE entities SET entity_type = 'concept' WHERE id = ?`);
+      // (name, entity_type) is unique: when a concept of that name already
+      // exists, fold the person row into it and keep every edge.
+      const repointSource = db.prepare(
+        `UPDATE OR IGNORE relationships SET source_entity_id = ? WHERE source_entity_id = ?`,
+      );
+      const repointTarget = db.prepare(
+        `UPDATE OR IGNORE relationships SET target_entity_id = ? WHERE target_entity_id = ?`,
+      );
+      const dropOrphanEdges = db.prepare(
+        `DELETE FROM relationships WHERE source_entity_id = ? OR target_entity_id = ?`,
+      );
+      const repointParent = db.prepare(
+        `UPDATE entities SET parent_entity_id = ? WHERE parent_entity_id = ?`,
+      );
+      const bump = db.prepare(`UPDATE entities SET mention_count = mention_count + ? WHERE id = ?`);
+      const remove = db.prepare(`DELETE FROM entities WHERE id = ?`);
+      for (const r of rows) {
+        if (looksLikePersonName(r.name)) {
+          continue;
+        }
+        const concept = findConcept.get(r.name) as { id: string } | undefined;
+        if (!concept) {
+          demote.run(r.id);
+          continue;
+        }
+        repointSource.run(concept.id, r.id);
+        repointTarget.run(concept.id, r.id);
+        dropOrphanEdges.run(r.id, r.id);
+        try {
+          repointParent.run(concept.id, r.id);
+        } catch {
+          // parent_entity_id arrived in a later migration on some nodes
+        }
+        bump.run(r.mention_count ?? 1, concept.id);
+        remove.run(r.id);
+      }
+    },
+  },
+  {
+    version: 76,
+    description:
+      "PLAN-55 Phase 0 (2026-10-10): memory_suppressions, the owner's standing 'no'. " +
+      "Owner forget records the memory text hash, owner retire records the fact " +
+      "key/value hash, preference removal records the preference key; session " +
+      "extraction, preference extraction, curiosity findings, dream insight promotion " +
+      "and the ledger's pin() consult it before writing, so what the owner removed " +
+      "stays removed when the same input is re-processed. Also in this release but " +
+      "code-only (SQLite has no enum): canonical_facts.source gains 'owner' (trust " +
+      "tier 3; 'user_directive' is its alias) and canonical_facts.status gains " +
+      "'owner_retired', which only an owner-tier pin or unretire reactivates.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_suppressions (
+          id         TEXT PRIMARY KEY,
+          kind       TEXT NOT NULL,
+          hash       TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          reason     TEXT,
+          actor      TEXT NOT NULL DEFAULT 'owner',
+          text       TEXT
+        )
+      `);
+      // The unreleased first cut of v76 had no `text` column; a node that ran
+      // it gets the column here rather than through a v77.
+      addColumnIfMissing(db, "memory_suppressions", "text", "TEXT");
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_suppressions_kind_hash ` +
+          `ON memory_suppressions(kind, hash)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_memory_suppressions_kind ON memory_suppressions(kind)`,
+      );
+    },
+  },
+  {
+    version: 77,
+    description:
+      "PLAN-55 Phase 1 (2026-10-10): canonical_facts.scope ('global' | 'project:<name>' | " +
+      "'person:<name>', default 'global') decides where a fact is injected: project-scoped " +
+      "facts render only when the active workspace matches. canonical_facts.evidence_ref " +
+      "(nullable) is the session line ref or quote the correction capture, the owner's pin " +
+      "or the agent's memory_pin cited. Code-only in the same release: canonical_conflicts " +
+      "gains the 'pending_supersede' kind (an agent pin that would replace a tier >= 2 " +
+      "belief is held for the owner instead of written).",
+    up: (db: DatabaseSync) => {
+      const has = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'canonical_facts'`)
+        .get();
+      if (!has) {
+        return;
+      }
+      addColumnIfMissing(db, "canonical_facts", "scope", "TEXT NOT NULL DEFAULT 'global'");
+      addColumnIfMissing(db, "canonical_facts", "evidence_ref", "TEXT");
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_canonical_facts_scope ON canonical_facts(scope) ` +
+          `WHERE valid_until IS NULL`,
+      );
+    },
+  },
+  {
+    version: 78,
+    description:
+      "PLAN-55 Phase 2 (2026-10-11): canonical:changed propagation. chunk_supersessions " +
+      "(chunk_id, fact_key, stale_value) marks a memory chunk that states a value the " +
+      "ledger no longer holds for that key; search ranks it below current results and " +
+      "tags it [superseded], and a pin back to that value deletes the mark. " +
+      "dream_briefs.stale_fact and dream_insights.stale_fact (JSON, nullable) flag an " +
+      "anticipation brief or a dream insight that cites a superseded value or rests on " +
+      "forgotten evidence: a flagged brief is not surfaced and a flagged insight is not " +
+      "promoted. canonical_change_outbox records every ledger change in the writer's " +
+      "transaction; propagated_at is set once the consumers ran, and a reconcile pass " +
+      "replays rows left unset. It starts empty: changes made before this migration are " +
+      "not propagated retroactively. canonical_propagation_undo records what an owner " +
+      "retire or a supersede removed (a preference row, graph edges) so bringing the " +
+      "value back restores it.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS chunk_supersessions (
+          chunk_id      TEXT NOT NULL,
+          fact_key      TEXT NOT NULL,
+          stale_value   TEXT NOT NULL,
+          fact_id       TEXT,
+          current_value TEXT,
+          created_at    INTEGER NOT NULL,
+          PRIMARY KEY (chunk_id, fact_key, stale_value)
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_chunk_supersessions_key ` +
+          `ON chunk_supersessions(fact_key, stale_value)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS canonical_change_outbox (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          fact_id        TEXT NOT NULL,
+          key            TEXT NOT NULL,
+          event_json     TEXT NOT NULL,
+          created_at     INTEGER NOT NULL,
+          propagated_at  INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_canonical_change_outbox_pending ` +
+          `ON canonical_change_outbox(propagated_at, id)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS canonical_propagation_undo (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          fact_key    TEXT NOT NULL,
+          value       TEXT NOT NULL,
+          kind        TEXT NOT NULL,
+          payload     TEXT NOT NULL,
+          created_at  INTEGER NOT NULL,
+          undone_at   INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_canonical_propagation_undo_key ` +
+          `ON canonical_propagation_undo(fact_key, value, undone_at)`,
+      );
+      const hasTable = (name: string): boolean =>
+        Boolean(
+          db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name),
+        );
+      if (hasTable("dream_briefs")) {
+        addColumnIfMissing(db, "dream_briefs", "stale_fact", "TEXT");
+      }
+      if (hasTable("dream_insights")) {
+        addColumnIfMissing(db, "dream_insights", "stale_fact", "TEXT");
+      }
+    },
+  },
+  {
+    version: 79,
+    description:
+      "PLAN-59 Phase 0 (2026-10-28): evidence telemetry. retrieval_hits records the " +
+      "top-K of every owner memory search (chunk id, rank, fused score, per-channel " +
+      "ranks) under a keyed query digest, never the query text. surfacing_events " +
+      "records what the agent proactively surfaced (curiosity findings, proactive " +
+      "recall, dream briefs) and, separately, what the owner did about it; silence " +
+      "stays `unknown`. decision_traces (shadow mode only) records what a " +
+      "GCCRF-as-diagnostic routing would have decided next to the legacy decision. " +
+      "evidence_meta holds the node-local HMAC key for the digests. All tables start " +
+      "empty; nothing is backfilled and no read path consumes them yet.",
+    up: (db: DatabaseSync) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS retrieval_hits (
+          id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+          query_id           TEXT NOT NULL,
+          query_digest       TEXT NOT NULL,
+          session_digest     TEXT,
+          caller             TEXT,
+          query_len          INTEGER NOT NULL,
+          chunk_id           TEXT NOT NULL,
+          rank               INTEGER NOT NULL,
+          fused_score        REAL,
+          channel_ranks_json TEXT,
+          injected           INTEGER,
+          cited              INTEGER,
+          embedding_model    TEXT,
+          scoring_version    TEXT,
+          created_at         INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_retrieval_hits_created ON retrieval_hits(created_at)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_retrieval_hits_chunk ` +
+          `ON retrieval_hits(chunk_id, created_at)`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_retrieval_hits_query ON retrieval_hits(query_id)`);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS surfacing_events (
+          id               INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id         TEXT NOT NULL UNIQUE,
+          kind             TEXT NOT NULL,
+          ref_id           TEXT,
+          arm              TEXT NOT NULL DEFAULT 'legacy',
+          opportunity_id   TEXT,
+          session_digest   TEXT,
+          stage            TEXT NOT NULL,
+          outcome          TEXT,
+          label_provenance TEXT,
+          cost_usd         REAL,
+          created_at       INTEGER NOT NULL,
+          outcome_at       INTEGER
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_surfacing_events_created ON surfacing_events(created_at)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_surfacing_events_ref ` +
+          `ON surfacing_events(ref_id, stage, created_at)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS decision_traces (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind            TEXT NOT NULL,
+          legacy_json     TEXT NOT NULL,
+          proposed_json   TEXT NOT NULL,
+          diverged        INTEGER NOT NULL,
+          scoring_version TEXT,
+          created_at      INTEGER NOT NULL
+        )
+      `);
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_decision_traces_created ON decision_traces(created_at)`,
+      );
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS evidence_meta (
+          key   TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `);
+      db.prepare(`INSERT OR IGNORE INTO evidence_meta (key, value) VALUES ('schema_note', ?)`).run(
+        "PLAN-59 Phase 0: digests are HMAC-SHA256 under digest_key; query text is never stored",
+      );
+    },
+  },
+  {
+    version: 80,
+    description:
+      "PLAN-59 Phase 2 shadow stage (2026-10-29): surfacing trial assignment details. " +
+      "surfacing_events.details_json (nullable JSON) carries the randomisation block id " +
+      "and the carry-over flag of an `assigned` row; an index on opportunity_id lets the " +
+      "shadow crossover marker find the delivery an opportunity produced. No row is " +
+      "rewritten; existing rows read as details NULL.",
+    up: (db) => {
+      addColumnIfMissing(db, "surfacing_events", "details_json", "TEXT");
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_surfacing_events_opportunity ` +
+          `ON surfacing_events(opportunity_id, stage, created_at)`,
+      );
+    },
+  },
+];
+
+/**
+ * The highest migration version defined here — i.e. the schema version a
+ * fully-migrated database should report. Derived from the array so it can
+ * never drift from a hardcoded literal (as `bitterbot doctor` once did).
+ */
+export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
+
+/**
+ * Idempotently add a column. PRAGMA table_info returns the live columns
+ * so we can no-op when a migration runs more than once (or against a DB
+ * that already has the column from a previous schema).
+ */
+function addColumnIfMissing(db: DatabaseSync, table: string, column: string, ddl: string): void {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  const exists = rows.some((r) => r.name === column);
+  if (exists) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+}
+
+/**
+ * Read the current schema version from the meta table.
+ */
+function getSchemaVersion(db: DatabaseSync): number {
+  try {
+    const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get(SCHEMA_VERSION_KEY) as
+      | { value: string }
+      | undefined;
+    if (!row?.value) {
+      return 0;
+    }
+    const version = parseInt(row.value, 10);
+    return Number.isFinite(version) ? version : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Write the current schema version to the meta table.
+ */
+function setSchemaVersion(db: DatabaseSync, version: number): void {
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+  ).run(SCHEMA_VERSION_KEY, String(version));
+}
+
+/**
+ * Run all pending migrations. Safe to call repeatedly — each migration
+ * only runs once per database.
+ */
+export function runMigrations(
+  db: DatabaseSync,
+  migrations: Migration[] = MIGRATIONS,
+): { from: number; to: number; ran: number } {
+  const current = getSchemaVersion(db);
+  const pending = migrations.filter((m) => m.version > current);
+
+  if (pending.length === 0) {
+    return { from: current, to: current, ran: 0 };
+  }
+
+  pending.sort((a, b) => a.version - b.version);
+
+  let applied = current;
+  for (const migration of pending) {
+    try {
+      log.debug(`running migration v${migration.version}: ${migration.description}`);
+      // Run each migration and its version bump atomically. SQLite supports
+      // transactional DDL, so on any failure the rollback leaves the schema
+      // exactly as it was — no half-applied migration that a later run would
+      // either skip (silent corruption) or choke on. None of the migrations use
+      // statements that can't run in a transaction (VACUUM/journal_mode/ATTACH).
+      db.exec("BEGIN");
+      try {
+        migration.up(db);
+        setSchemaVersion(db, migration.version);
+        db.exec("COMMIT");
+      } catch (inner) {
+        db.exec("ROLLBACK");
+        throw inner;
+      }
+      applied = migration.version;
+    } catch (err) {
+      // A failed migration is serious — surface it loudly and stop so later
+      // migrations don't run against an unexpected schema.
+      log.error(`migration v${migration.version} failed and was rolled back: ${String(err)}`);
+      break;
+    }
+  }
+
+  const result = { from: current, to: applied, ran: applied - current };
+  if (result.ran > 0) {
+    log.debug(`migrations complete`, result);
+  }
+  return result;
+}

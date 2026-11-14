@@ -1,0 +1,2649 @@
+---
+title: "Configuration Reference"
+description: "Complete field-by-field reference for ~/.bitterbot/bitterbot.json"
+---
+
+# Configuration Reference
+
+Every field available in `~/.bitterbot/bitterbot.json`. For a task-oriented overview, see [Configuration](/gateway/configuration).
+
+Config format is **JSON5** (comments + trailing commas allowed). All fields are optional — Bitterbot uses safe defaults when omitted.
+
+---
+
+## Channels
+
+Each channel starts automatically when its config section exists (unless `enabled: false`).
+
+### DM and group access
+
+All channels support DM policies and group policies:
+
+| DM policy           | Behavior                                                        |
+| ------------------- | --------------------------------------------------------------- |
+| `pairing` (default) | Unknown senders get a one-time pairing code; owner must approve |
+| `allowlist`         | Only senders in `allowFrom` (or paired allow store)             |
+| `open`              | Allow all inbound DMs (requires `allowFrom: ["*"]`)             |
+| `disabled`          | Ignore all inbound DMs                                          |
+
+| Group policy          | Behavior                                               |
+| --------------------- | ------------------------------------------------------ |
+| `allowlist` (default) | Only groups matching the configured allowlist          |
+| `open`                | Bypass group allowlists (mention-gating still applies) |
+| `disabled`            | Block all group/room messages                          |
+
+<Note>
+`channels.defaults.groupPolicy` sets the default when a provider's `groupPolicy` is unset.
+Pairing codes expire after 1 hour. Pending DM pairing requests are capped at **3 per channel**.
+Slack/Discord have a special fallback: if their provider section is missing entirely, runtime group policy can resolve to `open` (with a startup warning).
+</Note>
+
+### WhatsApp
+
+WhatsApp runs through the gateway's web channel (Baileys Web). It starts automatically when a linked session exists.
+
+```json5
+{
+  channels: {
+    whatsapp: {
+      dmPolicy: "pairing", // pairing | allowlist | open | disabled
+      allowFrom: ["+15555550123", "+447700900123"],
+      textChunkLimit: 4000,
+      chunkMode: "length", // length | newline
+      mediaMaxMb: 50,
+      sendReadReceipts: true, // blue ticks (false in self-chat mode)
+      groups: {
+        "*": { requireMention: true },
+      },
+      groupPolicy: "allowlist",
+      groupAllowFrom: ["+15551234567"],
+    },
+  },
+  web: {
+    enabled: true,
+    heartbeatSeconds: 60,
+    reconnect: {
+      initialMs: 2000,
+      maxMs: 120000,
+      factor: 1.4,
+      jitter: 0.2,
+      maxAttempts: 0,
+    },
+  },
+}
+```
+
+<Accordion title="Multi-account WhatsApp">
+
+```json5
+{
+  channels: {
+    whatsapp: {
+      accounts: {
+        default: {},
+        personal: {},
+        biz: {
+          // authDir: "~/.bitterbot/credentials/whatsapp/biz",
+        },
+      },
+    },
+  },
+}
+```
+
+- Outbound commands default to account `default` if present; otherwise the first configured account id (sorted).
+- Legacy single-account Baileys auth dir is migrated by `bitterbot doctor` into `whatsapp/default`.
+- Per-account overrides: `channels.whatsapp.accounts.<id>.sendReadReceipts`, `channels.whatsapp.accounts.<id>.dmPolicy`, `channels.whatsapp.accounts.<id>.allowFrom`.
+
+</Accordion>
+
+### Telegram
+
+```json5
+{
+  channels: {
+    telegram: {
+      enabled: true,
+      botToken: "your-bot-token",
+      dmPolicy: "pairing",
+      allowFrom: ["tg:123456789"],
+      groups: {
+        "*": { requireMention: true },
+        "-1001234567890": {
+          allowFrom: ["@admin"],
+          systemPrompt: "Keep answers brief.",
+          topics: {
+            "99": {
+              requireMention: false,
+              skills: ["search"],
+              systemPrompt: "Stay on topic.",
+            },
+          },
+        },
+      },
+      customCommands: [
+        { command: "backup", description: "Git backup" },
+        { command: "generate", description: "Create an image" },
+      ],
+      historyLimit: 50,
+      replyToMode: "first", // off | first | all
+      linkPreview: true,
+      streamMode: "partial", // off | partial | block
+      draftChunk: {
+        minChars: 200,
+        maxChars: 800,
+        breakPreference: "paragraph", // paragraph | newline | sentence
+      },
+      actions: { reactions: true, sendMessage: true },
+      reactionNotifications: "own", // off | own | all
+      mediaMaxMb: 5,
+      retry: {
+        attempts: 3,
+        minDelayMs: 400,
+        maxDelayMs: 30000,
+        jitter: 0.1,
+      },
+      network: { autoSelectFamily: false },
+      proxy: "socks5://localhost:9050",
+      webhookUrl: "https://example.com/telegram-webhook",
+      webhookSecret: "secret",
+      webhookPath: "/telegram-webhook",
+    },
+  },
+}
+```
+
+- Bot token: `channels.telegram.botToken` or `channels.telegram.tokenFile`, with `TELEGRAM_BOT_TOKEN` as fallback for the default account.
+- `configWrites: false` blocks Telegram-initiated config writes (supergroup ID migrations, `/config set|unset`).
+- Telegram stream previews use `sendMessage` + `editMessageText` (works in direct and group chats).
+- Retry policy: see [Retry policy](/concepts/retry).
+
+### Discord
+
+```json5
+{
+  channels: {
+    discord: {
+      enabled: true,
+      token: "your-bot-token",
+      mediaMaxMb: 8,
+      allowBots: false,
+      actions: {
+        reactions: true,
+        stickers: true,
+        polls: true,
+        permissions: true,
+        messages: true,
+        threads: true,
+        pins: true,
+        search: true,
+        memberInfo: true,
+        roleInfo: true,
+        roles: false,
+        channelInfo: true,
+        voiceStatus: true,
+        events: true,
+        moderation: false,
+      },
+      replyToMode: "off", // off | first | all
+      dmPolicy: "pairing",
+      allowFrom: ["1234567890", "steipete"],
+      dm: { enabled: true, groupEnabled: false, groupChannels: [.bitterbot-dm"] },
+      guilds: {
+        "123456789012345678": {
+          slug: "friends-of-bitterbot",
+          requireMention: false,
+          reactionNotifications: "own",
+          users: ["987654321098765432"],
+          channels: {
+            general: { allow: true },
+            help: {
+              allow: true,
+              requireMention: true,
+              users: ["987654321098765432"],
+              skills: ["docs"],
+              systemPrompt: "Short answers only.",
+            },
+          },
+        },
+      },
+      historyLimit: 20,
+      textChunkLimit: 2000,
+      chunkMode: "length", // length | newline
+      maxLinesPerMessage: 17,
+      ui: {
+        components: {
+          accentColor: "#5865F2",
+        },
+      },
+      retry: {
+        attempts: 3,
+        minDelayMs: 500,
+        maxDelayMs: 30000,
+        jitter: 0.1,
+      },
+    },
+  },
+}
+```
+
+- Token: `channels.discord.token`, with `DISCORD_BOT_TOKEN` as fallback for the default account.
+- Use `user:<id>` (DM) or `channel:<id>` (guild channel) for delivery targets; bare numeric IDs are rejected.
+- Guild slugs are lowercase with spaces replaced by `-`; channel keys use the slugged name (no `#`). Prefer guild IDs.
+- Bot-authored messages are ignored by default. `allowBots: true` enables them (own messages still filtered).
+- `maxLinesPerMessage` (default 17) splits tall messages even when under 2000 chars.
+- `channels.discord.ui.components.accentColor` sets the accent color for Discord components v2 containers.
+
+**Reaction notification modes:** `off` (none), `own` (bot's messages, default), `all` (all messages), `allowlist` (from `guilds.<id>.users` on all messages).
+
+### Slack
+
+```json5
+{
+  channels: {
+    slack: {
+      enabled: true,
+      botToken: "xoxb-...",
+      appToken: "xapp-...",
+      dmPolicy: "pairing",
+      allowFrom: ["U123", "U456", "*"],
+      dm: { enabled: true, groupEnabled: false, groupChannels: ["G123"] },
+      channels: {
+        C123: { allow: true, requireMention: true, allowBots: false },
+        "#general": {
+          allow: true,
+          requireMention: true,
+          allowBots: false,
+          users: ["U123"],
+          skills: ["docs"],
+          systemPrompt: "Short answers only.",
+        },
+      },
+      historyLimit: 50,
+      allowBots: false,
+      reactionNotifications: "own",
+      reactionAllowlist: ["U123"],
+      replyToMode: "off", // off | first | all
+      thread: {
+        historyScope: "thread", // thread | channel
+        inheritParent: false,
+      },
+      actions: {
+        reactions: true,
+        messages: true,
+        pins: true,
+        memberInfo: true,
+        emojiList: true,
+      },
+      slashCommand: {
+        enabled: true,
+        name: "bitterbot",
+        sessionPrefix: "slack:slash",
+        ephemeral: true,
+      },
+      textChunkLimit: 4000,
+      chunkMode: "length",
+      mediaMaxMb: 20,
+    },
+  },
+}
+```
+
+- **Socket mode** requires both `botToken` and `appToken` (`SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` for default account env fallback).
+- **HTTP mode** requires `botToken` plus `signingSecret` (at root or per-account).
+- `configWrites: false` blocks Slack-initiated config writes.
+- Use `user:<id>` (DM) or `channel:<id>` for delivery targets.
+
+**Reaction notification modes:** `off`, `own` (default), `all`, `allowlist` (from `reactionAllowlist`).
+
+**Thread session isolation:** `thread.historyScope` is per-thread (default) or shared across channel. `thread.inheritParent` copies parent channel transcript to new threads.
+
+| Action group | Default | Notes                  |
+| ------------ | ------- | ---------------------- |
+| reactions    | enabled | React + list reactions |
+| messages     | enabled | Read/send/edit/delete  |
+| pins         | enabled | Pin/unpin/list         |
+| memberInfo   | enabled | Member info            |
+| emojiList    | enabled | Custom emoji list      |
+
+### Signal
+
+```json5
+{
+  channels: {
+    signal: {
+      reactionNotifications: "own", // off | own | all | allowlist
+      reactionAllowlist: ["+15551234567", "uuid:123e4567-e89b-12d3-a456-426614174000"],
+      historyLimit: 50,
+    },
+  },
+}
+```
+
+**Reaction notification modes:** `off`, `own` (default), `all`, `allowlist` (from `reactionAllowlist`).
+
+### iMessage
+
+Bitterbot spawns `imsg rpc` (JSON-RPC over stdio). No daemon or port required.
+
+```json5
+{
+  channels: {
+    imessage: {
+      enabled: true,
+      cliPath: "imsg",
+      dbPath: "~/Library/Messages/chat.db",
+      remoteHost: "user@gateway-host",
+      dmPolicy: "pairing",
+      allowFrom: ["+15555550123", "user@example.com", "chat_id:123"],
+      historyLimit: 50,
+      includeAttachments: false,
+      mediaMaxMb: 16,
+      service: "auto",
+      region: "US",
+    },
+  },
+}
+```
+
+- Requires Full Disk Access to the Messages DB.
+- Prefer `chat_id:<id>` targets. Use `imsg chats --limit 20` to list chats.
+- `cliPath` can point to an SSH wrapper; set `remoteHost` for SCP attachment fetching.
+
+<Accordion title="iMessage SSH wrapper example">
+
+```bash
+#!/usr/bin/env bash
+exec ssh -T gateway-host imsg "$@"
+```
+
+</Accordion>
+
+### Multi-account (all channels)
+
+Run multiple accounts per channel (each with its own `accountId`):
+
+```json5
+{
+  channels: {
+    telegram: {
+      accounts: {
+        default: {
+          name: "Primary bot",
+          botToken: "123456:ABC...",
+        },
+        alerts: {
+          name: "Alerts bot",
+          botToken: "987654:XYZ...",
+        },
+      },
+    },
+  },
+}
+```
+
+- `default` is used when `accountId` is omitted (CLI + routing).
+- Env tokens only apply to the **default** account.
+- Base channel settings apply to all accounts unless overridden per account.
+- Use `bindings[].match.accountId` to route each account to a different agent.
+
+### Group chat mention gating
+
+Group messages default to **require mention** (metadata mention or regex patterns). Applies to WhatsApp, Telegram, Discord, and iMessage group chats.
+
+**Mention types:**
+
+- **Metadata mentions**: Native platform @-mentions. Ignored in WhatsApp self-chat mode.
+- **Text patterns**: Regex patterns in `agents.list[].groupChat.mentionPatterns`. Always checked.
+- Mention gating is enforced only when detection is possible (native mentions or at least one pattern).
+
+```json5
+{
+  messages: {
+    groupChat: { historyLimit: 50 },
+  },
+  agents: {
+    list: [{ id: "main", groupChat: { mentionPatterns: ["@bitterbot", "bitterbot"] } }],
+  },
+}
+```
+
+`messages.groupChat.historyLimit` sets the global default. Channels can override with `channels.<channel>.historyLimit` (or per-account). Set `0` to disable.
+
+#### DM history limits
+
+```json5
+{
+  channels: {
+    telegram: {
+      dmHistoryLimit: 30,
+      dms: {
+        "123456789": { historyLimit: 50 },
+      },
+    },
+  },
+}
+```
+
+Resolution: per-DM override → provider default → no limit (all retained).
+
+Supported: `telegram`, `whatsapp`, `discord`, `slack`, `signal`, `imessage`.
+
+#### Self-chat mode
+
+Include your own number in `allowFrom` to enable self-chat mode (ignores native @-mentions, only responds to text patterns):
+
+```json5
+{
+  channels: {
+    whatsapp: {
+      allowFrom: ["+15555550123"],
+      groups: { "*": { requireMention: true } },
+    },
+  },
+  agents: {
+    list: [
+      {
+        id: "main",
+        groupChat: { mentionPatterns: ["reisponde", "@bitterbot"] },
+      },
+    ],
+  },
+}
+```
+
+### Commands (chat command handling)
+
+```json5
+{
+  commands: {
+    native: "auto", // register native commands when supported
+    text: true, // parse /commands in chat messages
+    bash: false, // allow ! (alias: /bash)
+    bashForegroundMs: 2000,
+    config: false, // allow /config
+    debug: false, // allow /debug
+    restart: false, // allow /restart + gateway restart tool
+    allowFrom: {
+      "*": ["user1"],
+      discord: ["user:123"],
+    },
+    useAccessGroups: true,
+  },
+}
+```
+
+<Accordion title="Command details">
+
+- Text commands must be **standalone** messages with leading `/`.
+- `native: "auto"` turns on native commands for Discord/Telegram, leaves Slack off.
+- Override per channel: `channels.discord.commands.native` (bool or `"auto"`). `false` clears previously registered commands.
+- `channels.telegram.customCommands` adds extra Telegram bot menu entries.
+- `bash: true` enables `! <cmd>` for host shell. Requires `tools.elevated.enabled` and sender in `tools.elevated.allowFrom.<channel>`.
+- `config: true` enables `/config` (reads/writes `bitterbot.json`).
+- `channels.<provider>.configWrites` gates config mutations per channel (default: true).
+- `allowFrom` is per-provider. When set, it is the **only** authorization source (channel allowlists/pairing and `useAccessGroups` are ignored).
+- `useAccessGroups: false` allows commands to bypass access-group policies when `allowFrom` is not set.
+
+</Accordion>
+
+---
+
+## Agent defaults
+
+### `agents.defaults.workspace`
+
+Default: `~/.bitterbot/workspace`.
+
+```json5
+{
+  agents: { defaults: { workspace: "~/.bitterbot/workspace" } },
+}
+```
+
+### `agents.defaults.repoRoot`
+
+Optional repository root shown in the system prompt's Runtime line. If unset, Bitterbot auto-detects by walking upward from the workspace.
+
+```json5
+{
+  agents: { defaults: { repoRoot: "~/Projects/bitterbot" } },
+}
+```
+
+### `agents.defaults.skipBootstrap`
+
+Disables automatic creation of workspace bootstrap files (`GENOME.md`, `PROTOCOLS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, `BOOTSTRAP.md`).
+
+```json5
+{
+  agents: { defaults: { skipBootstrap: true } },
+}
+```
+
+### `agents.defaults.bootstrapMaxChars`
+
+Max characters per workspace bootstrap file before truncation. Default: `20000`.
+
+```json5
+{
+  agents: { defaults: { bootstrapMaxChars: 20000 } },
+}
+```
+
+### `agents.defaults.bootstrapTotalMaxChars`
+
+Max total characters injected across all workspace bootstrap files. Default: `24000`.
+
+```json5
+{
+  agents: { defaults: { bootstrapTotalMaxChars: 24000 } },
+}
+```
+
+### `agents.defaults.userTimezone`
+
+Timezone for system prompt context (not message timestamps). Falls back to host timezone.
+
+```json5
+{
+  agents: { defaults: { userTimezone: "America/Chicago" } },
+}
+```
+
+### `agents.defaults.timeFormat`
+
+Time format in system prompt. Default: `auto` (OS preference).
+
+```json5
+{
+  agents: { defaults: { timeFormat: "auto" } }, // auto | 12 | 24
+}
+```
+
+### `agents.defaults.model`
+
+```json5
+{
+  agents: {
+    defaults: {
+      models: {
+        "anthropic/claude-opus-4-6": { alias: "opus" },
+        "minimax/MiniMax-M2.1": { alias: "minimax" },
+      },
+      model: {
+        primary: "anthropic/claude-opus-4-6",
+        fallbacks: ["minimax/MiniMax-M2.1"],
+      },
+      imageModel: {
+        primary: "openrouter/qwen/qwen-2.5-vl-72b-instruct:free",
+        fallbacks: ["openrouter/google/gemini-2.0-flash-vision:free"],
+      },
+      thinkingDefault: "low",
+      verboseDefault: "off",
+      elevatedDefault: "on",
+      timeoutSeconds: 600,
+      mediaMaxMb: 5,
+      contextTokens: 200000,
+      maxConcurrent: 3,
+    },
+  },
+}
+```
+
+- `model.primary`: format `provider/model` (e.g. `anthropic/claude-opus-4-6`). If you omit the provider, Bitterbot assumes `anthropic` (deprecated).
+- `models`: the configured model catalog. Each entry can include `alias` (shortcut) and `params` (provider-specific: `temperature`, `maxTokens`). It is not a restriction: setting a default registers it here without forbidding other models.
+- `restrictModels` (default `false`): `true` enforces `models` as the allowlist for `/model` and session overrides (the current default is always allowed).
+- `imageModel`: only used if the primary model lacks image input.
+- `maxConcurrent`: max parallel agent runs across sessions (each session still serialized). Default: 1.
+
+**Built-in alias shorthands** (only apply when the model is in `agents.defaults.models`):
+
+| Alias          | Model                           |
+| -------------- | ------------------------------- |
+| `opus`         | `anthropic/claude-opus-4-6`     |
+| `sonnet`       | `anthropic/claude-sonnet-4-5`   |
+| `gpt`          | `openai/gpt-5.2`                |
+| `gpt-mini`     | `openai/gpt-5-mini`             |
+| `gemini`       | `google/gemini-3-pro-preview`   |
+| `gemini-flash` | `google/gemini-3-flash-preview` |
+
+Your configured aliases always win over defaults.
+
+Z.AI GLM-4.x models automatically enable thinking mode unless you set `--thinking off` or define `agents.defaults.models["zai/<model>"].params.thinking` yourself.
+
+### `agents.defaults.cliBackends`
+
+Optional CLI backends for text-only fallback runs (no tool calls). Useful as a backup when API providers fail.
+
+```json5
+{
+  agents: {
+    defaults: {
+      cliBackends: {
+        "claude-cli": {
+          command: "/opt/homebrew/bin/claude",
+        },
+        "my-cli": {
+          command: "my-cli",
+          args: ["--json"],
+          output: "json",
+          modelArg: "--model",
+          sessionArg: "--session",
+          sessionMode: "existing",
+          systemPromptArg: "--system",
+          systemPromptWhen: "first",
+          imageArg: "--image",
+          imageMode: "repeat",
+        },
+      },
+    },
+  },
+}
+```
+
+- CLI backends are text-first; tools are always disabled.
+- Sessions supported when `sessionArg` is set.
+- Image pass-through supported when `imageArg` accepts file paths.
+
+### `agents.defaults.heartbeat`
+
+Periodic heartbeat runs.
+
+```json5
+{
+  agents: {
+    defaults: {
+      heartbeat: {
+        every: "30m", // 0m disables
+        model: "openai/gpt-5.2-mini",
+        includeReasoning: false,
+        session: "main",
+        to: "+15555550123",
+        target: "last", // last | whatsapp | telegram | discord | ... | none
+        prompt: "Read HEARTBEAT.md if it exists...",
+        ackMaxChars: 300,
+      },
+    },
+  },
+}
+```
+
+- `every`: duration string (ms/s/m/h). Default: `30m`.
+- Per-agent: set `agents.list[].heartbeat`. When any agent defines `heartbeat`, **only those agents** run heartbeats.
+- Heartbeats run full agent turns — shorter intervals burn more tokens.
+
+### `agents.defaults.compaction`
+
+```json5
+{
+  agents: {
+    defaults: {
+      compaction: {
+        mode: "default", // "safeguard" is accepted, has no effect, and warns at load
+        policy: "summary", // summary | offload (PLAN-52A; offload is flagged until its evaluation passes)
+        offload: {
+          toolOutputStubs: true, // stub old tool outputs mid-turn; full text stays reachable via recall_range
+          recallCrossSession: "off", // off | owner: may recall_range read other sessions of this agent?
+          triggerTurnEndFraction: 0.55, // between turns: horizon cut when the prompt exceeds this share of the window
+          triggerTurnStartFraction: 0.7, // safety net before the first model call
+          triggerMidTurnFraction: 0.8, // before each model call: stub older tool outputs
+          targetFraction: 0.35, // window share after a horizon cut
+          midTurnTargetFraction: 0.5, // window share after mid-turn stubs
+          minKeepUserTurns: 2, // complete real turns always kept
+          toolOutputStubMinTokens: 1000, // smaller tool outputs are never stubbed
+          spareRecentToolResults: 2, // newest tool outputs are never stubbed
+          elideHeartbeats: true, // drop bare HEARTBEAT_OK pairs
+          ledgerBudgetTokens: 1200,
+          minElidedTokens: 2000, // a horizon cut that frees less than this is skipped (overflow/manual excepted)
+          summary: "always", // off | idle | always: cheap-model summary appended to the ledger
+          summaryModel: "anthropic/claude-haiku-4-5",
+          proactiveRecall: true,
+          recallBudgetUsdPerDay: 1.0,
+        },
+        reserveTokensFloor: 24000,
+        memoryFlush: {
+          enabled: true,
+          softThresholdTokens: 6000,
+          systemPrompt: "Session nearing compaction. Store durable memories now.",
+          prompt: "Write any lasting notes to memory/YYYY-MM-DD.md; reply with NO_REPLY if nothing to store.",
+        },
+      },
+    },
+  },
+}
+```
+
+- `mode`: `default` is the only live mode. `safeguard` is still accepted so old configs parse, has no effect, warns at load and will be removed next release (`bitterbot doctor --fix` removes it). See [Compaction](/concepts/compaction).
+- `policy`: `summary` (LLM summary, the default) or `offload` (deterministic context offload with a transcript ledger and the recall tools; under `offload` the `recall_range` tool is always hot). Under `offload` the horizon cut replaces the LLM summary as the main compaction mechanism (see [Compaction](/concepts/compaction)).
+- `offload.toolOutputStubs` (default `true`, independent of `policy`): when a turn passes the mid-turn trigger, the oldest tool outputs are replaced by a stub naming the tool call id; the transcript keeps the text and [recall_range](/tools/recall-range) returns it. Stubs persist across turns and restarts.
+- `offload.recallCrossSession`: `off` (default) keeps [recall_range](/tools/recall-range) on the current conversation; `owner` lets owner senders read other sessions of this agent.
+- `offload.*` trigger and target fractions, `minKeepUserTurns`, stub thresholds, `elideHeartbeats`, `ledgerBudgetTokens`: parameters of the offload planner (`src/agents/runtime/compaction/`). Targets must sit below their triggers; the planner clamps them otherwise. `summary` (`always` by default: a short cheap-model summary of the elided range is appended to the ledger; `idle` skips it during overflow recovery; `off` writes the ledger alone) and `summaryModel` select that summary. `proactiveRecall` (default `true`): once part of a conversation has been offloaded, each new user message is searched against the offloaded dialogue and up to three matching excerpts are placed in front of it (no model call; skipped for heartbeats). `elideHeartbeats` (default `true`): at the offload trigger, bare heartbeat prompt-and-acknowledgement pairs are dropped from the window (they stay in the transcript). A heartbeat prompt that carried queued system events, a heartbeat turn that ran tools, and the turn that just ran are never dropped. `recallBudgetUsdPerDay` (default `1.0`): once the node's `deep_recall` spend for the UTC day reaches the agent's limit, `deep_recall` answers with a notice pointing at `recall_range`, which is free. It applies to every scope and is not enforced when the usage ledger is off.
+- `memoryFlush`: silent agentic turn before auto-compaction to store durable memories. Skipped when workspace is read-only.
+- Per-agent override: `agents.list[].compaction` accepts `policy` and `offload`, layered field by field over these defaults, so one agent can run `offload` while the others stay on `summary`. The other compaction keys are global.
+
+### `agents.defaults.runtime`
+
+Accepted and ignored. Every agent runs the owned runtime under `src/agents/runtime/` (transcript store, agent loop, session layer, compaction policies, model registry); see [Agent runtime](/reference/agent-runtime). The key, and its per-agent form `agents.list[].runtime.engine`, remain in the schema so configs written while the pi engine existed still parse:
+
+```json5
+{
+  agents: {
+    defaults: {
+      runtime: { engine: "bitterbot" }, // "bitterbot" | "pi" (removed; ignored with a warning)
+    },
+  },
+}
+```
+
+A value of `"pi"` logs one warning per process (`the pi engine was removed; <agent or agents.defaults> runs the owned runtime`) and has no other effect. The session file format did not change with the engine, so transcripts written by either engine are read the same way.
+
+### `agents.defaults.contextPruning`
+
+Accepted and has no effect. With `mode: "cache-ttl"` the runtime still appends a cache-TTL timestamp entry to the session, but nothing acts on that entry, so nothing is pruned: old tool outputs are handled by compaction (`compaction.offload.toolOutputStubs`, above). The key stays in the schema this release so existing configs parse, warns at load, and will be removed next release; `bitterbot doctor --fix` removes it. See [Session pruning](/concepts/session-pruning).
+
+### Block streaming
+
+```json5
+{
+  agents: {
+    defaults: {
+      blockStreamingDefault: "off", // on | off
+      blockStreamingBreak: "text_end", // text_end | message_end
+      blockStreamingChunk: { minChars: 800, maxChars: 1200 },
+      blockStreamingCoalesce: { idleMs: 1000 },
+      humanDelay: { mode: "natural" }, // off | natural | custom (use minMs/maxMs)
+    },
+  },
+}
+```
+
+- Non-Telegram channels require explicit `*.blockStreaming: true` to enable block replies.
+- Channel overrides: `channels.<channel>.blockStreamingCoalesce` (and per-account variants). Signal/Slack/Discord default `minChars: 1500`.
+- `humanDelay`: randomized pause between block replies. `natural` = 800–2500ms. Per-agent override: `agents.list[].humanDelay`.
+
+See [Streaming](/concepts/streaming) for behavior + chunking details.
+
+### Typing indicators
+
+```json5
+{
+  agents: {
+    defaults: {
+      typingMode: "instant", // never | instant | thinking | message
+      typingIntervalSeconds: 6,
+    },
+  },
+}
+```
+
+- Defaults: `instant` for direct chats/mentions, `message` for unmentioned group chats.
+- Per-session overrides: `session.typingMode`, `session.typingIntervalSeconds`.
+
+See [Typing Indicators](/concepts/typing-indicators).
+
+### `agents.defaults.sandbox`
+
+Optional **Docker sandboxing** for the embedded agent. See [Sandboxing](/gateway/sandboxing) for the full guide.
+
+```json5
+{
+  agents: {
+    defaults: {
+      sandbox: {
+        mode: "non-main", // off | non-main | all
+        scope: "agent", // session | agent | shared
+        workspaceAccess: "none", // none | ro | rw
+        workspaceRoot: "~/.bitterbot/sandboxes",
+        docker: {
+          image: .bitterbot-sandbox:bookworm-slim",
+          containerPrefix: .bitterbot-sbx-",
+          workdir: "/workspace",
+          readOnlyRoot: true,
+          tmpfs: ["/tmp", "/var/tmp", "/run"],
+          network: "none",
+          user: "1000:1000",
+          capDrop: ["ALL"],
+          env: { LANG: "C.UTF-8" },
+          setupCommand: "apt-get update && apt-get install -y git curl jq",
+          pidsLimit: 256,
+          memory: "1g",
+          memorySwap: "2g",
+          cpus: 1,
+          ulimits: {
+            nofile: { soft: 1024, hard: 2048 },
+            nproc: 256,
+          },
+          seccompProfile: "/path/to/seccomp.json",
+          apparmorProfile: .bitterbot-sandbox",
+          dns: ["1.1.1.1", "8.8.8.8"],
+          extraHosts: ["internal.service:10.0.0.5"],
+          binds: ["/home/user/source:/source:rw"],
+        },
+        browser: {
+          enabled: false,
+          image: .bitterbot-sandbox-browser:bookworm-slim",
+          cdpPort: 9222,
+          vncPort: 5900,
+          noVncPort: 6080,
+          headless: false,
+          enableNoVnc: true,
+          allowHostControl: false,
+          autoStart: true,
+          autoStartTimeoutMs: 12000,
+        },
+        prune: {
+          idleHours: 24,
+          maxAgeDays: 7,
+        },
+      },
+    },
+  },
+  tools: {
+    sandbox: {
+      tools: {
+        allow: [
+          "exec",
+          "process",
+          "read",
+          "write",
+          "edit",
+          "apply_patch",
+          "sessions_list",
+          "sessions_history",
+          "sessions_send",
+          "sessions_spawn",
+          "session_status",
+        ],
+        deny: ["browser", "canvas", "nodes", "cron", "discord", "gateway"],
+      },
+    },
+  },
+}
+```
+
+<Accordion title="Sandbox details">
+
+**Workspace access:**
+
+- `none`: per-scope sandbox workspace under `~/.bitterbot/sandboxes`
+- `ro`: sandbox workspace at `/workspace`, agent workspace mounted read-only at `/agent`
+- `rw`: agent workspace mounted read/write at `/workspace`
+
+**Scope:**
+
+- `session`: per-session container + workspace
+- `agent`: one container + workspace per agent (default)
+- `shared`: shared container and workspace (no cross-session isolation)
+
+**`setupCommand`** runs once after container creation (via `sh -lc`). Needs network egress, writable root, root user.
+
+**Containers default to `network: "none"`** — set to `"bridge"` if the agent needs outbound access.
+
+**Inbound attachments** are staged into `media/inbound/*` in the active workspace.
+
+**`docker.binds`** mounts additional host directories; global and per-agent binds are merged.
+
+**Sandboxed browser** (`sandbox.browser.enabled`): Chromium + CDP in a container. noVNC URL injected into system prompt. Does not require `browser.enabled` in main config.
+
+- `allowHostControl: false` (default) blocks sandboxed sessions from targeting the host browser.
+- `sandbox.browser.binds` mounts additional host directories into the sandbox browser container only. When set (including `[]`), it replaces `docker.binds` for the browser container.
+
+</Accordion>
+
+Build images:
+
+```bash
+scripts/sandbox-setup.sh           # main sandbox image
+scripts/sandbox-browser-setup.sh   # optional browser image
+```
+
+### `agents.list` (per-agent overrides)
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "main",
+        default: true,
+        name: "Main Agent",
+        workspace: "~/.bitterbot/workspace",
+        agentDir: "~/.bitterbot/agents/main/agent",
+        model: "anthropic/claude-opus-4-6", // or { primary, fallbacks }
+        identity: {
+          name: "Samantha",
+          theme: "helpful sloth",
+          emoji: "🦥",
+          avatar: "avatars/samantha.png",
+        },
+        groupChat: { mentionPatterns: ["@bitterbot"] },
+        sandbox: { mode: "off" },
+        subagents: { allowAgents: ["*"] },
+        tools: {
+          profile: "coding",
+          allow: ["browser"],
+          deny: ["canvas"],
+          elevated: { enabled: true },
+        },
+      },
+    ],
+  },
+}
+```
+
+- `id`: stable agent id (required).
+- `default`: when multiple are set, first wins (warning logged). If none set, first list entry is default.
+- `model`: string form overrides `primary` only; object form `{ primary, fallbacks }` overrides both (`[]` disables global fallbacks).
+- `identity.avatar`: workspace-relative path, `http(s)` URL, or `data:` URI.
+- `identity` derives defaults: `ackReaction` from `emoji`, `mentionPatterns` from `name`/`emoji`.
+- `subagents.allowAgents`: allowlist of agent ids for `sessions_spawn` (`["*"]` = any; default: same agent only).
+
+---
+
+## Multi-agent routing
+
+Run multiple isolated agents inside one Gateway. See [Multi-Agent](/concepts/multi-agent).
+
+```json5
+{
+  agents: {
+    list: [
+      { id: "home", default: true, workspace: "~/.bitterbot/workspace-home" },
+      { id: "work", workspace: "~/.bitterbot/workspace-work" },
+    ],
+  },
+  bindings: [
+    { agentId: "home", match: { channel: "whatsapp", accountId: "personal" } },
+    { agentId: "work", match: { channel: "whatsapp", accountId: "biz" } },
+  ],
+}
+```
+
+### Binding match fields
+
+- `match.channel` (required)
+- `match.accountId` (optional; `*` = any account; omitted = default account)
+- `match.peer` (optional; `{ kind: direct|group|channel, id }`)
+- `match.guildId` / `match.teamId` (optional; channel-specific)
+
+**Deterministic match order:**
+
+1. `match.peer`
+2. `match.guildId`
+3. `match.teamId`
+4. `match.accountId` (exact, no peer/guild/team)
+5. `match.accountId: "*"` (channel-wide)
+6. Default agent
+
+Within each tier, the first matching `bindings` entry wins.
+
+### Per-agent access profiles
+
+<Accordion title="Full access (no sandbox)">
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "personal",
+        workspace: "~/.bitterbot/workspace-personal",
+        sandbox: { mode: "off" },
+      },
+    ],
+  },
+}
+```
+
+</Accordion>
+
+<Accordion title="Read-only tools + workspace">
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "family",
+        workspace: "~/.bitterbot/workspace-family",
+        sandbox: { mode: "all", scope: "agent", workspaceAccess: "ro" },
+        tools: {
+          allow: [
+            "read",
+            "sessions_list",
+            "sessions_history",
+            "sessions_send",
+            "sessions_spawn",
+            "session_status",
+          ],
+          deny: ["write", "edit", "apply_patch", "exec", "process", "browser"],
+        },
+      },
+    ],
+  },
+}
+```
+
+</Accordion>
+
+<Accordion title="No filesystem access (messaging only)">
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "public",
+        workspace: "~/.bitterbot/workspace-public",
+        sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" },
+        tools: {
+          allow: [
+            "sessions_list",
+            "sessions_history",
+            "sessions_send",
+            "sessions_spawn",
+            "session_status",
+            "whatsapp",
+            "telegram",
+            "slack",
+            "discord",
+            "gateway",
+          ],
+          deny: [
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "exec",
+            "process",
+            "browser",
+            "canvas",
+            "nodes",
+            "cron",
+            "gateway",
+            "image",
+          ],
+        },
+      },
+    ],
+  },
+}
+```
+
+</Accordion>
+
+See [Multi-Agent Sandbox & Tools](/tools/multi-agent-sandbox-tools) for precedence details.
+
+---
+
+## Session
+
+```json5
+{
+  session: {
+    scope: "per-sender",
+    dmScope: "main", // main | per-peer | per-channel-peer | per-account-channel-peer
+    identityLinks: {
+      alice: ["telegram:123456789", "discord:987654321012345678"],
+    },
+    reset: {
+      mode: "daily", // daily | idle
+      atHour: 4,
+      idleMinutes: 60,
+    },
+    resetByType: {
+      thread: { mode: "daily", atHour: 4 },
+      direct: { mode: "idle", idleMinutes: 240 },
+      group: { mode: "idle", idleMinutes: 120 },
+    },
+    resetTriggers: ["/new", "/reset"],
+    store: "~/.bitterbot/agents/{agentId}/sessions/sessions.json",
+    maintenance: {
+      mode: "warn", // warn | enforce
+      pruneAfter: "30d",
+      maxEntries: 500,
+      rotateBytes: "10mb",
+    },
+    mainKey: "main", // legacy (runtime always uses "main")
+    memory: "on", // "off" = incognito: nothing from conversations is learned
+    agentToAgent: { maxPingPongTurns: 5 },
+    sendPolicy: {
+      rules: [{ action: "deny", match: { channel: "discord", chatType: "group" } }],
+      default: "allow",
+    },
+  },
+}
+```
+
+<Accordion title="Session field details">
+
+- **`dmScope`**: how DMs are grouped.
+  - `main`: all DMs share the main session.
+  - `per-peer`: isolate by sender id across channels.
+  - `per-channel-peer`: isolate per channel + sender (recommended for multi-user inboxes).
+  - `per-account-channel-peer`: isolate per account + channel + sender (recommended for multi-account).
+- **`identityLinks`**: map canonical ids to provider-prefixed peers for cross-channel session sharing.
+- **`reset`**: primary reset policy. `daily` resets at `atHour` local time; `idle` resets after `idleMinutes`. When both configured, whichever expires first wins.
+- **`resetByType`**: per-type overrides (`direct`, `group`, `thread`). Legacy `dm` accepted as alias for `direct`.
+- **`mainKey`**: legacy field. Runtime now always uses `"main"` for the main direct-chat bucket.
+- **`sendPolicy`**: match by `channel`, `chatType` (`direct|group|channel`, with legacy `dm` alias), `keyPrefix`, or `rawKeyPrefix`. First deny wins.
+- **`maintenance`**: `warn` warns the active session on eviction; `enforce` applies pruning and rotation.
+- **`memory`**: `"off"` keeps conversations out of memory: transcripts are not indexed, the session extractor does not read them, and corrections you state in chat are not captured (see [Your memory controls](/memory/controls)). Default `"on"`.
+
+</Accordion>
+
+---
+
+## Messages
+
+```json5
+{
+  messages: {
+    responsePrefix: "🤖", // or "auto"
+    ackReaction: "👀",
+    ackReactionScope: "group-mentions", // group-mentions | group-all | direct | all
+    removeAckAfterReply: false,
+    queue: {
+      mode: "collect", // steer | followup | collect | steer-backlog | steer+backlog | queue | interrupt
+      debounceMs: 1000,
+      cap: 20,
+      drop: "summarize", // old | new | summarize
+      byChannel: {
+        whatsapp: "collect",
+        telegram: "collect",
+      },
+    },
+    inbound: {
+      debounceMs: 2000, // 0 disables
+      byChannel: {
+        whatsapp: 5000,
+        slack: 1500,
+      },
+    },
+  },
+}
+```
+
+### Response prefix
+
+Per-channel/account overrides: `channels.<channel>.responsePrefix`, `channels.<channel>.accounts.<id>.responsePrefix`.
+
+Resolution (most specific wins): account → channel → global. `""` disables and stops cascade. `"auto"` derives `[{identity.name}]`.
+
+**Template variables:**
+
+| Variable          | Description            | Example                     |
+| ----------------- | ---------------------- | --------------------------- |
+| `{model}`         | Short model name       | `claude-opus-4-6`           |
+| `{modelFull}`     | Full model identifier  | `anthropic/claude-opus-4-6` |
+| `{provider}`      | Provider name          | `anthropic`                 |
+| `{thinkingLevel}` | Current thinking level | `high`, `low`, `off`        |
+| `{identity.name}` | Agent identity name    | (same as `"auto"`)          |
+
+Variables are case-insensitive. `{think}` is an alias for `{thinkingLevel}`.
+
+### Ack reaction
+
+- Defaults to active agent's `identity.emoji`, otherwise `"👀"`. Set `""` to disable.
+- Per-channel overrides: `channels.<channel>.ackReaction`, `channels.<channel>.accounts.<id>.ackReaction`.
+- Resolution order: account → channel → `messages.ackReaction` → identity fallback.
+- Scope: `group-mentions` (default), `group-all`, `direct`, `all`.
+- `removeAckAfterReply`: removes ack after reply (Slack/Discord/Telegram only).
+
+### Inbound debounce
+
+Batches rapid text-only messages from the same sender into a single agent turn. Media/attachments flush immediately. Control commands bypass debouncing.
+
+### TTS (text-to-speech)
+
+```json5
+{
+  messages: {
+    tts: {
+      auto: "always", // off | always | inbound | tagged
+      mode: "final", // final | all
+      provider: "elevenlabs",
+      summaryModel: "openai/gpt-4.1-mini",
+      modelOverrides: { enabled: true },
+      maxTextLength: 4000,
+      timeoutMs: 30000,
+      prefsPath: "~/.bitterbot/settings/tts.json",
+      elevenlabs: {
+        apiKey: "elevenlabs_api_key",
+        baseUrl: "https://api.elevenlabs.io",
+        voiceId: "voice_id",
+        modelId: "eleven_multilingual_v2",
+        seed: 42,
+        applyTextNormalization: "auto",
+        languageCode: "en",
+        voiceSettings: {
+          stability: 0.5,
+          similarityBoost: 0.75,
+          style: 0.0,
+          useSpeakerBoost: true,
+          speed: 1.0,
+        },
+      },
+      openai: {
+        apiKey: "openai_api_key",
+        model: "gpt-4o-mini-tts",
+        voice: "alloy",
+      },
+    },
+  },
+}
+```
+
+- `auto` controls auto-TTS. `/tts off|always|inbound|tagged` overrides per session.
+- `summaryModel` overrides `agents.defaults.model.primary` for auto-summary.
+- API keys fall back to `ELEVENLABS_API_KEY`/`XI_API_KEY` and `OPENAI_API_KEY`.
+
+---
+
+## Talk
+
+Defaults for Talk mode.
+
+```json5
+{
+  talk: {
+    voiceId: "elevenlabs_voice_id",
+    voiceAliases: {
+      Bitterbot: "EXAVITQu4vr4xnSDxMaL",
+      Roger: "CwhRBWXzGAHq8TQ4Fs17",
+    },
+    modelId: "eleven_v3",
+    outputFormat: "mp3_44100_128",
+    apiKey: "elevenlabs_api_key",
+    interruptOnSpeech: true,
+  },
+}
+```
+
+- Voice IDs fall back to `ELEVENLABS_VOICE_ID` or `SAG_VOICE_ID`.
+- `apiKey` falls back to `ELEVENLABS_API_KEY`.
+- `voiceAliases` lets Talk directives use friendly names.
+
+---
+
+## Tools
+
+### Tool profiles
+
+`tools.profile` sets a base allowlist before `tools.allow`/`tools.deny`:
+
+| Profile     | Includes                                                                                  |
+| ----------- | ----------------------------------------------------------------------------------------- |
+| `minimal`   | `session_status` only                                                                     |
+| `coding`    | `group:fs`, `group:runtime`, `group:sessions`, `group:memory`, `image`                    |
+| `messaging` | `group:messaging`, `sessions_list`, `sessions_history`, `sessions_send`, `session_status` |
+| `full`      | No restriction (same as unset)                                                            |
+
+### Tool groups
+
+| Group              | Tools                                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| `group:runtime`    | `exec`, `process` (`bash` is accepted as an alias for `exec`)                            |
+| `group:fs`         | `read`, `write`, `edit`, `apply_patch`                                                   |
+| `group:sessions`   | `sessions_list`, `sessions_history`, `sessions_send`, `sessions_spawn`, `session_status` |
+| `group:memory`     | `memory_search`, `memory_get`                                                            |
+| `group:web`        | `web_search`, `web_fetch`                                                                |
+| `group:ui`         | `browser`, `canvas`                                                                      |
+| `group:automation` | `cron`, `gateway`                                                                        |
+| `group:messaging`  | `message`                                                                                |
+| `group:nodes`      | `nodes`                                                                                  |
+| `group:bitterbot`  | All built-in tools (excludes provider plugins)                                           |
+
+### `tools.allow` / `tools.deny`
+
+Global tool allow/deny policy (deny wins). Case-insensitive, supports `*` wildcards. Applied even when Docker sandbox is off.
+
+```json5
+{
+  tools: { deny: ["browser", "canvas"] },
+}
+```
+
+### `tools.byProvider`
+
+Further restrict tools for specific providers or models. Order: base profile → provider profile → allow/deny.
+
+```json5
+{
+  tools: {
+    profile: "coding",
+    byProvider: {
+      google: { profile: "minimal" },
+      "openai/gpt-5.2": { allow: ["group:fs", "sessions_list"] },
+    },
+  },
+}
+```
+
+### `tools.elevated`
+
+Controls elevated (host) exec access:
+
+```json5
+{
+  tools: {
+    elevated: {
+      enabled: true,
+      allowFrom: {
+        whatsapp: ["+15555550123"],
+        discord: ["steipete", "1234567890123"],
+      },
+    },
+  },
+}
+```
+
+- Per-agent override (`agents.list[].tools.elevated`) can only further restrict.
+- `/elevated on|off|ask|full` stores state per session; inline directives apply to single message.
+- Elevated `exec` runs on the host, bypasses sandboxing.
+
+### `tools.exec`
+
+```json5
+{
+  tools: {
+    exec: {
+      backgroundMs: 10000,
+      timeoutSec: 1800,
+      cleanupMs: 1800000,
+      notifyOnExit: true,
+      notifyOnExitEmptySuccess: false,
+      applyPatch: {
+        enabled: false,
+        allowModels: ["gpt-5.2"],
+      },
+      // Pre-shell sanitizer rule opt-outs. Use sparingly — fail-closed is the point.
+      // Valid rule ids: no-null-byte, no-zero-width-unicode, no-non-ascii-binary-name,
+      // no-ifs-injection, no-equals-expansion, no-pipe-to-shell-from-net,
+      // no-process-substitution-exec, no-zsh-builtin-smuggling.
+      // Full reference: /tools/bash-command-sanitizer
+      commandRules: {
+        allow: [],
+      },
+    },
+  },
+}
+```
+
+### `tools.web`
+
+```json5
+{
+  tools: {
+    web: {
+      search: {
+        enabled: true,
+        apiKey: "brave_api_key", // or BRAVE_API_KEY env
+        maxResults: 5,
+        timeoutSeconds: 30,
+        cacheTtlMinutes: 15,
+      },
+      fetch: {
+        enabled: true,
+        maxChars: 50000,
+        maxCharsCap: 50000,
+        timeoutSeconds: 30,
+        cacheTtlMinutes: 15,
+        userAgent: "custom-ua",
+      },
+    },
+  },
+}
+```
+
+### `tools.media`
+
+Configures inbound media understanding (image/audio/video):
+
+```json5
+{
+  tools: {
+    media: {
+      concurrency: 2,
+      audio: {
+        enabled: true,
+        maxBytes: 20971520,
+        scope: {
+          default: "deny",
+          rules: [{ action: "allow", match: { chatType: "direct" } }],
+        },
+        models: [
+          { provider: "openai", model: "gpt-4o-mini-transcribe" },
+          { type: "cli", command: "whisper", args: ["--model", "base", "{{MediaPath}}"] },
+        ],
+      },
+      video: {
+        enabled: true,
+        maxBytes: 52428800,
+        models: [{ provider: "google", model: "gemini-3-flash-preview" }],
+      },
+    },
+  },
+}
+```
+
+<Accordion title="Media model entry fields">
+
+**Provider entry** (`type: "provider"` or omitted):
+
+- `provider`: API provider id (`openai`, `anthropic`, `google`/`gemini`, `groq`, etc.)
+- `model`: model id override
+- `profile` / `preferredProfile`: auth profile selection
+
+**CLI entry** (`type: "cli"`):
+
+- `command`: executable to run
+- `args`: templated args (supports `{{MediaPath}}`, `{{Prompt}}`, `{{MaxChars}}`, etc.)
+
+**Common fields:**
+
+- `capabilities`: optional list (`image`, `audio`, `video`). Defaults: `openai`/`anthropic`/`minimax` → image, `google` → image+audio+video, `groq` → audio.
+- `prompt`, `maxChars`, `maxBytes`, `timeoutSeconds`, `language`: per-entry overrides.
+- Failures fall back to the next entry.
+
+Provider auth follows standard order: auth profiles → env vars → `models.providers.*.apiKey`.
+
+</Accordion>
+
+### `tools.agentToAgent`
+
+```json5
+{
+  tools: {
+    agentToAgent: {
+      enabled: false,
+      allow: ["home", "work"],
+    },
+  },
+}
+```
+
+### `tools.sessions`
+
+Controls which sessions can be targeted by the session tools (`sessions_list`, `sessions_history`, `sessions_send`).
+
+Default: `tree` (current session + sessions spawned by it, such as subagents).
+
+```json5
+{
+  tools: {
+    sessions: {
+      // "self" | "tree" | "agent" | "all"
+      visibility: "tree",
+    },
+  },
+}
+```
+
+Notes:
+
+- `self`: only the current session key.
+- `tree`: current session + sessions spawned by the current session (subagents).
+- `agent`: any session belonging to the current agent id (can include other users if you run per-sender sessions under the same agent id).
+- `all`: any session. Cross-agent targeting still requires `tools.agentToAgent`.
+- Sandbox clamp: when the current session is sandboxed and `agents.defaults.sandbox.sessionToolsVisibility="spawned"`, visibility is forced to `tree` even if `tools.sessions.visibility="all"`.
+
+### `tools.subagents`
+
+```json5
+{
+  agents: {
+    defaults: {
+      subagents: {
+        model: "minimax/MiniMax-M2.1",
+        maxConcurrent: 1,
+        archiveAfterMinutes: 60,
+      },
+    },
+  },
+}
+```
+
+- `model`: default model for spawned sub-agents. If omitted, sub-agents inherit the caller's model.
+- Per-subagent tool policy: `tools.subagents.tools.allow` / `tools.subagents.tools.deny`.
+
+### `tools.wallet`
+
+USDC smart wallet on Base. The wallet is what lets the agent earn from
+published skills, pay paywalled APIs via x402, and claim management-node
+bounties. The wizard (`bitterbot configure --section wallet`) will
+collect the Coinbase Developer Platform (CDP) credentials and write them
+to the right places.
+
+```json5
+{
+  tools: {
+    wallet: {
+      enabled: true,
+      network: "base-sepolia", // base | base-sepolia (default: base-sepolia)
+      cdpApiKeyId: "00000000-0000-0000-0000-000000000000",
+      cdpApiKeySecret: "base64-ed25519-secret",
+      perTransactionCapUsd: 25,
+      dailySpendLimitUsd: 50,
+      sessionSpendCapUsd: 50,
+      walletStorePath: "~/.bitterbot/wallet",
+      onrampUrl: "https://onramp.bitterbot.ai", // Tier 1/3 — see below
+      stripe: {
+        enabled: false,
+        // secretKey: "sk_live_...",        // or STRIPE_SECRET_KEY
+        // publishableKey: "pk_live_...",   // or STRIPE_PUBLISHABLE_KEY
+      },
+      x402: {
+        enabled: false,
+        maxCostPerRequestUsd: 1,
+        // facilitatorUrl: "https://x402.example.com",
+      },
+    },
+  },
+}
+```
+
+| Field                       | Default               | Notes                                                                                                                                                             |
+| --------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                   | `true`                | When `false`, all `wallet.*` RPCs return an error.                                                                                                                |
+| `network`                   | `base-sepolia`        | `base` (mainnet) or `base-sepolia` (testnet). Switch to mainnet only after watching behavior.                                                                     |
+| `cdpApiKeyId`               | —                     | CDP API Key ID. Env fallback: `CDP_API_KEY_ID`.                                                                                                                   |
+| `cdpApiKeySecret`           | —                     | CDP API Key Secret (Ed25519 base64). Env fallback: `CDP_API_KEY_SECRET`.                                                                                          |
+| _(wallet secret)_           | env-only              | Must be set via env: `CDP_WALLET_SECRET`. The wizard writes it to `~/.bitterbot/.env`.                                                                            |
+| `perTransactionCapUsd`      | `25`                  | Cap on a single outbound transaction.                                                                                                                             |
+| `dailySpendLimitUsd`        | `50`                  | Rolling 24 h cap.                                                                                                                                                 |
+| `sessionSpendCapUsd`        | `50`                  | Cap per agent session.                                                                                                                                            |
+| `walletStorePath`           | `~/.bitterbot/wallet` | Directory for persisted smart-account metadata (not the signing key).                                                                                             |
+| `onrampUrl`                 | —                     | Tier 3 hosted onramp override. When unset and Stripe keys are also unset, Tier 1 defaults to `https://onramp.bitterbot.ai`. Env fallback: `BITTERBOT_ONRAMP_URL`. |
+| `stripe.enabled`            | `false`               | Tier 2 (BYO Stripe). Creates onramp sessions locally.                                                                                                             |
+| `stripe.secretKey`          | —                     | Env fallback: `STRIPE_SECRET_KEY`.                                                                                                                                |
+| `stripe.publishableKey`     | —                     | Env fallback: `STRIPE_PUBLISHABLE_KEY`.                                                                                                                           |
+| `x402.enabled`              | `false`               | Enable x402 micropayment flows for paywalled APIs.                                                                                                                |
+| `x402.maxCostPerRequestUsd` | `1`                   | Per-request cap inside the agent's per-tx cap.                                                                                                                    |
+| `x402.facilitatorUrl`       | —                     | Optional x402 facilitator endpoint.                                                                                                                               |
+
+Spend caps are enforced inside the wallet service **before** signing, and
+the agent cannot override them from inside a session. Bump them
+explicitly here if an autonomous use case needs more headroom.
+
+**Onramp resolution order** (for `wallet.stripeOnramp` / `wallet.fund`):
+
+1. **Tier 2** — `stripe.enabled: true` or `STRIPE_SECRET_KEY` set → creates the onramp session locally.
+2. **Tier 3** — `onrampUrl` set → POSTs to that endpoint.
+3. **Tier 1** — neither of the above → defaults to `https://onramp.bitterbot.ai`.
+
+On **testnet** (`base-sepolia`), an additional faucet URL is returned alongside the onramp URL so you can grab test USDC without a card.
+
+See also: [Agent wallet](/wallet), [Wallet funding](/wallet/wallet-funding).
+
+---
+
+## Custom providers and base URLs
+
+Bitterbot uses the `@mariozechner/pi-ai` model catalog. Add custom providers via `models.providers` in config or `~/.bitterbot/agents/<agentId>/agent/models.json`.
+
+```json5
+{
+  models: {
+    mode: "merge", // merge (default) | replace
+    providers: {
+      "custom-proxy": {
+        baseUrl: "http://localhost:4000/v1",
+        apiKey: "LITELLM_KEY",
+        api: "openai-completions", // openai-completions | openai-responses | anthropic-messages | google-generative-ai
+        models: [
+          {
+            id: "llama-3.1-8b",
+            name: "Llama 3.1 8B",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 128000,
+            maxTokens: 32000,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+- Use `authHeader: true` + `headers` for custom auth needs.
+- Override agent config root with `BITTERBOT_AGENT_DIR` (or `PI_CODING_AGENT_DIR`).
+
+### Provider examples
+
+<Accordion title="Cerebras (GLM 4.6 / 4.7)">
+
+```json5
+{
+  env: { CEREBRAS_API_KEY: "sk-..." },
+  agents: {
+    defaults: {
+      model: {
+        primary: "cerebras/zai-glm-4.7",
+        fallbacks: ["cerebras/zai-glm-4.6"],
+      },
+      models: {
+        "cerebras/zai-glm-4.7": { alias: "GLM 4.7 (Cerebras)" },
+        "cerebras/zai-glm-4.6": { alias: "GLM 4.6 (Cerebras)" },
+      },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      cerebras: {
+        baseUrl: "https://api.cerebras.ai/v1",
+        apiKey: "${CEREBRAS_API_KEY}",
+        api: "openai-completions",
+        models: [
+          { id: "zai-glm-4.7", name: "GLM 4.7 (Cerebras)" },
+          { id: "zai-glm-4.6", name: "GLM 4.6 (Cerebras)" },
+        ],
+      },
+    },
+  },
+}
+```
+
+Use `cerebras/zai-glm-4.7` for Cerebras; `zai/glm-4.7` for Z.AI direct.
+
+</Accordion>
+
+<Accordion title="OpenCode Zen">
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "opencode/claude-opus-4-6" },
+      models: { "opencode/claude-opus-4-6": { alias: "Opus" } },
+    },
+  },
+}
+```
+
+Set `OPENCODE_API_KEY` (or `OPENCODE_ZEN_API_KEY`). Shortcut: `bitterbot onboard --auth-choice opencode-zen`.
+
+</Accordion>
+
+<Accordion title="Z.AI (GLM-4.7)">
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "zai/glm-4.7" },
+      models: { "zai/glm-4.7": {} },
+    },
+  },
+}
+```
+
+Set `ZAI_API_KEY`. `z.ai/*` and `z-ai/*` are accepted aliases. Shortcut: `bitterbot onboard --auth-choice zai-api-key`.
+
+- General endpoint: `https://api.z.ai/api/paas/v4`
+- Coding endpoint (default): `https://api.z.ai/api/coding/paas/v4`
+- For the general endpoint, define a custom provider with the base URL override.
+
+</Accordion>
+
+<Accordion title="Moonshot AI (Kimi)">
+
+```json5
+{
+  env: { MOONSHOT_API_KEY: "sk-..." },
+  agents: {
+    defaults: {
+      model: { primary: "moonshot/kimi-k2.5" },
+      models: { "moonshot/kimi-k2.5": { alias: "Kimi K2.5" } },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      moonshot: {
+        baseUrl: "https://api.moonshot.ai/v1",
+        apiKey: "${MOONSHOT_API_KEY}",
+        api: "openai-completions",
+        models: [
+          {
+            id: "kimi-k2.5",
+            name: "Kimi K2.5",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 256000,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+For the China endpoint: `baseUrl: "https://api.moonshot.cn/v1"` or `bitterbot onboard --auth-choice moonshot-api-key-cn`.
+
+</Accordion>
+
+<Accordion title="Kimi Coding">
+
+```json5
+{
+  env: { KIMI_API_KEY: "sk-..." },
+  agents: {
+    defaults: {
+      model: { primary: "kimi-coding/k2p5" },
+      models: { "kimi-coding/k2p5": { alias: "Kimi K2.5" } },
+    },
+  },
+}
+```
+
+Anthropic-compatible, built-in provider. Shortcut: `bitterbot onboard --auth-choice kimi-code-api-key`.
+
+</Accordion>
+
+<Accordion title="Synthetic (Anthropic-compatible)">
+
+```json5
+{
+  env: { SYNTHETIC_API_KEY: "sk-..." },
+  agents: {
+    defaults: {
+      model: { primary: "synthetic/hf:MiniMaxAI/MiniMax-M2.1" },
+      models: { "synthetic/hf:MiniMaxAI/MiniMax-M2.1": { alias: "MiniMax M2.1" } },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      synthetic: {
+        baseUrl: "https://api.synthetic.new/anthropic",
+        apiKey: "${SYNTHETIC_API_KEY}",
+        api: "anthropic-messages",
+        models: [
+          {
+            id: "hf:MiniMaxAI/MiniMax-M2.1",
+            name: "MiniMax M2.1",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 192000,
+            maxTokens: 65536,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Base URL should omit `/v1` (Anthropic client appends it). Shortcut: `bitterbot onboard --auth-choice synthetic-api-key`.
+
+</Accordion>
+
+<Accordion title="MiniMax M2.1 (direct)">
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "minimax/MiniMax-M2.1" },
+      models: {
+        "minimax/MiniMax-M2.1": { alias: "Minimax" },
+      },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      minimax: {
+        baseUrl: "https://api.minimax.io/anthropic",
+        apiKey: "${MINIMAX_API_KEY}",
+        api: "anthropic-messages",
+        models: [
+          {
+            id: "MiniMax-M2.1",
+            name: "MiniMax M2.1",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 15, output: 60, cacheRead: 2, cacheWrite: 10 },
+            contextWindow: 200000,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Set `MINIMAX_API_KEY`. Shortcut: `bitterbot onboard --auth-choice minimax-api`.
+
+</Accordion>
+
+<Accordion title="Local models (LM Studio)">
+
+See [Local Models](/gateway/local-models). TL;DR: run MiniMax M2.1 via LM Studio Responses API on serious hardware; keep hosted models merged for fallback.
+
+</Accordion>
+
+---
+
+## Skills
+
+```json5
+{
+  skills: {
+    allowBundled: ["gemini"],
+    load: {
+      extraDirs: ["~/Projects/agent-scripts/skills"],
+    },
+    install: {
+      preferBrew: true,
+      nodeManager: "npm", // npm | pnpm | yarn
+    },
+    entries: {
+      "nano-banana-pro": {
+        apiKey: "GEMINI_KEY_HERE",
+        env: { GEMINI_API_KEY: "GEMINI_KEY_HERE" },
+      },
+
+      sag: { enabled: false },
+    },
+    prior: {
+      enabled: true, // default: order and annotate the skills index from verified outcomes
+      writer: "shadow", // shadow (journal only) | on | off
+      mode: "mean", // mean | thompson
+      evidence: "verbal", // verbal | counts | verdict | off (ordering only)
+      discount: 0.98,
+      pseudoCount: 4,
+    },
+  },
+}
+```
+
+- `allowBundled`: optional allowlist for bundled skills only (managed/workspace skills unaffected).
+- `entries.<skillKey>.enabled: false` disables a skill even if bundled/installed.
+- `entries.<skillKey>.apiKey`: convenience for skills declaring a primary env var.
+- `prior`: the experience-guided skill prior (on by default; set
+  `enabled: false` to turn it off). The `<available_skills>` index is reordered from an outcome-gated ledger
+  (`ledgerPath`, default `CONFIG_DIR/skill-prior.json`) before each run; it
+  never removes an entry or grants a tool. `evidence` defaults to `verbal`,
+  showing exact verified outcomes beside the matching skill, for example
+  `REJECTED every time it was used (3 uses)`. `counts` shows numeric pass/run
+  counts, `verdict` shows a majority verdict, and `off` keeps ordering only.
+  Evidence requires the same context cell and skill content hash; zero-run,
+  unverified and legacy entries without exact counters remain unannotated.
+  The live context cell is currently `default`; a ledger from another cell
+  does not provide local evidence. The ledger is a trusted local input and
+  the run path only reads it. `writer` defaults to `"shadow"`, which records
+  proposed credits and exclusions on the `skills` journal stream without
+  changing the ledger. `"on"` enables asynchronous recording after completed
+  runs; `"off"` stops the writer. `enabled: false` also stops the writer.
+  Only one full skill read with read-time provenance and frozen, executed
+  task checks or authenticated owner feedback qualifies. Non-owner, remote,
+  benchmark and harness runs are excluded. Model-authored checks are marked
+  as such; a clean tool call or judge-only verdict is insufficient.
+  Corrections replace earlier credits, with durable dedupe across restarts.
+  Nonempty unscoped/benchmark ledgers are refused; use a fresh `ledgerPath`.
+  At 10,000 durable credits, new credits stop without discarding history.
+  Changing `discount` or `pseudoCount` requires a fresh path. See
+  [Skills pipeline](/memory/skills-pipeline) for attribution and retention limits.
+
+---
+
+## Plugins
+
+```json5
+{
+  plugins: {
+    enabled: true,
+    allow: ["voice-call"],
+    deny: [],
+    load: {
+      paths: ["~/Projects/oss/voice-call-extension"],
+    },
+    entries: {
+      "voice-call": {
+        enabled: true,
+        config: { provider: "twilio" },
+      },
+    },
+  },
+}
+```
+
+- Loaded from `~/.bitterbot/extensions`, `<workspace>/.bitterbot/extensions`, plus `plugins.load.paths`.
+- **Config changes require a gateway restart.**
+- `allow`: optional allowlist (only listed plugins load). `deny` wins.
+
+See [Plugins](/tools/plugin).
+
+---
+
+## Monitors
+
+```json5
+{
+  monitors: { enabled: true }, // default true
+}
+```
+
+[Monitors](/automation/monitors) watch a page or an API with a plain fetch and wake the agent only on change. `enabled: false` (or `BITTERBOT_SKIP_MONITORS=1`) stops the engine; saved monitors are kept.
+
+## Notifications
+
+Notices the gateway sends you on its own account: a scheduled job that failed or was turned off, a task interrupted by a restart. Every notice is kept in the main session and shown in the Control UI whatever these settings say; they govern the extra push to a chat channel.
+
+```json5
+{
+  notifications: {
+    owner: { channel: "telegram", to: "123456789" }, // default: where the heartbeat delivers
+    quietHours: { start: "22:00", end: "07:00", timezone: "America/New_York" },
+    maxPerHour: 6, // default 6; 0 pushes nothing
+  },
+}
+```
+
+- `owner`: where to push. Without it, notices go to the heartbeat's target, or the main session's most recent conversation.
+- `quietHours`: no pushes in this window (24-hour `HH:MM`; may run past midnight). Notices raised in it wait in the main session.
+- `maxPerHour`: most pushes in any hour. The rest wait in the main session.
+
+The same notice is not repeated within 30 minutes.
+
+## Review
+
+```json5
+{
+  review: {
+    spend: "ask", // "ask" (default) | "allow"
+    publish: "ask", // "ask" (default) | "allow"
+    contact: "first", // "first" (default) | "ask" | "allow"
+    ttlHours: 24,
+  },
+}
+```
+
+- `spend: "ask"` holds wallet sends and x402 payments until you approve them; a standing spend grant that covers the payee and amount passes without asking. `"allow"` keeps only the wallet caps.
+- `publish: "ask"` holds posts to the X channel.
+- `contact: "first"` holds the first message the agent addresses to a recipient it has never dealt with; `"ask"` holds every message to a named recipient; `"allow"` holds none. Replies in the current conversation are never held. See [Action review](/tools/action-review).
+
+---
+
+## Memory
+
+The memory subsystems (`memory.dream`, `memory.consolidation`, `memory.curiosity`, ...) are documented with the memory system itself; see [How the memory works](/memory/how-the-memory-works) and [Curiosity and search](/memory/curiosity-and-search). Research and evidence settings are listed below.
+
+### `memory.proceduralLearning`
+
+Available by default in shadow mode. No config block is needed. The service hosts both manual research experiments and an automatic failure-learning coordinator. Idle dream ticks run production experiments through the existing skill-evolution task gates; research candidates remain shadow-only. Production evolution is separately controlled by `skills.evolution.enabled`.
+
+```json5
+{
+  memory: {
+    proceduralLearning: {
+      mode: "shadow", // "off" | "shadow" | "active"; default "shadow"
+      automation: {
+        enabled: true, // idle failure experiments through the production gates
+        maxLlmCalls: 64, // callback dispatches, not dollars or provider requests
+        maxAgentTurns: 240, // a trial turn can make multiple model requests
+        maxWallMinutes: 60, // checked before dispatch and promotion
+      },
+      experienceMemory: {
+        enabled: true, // redacted experience from verified acquisition runs only
+        minSupport: 2,
+        maxPromptChars: 6000,
+      },
+      maxEntries: 1000,
+      maxResults: 3,
+      maxAgeDays: 30,
+      executionBudget: { providerUsd: 0, toolCalls: 100, wallMs: 60000 },
+    },
+  },
+}
+```
+
+`mode: "off"` prevents the service from opening. `automation.enabled: false` disables the idle coordinator while preserving the legacy full-dream evolution hook; `skills.evolution.enabled: false` disables production evolution altogether. `experienceMemory.enabled: false` disables adapter extraction while retaining the lab. Restart the gateway to apply changes. The automatic coordinator and strategy lab require `shadow`; `active` is for explicit host adapters. Automatic work respects the dream idle threshold, evolution cadence, usage budgets and pause state. Dispatch limits are reserved durably before work; exhausted limits hold candidates, and in-flight calls finish under their existing timeouts. Research host integrations still supply their own adapters, verifiers and budgets. The experiment ledger stores journal references and hashes, not raw conversations; held-out results cannot become acquisition experience. See [Learning Strategy Lab](/memory/learning-strategy-lab#automatic-failure-experiments) for recovery, accounting and promotion boundaries.
+
+### `memory.curiosity.evidence`
+
+```json5
+{
+  memory: {
+    curiosity: {
+      evidence: {
+        mode: "shadow", // "off" | "observe" | "shadow" (default "shadow")
+        retentionDays: 90, // prune rows older than this on the consolidation tick
+        topK: 10, // retrieval rows kept per search
+        surfacingTrial: {
+          mode: "shadow", // "off" | "shadow" (default "shadow")
+          blockMinutes: 240, // length of one randomisation block
+          carryOverDays: 7, // an item assigned within this window keeps its arm
+          seed: "optional", // absent: derived from this node's evidence digest key
+        },
+      },
+    },
+  },
+}
+```
+
+- `off`: nothing is written. `observe`: retrieval hits and surfacing events. `shadow`: also dream-engine decision traces.
+- Observation changes no behaviour in any mode. Query text is never stored; queries and session keys appear only as node-keyed digests. See [Evidence telemetry](/memory/evidence-telemetry).
+- `surfacingTrial` (PLAN-59 Phase 2, shadow stage): logs every proactive surfacing opportunity as `eligible` and assigns it `surface` or `withhold` by a randomised block design, then delivers exactly as before. `shadow` changes nothing the owner sees; `off` restores the Phase 0 rows. A `live` mode does not exist yet; the withhold condition is a separate decision and PR. Writes nothing when `evidence.mode` is `off`. See [Surfacing trial](/memory/evidence-telemetry#surfacing-trial-shadow-stage).
+
+## Browser
+
+```json5
+{
+  browser: {
+    enabled: true,
+    evaluateEnabled: true,
+    defaultProfile: "chrome",
+    profiles: {
+      bitterbot: { cdpPort: 18800, color: "#FF4500" },
+      work: { cdpPort: 18801, color: "#0066CC" },
+      remote: { cdpUrl: "http://10.0.0.42:9222", color: "#00AA00" },
+    },
+    color: "#FF4500",
+    // headless: false,
+    // noSandbox: false,
+    // executablePath: "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    // attachOnly: false,
+    // liveView: { enabled: true, maxFps: 8, quality: 60 },
+    // replay: { enabled: true, retentionDays: 7 },
+  },
+}
+```
+
+- `evaluateEnabled: false` disables `act:evaluate` and `wait --fn`.
+- `liveView` controls the stream of the agent's page in the Control UI's side panel. `enabled: false` turns it off; `maxFps` (1-30) and `quality` (10-95) trade smoothness for bandwidth. See [Live view and take over](/tools/browser#live-view-and-take-over).
+- `replay` keeps a screenshot after each page action the agent takes, for playback in the Activity panel. `enabled: false` stops recording; `retentionDays` (1-90, default 7) sets how long a recording is kept after its last frame. See [Session replay](/tools/browser#session-replay).
+- Remote profiles are attach-only (start/stop/reset disabled).
+- Auto-detect order: default browser if Chromium-based → Chrome → Brave → Edge → Chromium → Chrome Canary.
+- Control service: loopback only, on `gateway.port + 2` (19003 by default).
+
+---
+
+## UI
+
+```json5
+{
+  ui: {
+    seamColor: "#FF4500",
+    assistant: {
+      name: "Bitterbot",
+      avatar: "CB", // emoji, short text, image URL, or data URI
+    },
+  },
+}
+```
+
+- `seamColor`: accent color for native app UI chrome (Talk Mode bubble tint, etc.).
+- `assistant`: Control UI identity override. Falls back to active agent identity.
+
+---
+
+## Gateway
+
+```json5
+{
+  gateway: {
+    mode: "local", // local | remote
+    port: 19001,
+    bind: "loopback",
+    auth: {
+      mode: "token", // token | password | trusted-proxy
+      token: "your-token",
+      // password: "your-password", // or BITTERBOT_GATEWAY_PASSWORD
+      // trustedProxy: { userHeader: "x-forwarded-user" }, // for mode=trusted-proxy; see /gateway/trusted-proxy-auth
+      allowTailscale: true,
+      rateLimit: {
+        maxAttempts: 10,
+        windowMs: 60000,
+        lockoutMs: 300000,
+        exemptLoopback: true,
+      },
+    },
+    tailscale: {
+      mode: "off", // off | serve | funnel
+      resetOnExit: false,
+    },
+    controlUi: {
+      enabled: true,
+      basePath: "/bitterbot",
+      // root: "dist/control-ui",
+      // allowInsecureAuth: false,
+      // dangerouslyDisableDeviceAuth: false,
+    },
+    remote: {
+      url: "ws://gateway.tailnet:19001",
+      transport: "ssh", // ssh | direct
+      token: "your-token",
+      // password: "your-password",
+    },
+    trustedProxies: ["10.0.0.1"],
+    tools: {
+      // Additional /tools/invoke HTTP denies
+      deny: ["browser"],
+      // Remove tools from the default HTTP deny list
+      allow: ["gateway"],
+    },
+  },
+}
+```
+
+<Accordion title="Gateway field details">
+
+- `mode`: `local` (run gateway) or `remote` (connect to remote gateway). Gateway refuses to start unless `local`.
+- `port`: single multiplexed port for WS + HTTP. Precedence: `--port` > `BITTERBOT_GATEWAY_PORT` > `gateway.port` > `19001`.
+- `bind`: `auto`, `loopback` (default), `lan` (`0.0.0.0`), `tailnet` (Tailscale IP only), or `custom`.
+- **Auth**: required by default. Non-loopback binds require a shared token/password. Onboarding wizard generates a token by default.
+- `auth.mode: "trusted-proxy"`: delegate auth to an identity-aware reverse proxy and trust identity headers from `gateway.trustedProxies` (see [Trusted Proxy Auth](/gateway/trusted-proxy-auth)).
+- `auth.allowTailscale`: when `true`, Tailscale Serve identity headers satisfy auth (verified via `tailscale whois`). Defaults to `true` when `tailscale.mode = "serve"`.
+- `auth.rateLimit`: optional failed-auth limiter. Applies per client IP and per auth scope (shared-secret and device-token are tracked independently). Blocked attempts return `429` + `Retry-After`.
+  - `auth.rateLimit.exemptLoopback` defaults to `true`; set `false` when you intentionally want localhost traffic rate-limited too (for test setups or strict proxy deployments).
+- `tailscale.mode`: `serve` (tailnet only, loopback bind) or `funnel` (public, requires auth).
+- `remote.transport`: `ssh` (default) or `direct` (ws/wss). For `direct`, `remote.url` must be `ws://` or `wss://`.
+- `gateway.remote.token` is for remote CLI calls only; does not enable local gateway auth.
+- `trustedProxies`: reverse proxy IPs that terminate TLS. Only list proxies you control.
+- `gateway.tools.deny`: extra tool names blocked for HTTP `POST /tools/invoke` (extends default deny list).
+- `gateway.tools.allow`: remove tool names from the default HTTP deny list.
+
+</Accordion>
+
+<Accordion title="Control UI auth flow">
+
+The Control UI is served by the gateway itself at `http://127.0.0.1:19001/` and connects back over WebSocket to the same origin. These settings control how the gateway handles that connection.
+
+**Shared token auth (normal path):**
+The Control UI authenticates using `gateway.auth.token` — the same shared token the CLI uses. The UI obtains it automatically from the gateway's same-origin loopback handoff endpoint (`/auth/session-token`); for a remote gateway, the first-run screen accepts the token manually. The onboarding wizard generates the token automatically; nothing is baked into the UI build.
+
+**Device pairing.** A Control UI connecting over loopback skips device pairing. A remote Control UI (LAN, tailnet, a hosted server) also proves a device identity and needs a one-time approval, or bootstrap pairing (below) for the very first device.
+
+**`controlUi` fields:**
+
+- `enabled` (default `true`): controls whether the gateway accepts Control UI WebSocket connections.
+- `basePath`: optional prefix path for the gateway's built-in dashboard endpoint.
+- `allowedOrigins`: browser origins allowed to open WebSocket connections. When unset, the gateway allows loopback origins and origins matching the request Host header (including `http://localhost:5173`) automatically.
+- `allowedHosts`: extra hostnames the token handoff endpoint answers for (for example a Tailscale Serve name). Loopback names are always allowed; anything else is refused to block DNS-rebinding.
+- `bootstrapPairing` (default `false`, or on when `BITTERBOT_BOOTSTRAP_PAIRING=1`): pair the first Control UI device that proves the gateway token, once, while no device is paired. The Fly, VPS and Compose setups turn it on.
+- `allowInsecureAuth` (default `false`): allow shared-token auth over plain HTTP from non-loopback origins. Not recommended.
+- `dangerouslyDisableDeviceAuth` (default `false`): break-glass flag that strips device identity checks. Not needed for normal browser access — only use for emergency recovery.
+
+**If the Control UI cannot connect**, check:
+
+1. You opened the UI at `http://127.0.0.1:19001/` on the gateway machine (or through an SSH tunnel to it) — the automatic token handoff only answers loopback requests.
+2. The gateway is running: `bitterbot gateway status`.
+3. For a remote gateway, the first-run screen has the right `ws://` URL and the token from `~/.bitterbot/bitterbot.json → gateway.auth.token`.
+
+</Accordion>
+
+### OpenAI-compatible endpoints
+
+- Chat Completions: disabled by default. Enable with `gateway.http.endpoints.chatCompletions.enabled: true`.
+- Responses API: `gateway.http.endpoints.responses.enabled`.
+- Responses URL-input hardening:
+  - `gateway.http.endpoints.responses.maxUrlParts`
+  - `gateway.http.endpoints.responses.files.urlAllowlist`
+  - `gateway.http.endpoints.responses.images.urlAllowlist`
+
+### Multi-instance isolation
+
+Run multiple gateways on one host with unique ports and state dirs:
+
+```bash
+BITTERBOT_CONFIG_PATH=~/.bitterbot/a.json \
+BITTERBOT_STATE_DIR=~/.bitterbot-a \
+bitterbot gateway --port 19001
+```
+
+Convenience flags: `--dev` (uses `~/.bitterbot-dev` + port `19001`), `--profile <name>` (uses `~/.bitterbot-<name>`).
+
+See [Multiple Gateways](/gateway/multiple-gateways).
+
+---
+
+## P2P Network
+
+The P2P orchestrator runs as a Rust sidecar daemon using libp2p. It handles peer discovery, skill propagation, reputation scoring, and NAT traversal.
+
+```json5
+{
+  p2p: {
+    enabled: true, // default: true
+    listenAddrs: ["/ip4/0.0.0.0/tcp/9100"], // default if omitted
+    bootstrapDns: "p2p.bitterbot.ai", // DNS-based bootstrap discovery
+    bootstrapPeers: [], // additional static bootstrap peers
+    relayMode: "auto", // off | client | server | auto
+    relayServers: [], // explicit relay server multiaddresses
+    keyDir: "~/.bitterbot/keys", // Ed25519 keypair for node identity
+    httpAddr: "127.0.0.1:9847", // orchestrator dashboard (loopback)
+    httpAuthToken: "...", // bearer token for dashboard API
+    security: {
+      maxSkillSizeBytes: 262144, // 256KB
+      maxSkillsPerMinutePerPeer: 10,
+      requireSignature: true,
+    },
+  },
+}
+```
+
+<Accordion title="P2P field details">
+
+- `enabled`: set `false` to disable the P2P orchestrator entirely. Default: `true`.
+- `listenAddrs`: libp2p listen addresses. Default: `/ip4/0.0.0.0/tcp/9100`. Port 9100 open gives best performance, but is not required — nodes behind NAT use circuit relay.
+- `bootstrapDns`: DNS domain for bootstrap peer discovery. Resolves `_dnsaddr.<domain>` TXT records. Default: `"p2p.bitterbot.ai"`.
+- `bootstrapPeers`: additional static bootstrap peer multiaddresses (merged with DNS results).
+- `relayMode`: NAT traversal strategy.
+  - `"auto"` (default): server for management nodes, client for edge nodes.
+  - `"client"`: use relay servers when behind NAT. AutoNAT detects NAT status and reserves relay slots automatically.
+  - `"server"`: serve as a relay for NAT'd peers (used by bootstrap nodes).
+  - `"off"`: disable relay entirely.
+- `relayServers`: explicit relay server multiaddresses for client mode. If empty, bootstrap peers are used as relay candidates.
+- `keyDir`: directory for the Ed25519 keypair that determines the node's peer ID. Default: `~/.bitterbot/keys` (always passed to the orchestrator). Identities left in the legacy locations (`<repo>/keys`, `<repo>/desktop/keys`, `~/keys`) are moved there automatically on the next start; a management-tier node with no keypair anywhere refuses to boot rather than silently minting a fresh identity.
+- `httpAddr`: bind address for the orchestrator HTTP dashboard. Default: `"127.0.0.1:9847"` (loopback only).
+- `security.maxSkillSizeBytes`: reject skills larger than this. Default: 256KB.
+- `security.maxSkillsPerMinutePerPeer`: per-peer rate limit. Default: 10.
+- `security.requireSignature`: require Ed25519 signature on all skill envelopes. Default: `true`.
+
+</Accordion>
+
+<Accordion title="NAT traversal">
+
+Most nodes behind home routers or firewalls work automatically with no configuration needed. The orchestrator detects NAT via AutoNAT and reserves a circuit relay slot on the bootstrap node.
+
+**How it works:**
+
+1. AutoNAT probes whether the node is publicly reachable on port 9100
+2. If behind NAT, the relay client connects to a bootstrap node and reserves a relay slot
+3. Other peers reach this node via the relay: `/p2p/<relay>/p2p-circuit/p2p/<this-node>`
+4. DCUtR (Direct Connection Upgrade through Relay) attempts hole-punching for a direct TCP connection
+5. If hole-punching succeeds, traffic flows directly; if not, it continues through the relay
+
+**For best performance:** forward TCP port 9100 to the machine running Bitterbot. This avoids relay overhead and allows direct peer connections.
+
+**Relay reservations** expire after 1 hour and are automatically renewed every 45 minutes.
+
+</Accordion>
+
+---
+
+## Hooks
+
+```json5
+{
+  hooks: {
+    enabled: true,
+    token: "shared-secret",
+    path: "/hooks",
+    maxBodyBytes: 262144,
+    defaultSessionKey: "hook:ingress",
+    allowRequestSessionKey: false,
+    allowedSessionKeyPrefixes: ["hook:"],
+    allowedAgentIds: ["hooks", "main"],
+    presets: ["gmail"],
+    transformsDir: "~/.bitterbot/hooks/transforms",
+    mappings: [
+      {
+        match: { path: "gmail" },
+        action: "agent",
+        agentId: "hooks",
+        wakeMode: "now",
+        name: "Gmail",
+        sessionKey: "hook:gmail:{{messages[0].id}}",
+        messageTemplate: "From: {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}",
+        deliver: true,
+        channel: "last",
+        model: "openai/gpt-5.2-mini",
+      },
+    ],
+  },
+}
+```
+
+Auth: `Authorization: Bearer <token>` or `x-bitterbot-token: <token>`.
+
+**Endpoints:**
+
+- `POST /hooks/wake` → `{ text, mode?: "now"|"next-heartbeat" }`
+- `POST /hooks/agent` → `{ message, name?, agentId?, sessionKey?, wakeMode?, deliver?, channel?, to?, model?, thinking?, timeoutSeconds? }`
+  - `sessionKey` from request payload is accepted only when `hooks.allowRequestSessionKey=true` (default: `false`).
+- `POST /hooks/<name>` → resolved via `hooks.mappings`
+
+<Accordion title="Mapping details">
+
+- `match.path` matches sub-path after `/hooks` (e.g. `/hooks/gmail` → `gmail`).
+- `match.source` matches a payload field for generic paths.
+- Templates like `{{messages[0].subject}}` read from the payload.
+- `transform` can point to a JS/TS module returning a hook action.
+  - `transform.module` must be a relative path and stays within `hooks.transformsDir` (absolute paths and traversal are rejected).
+- `agentId` routes to a specific agent; unknown IDs fall back to default.
+- `allowedAgentIds`: restricts explicit routing (`*` or omitted = allow all, `[]` = deny all).
+- `defaultSessionKey`: optional fixed session key for hook agent runs without explicit `sessionKey`.
+- `allowRequestSessionKey`: allow `/hooks/agent` callers to set `sessionKey` (default: `false`).
+- `allowedSessionKeyPrefixes`: optional prefix allowlist for explicit `sessionKey` values (request + mapping), e.g. `["hook:"]`.
+- `deliver: true` sends final reply to a channel; `channel` defaults to `last`.
+- `model` overrides LLM for this hook run (must be allowed if model catalog is set).
+
+</Accordion>
+
+### Gmail integration
+
+```json5
+{
+  hooks: {
+    gmail: {
+      account: "bitterbot@gmail.com",
+      topic: "projects/<project-id>/topics/gog-gmail-watch",
+      subscription: "gog-gmail-watch-push",
+      pushToken: "shared-push-token",
+      hookUrl: "http://127.0.0.1:19001/hooks/gmail",
+      includeBody: true,
+      maxBytes: 20000,
+      renewEveryMinutes: 720,
+      serve: { bind: "127.0.0.1", port: 8788, path: "/" },
+      tailscale: { mode: "funnel", path: "/gmail-pubsub" },
+      model: "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+      thinking: "off",
+    },
+  },
+}
+```
+
+- Gateway auto-starts `gog gmail watch serve` on boot when configured. Set `BITTERBOT_SKIP_GMAIL_WATCHER=1` to disable.
+- Don't run a separate `gog gmail watch serve` alongside the Gateway.
+
+---
+
+## Canvas host
+
+```json5
+{
+  canvasHost: {
+    root: "~/.bitterbot/workspace/canvas",
+    liveReload: true,
+    // enabled: false, // or BITTERBOT_SKIP_CANVAS_HOST=1
+  },
+}
+```
+
+- Serves agent-editable HTML/CSS/JS and A2UI over HTTP under the Gateway port:
+  - `http://<gateway-host>:<gateway.port>/__bitterbot__/canvas/`
+  - `http://<gateway-host>:<gateway.port>/__bitterbot__/a2ui/`
+- Local-only: keep `gateway.bind: "loopback"` (default).
+- Non-loopback binds: canvas routes require Gateway auth (token/password/trusted-proxy), same as other Gateway HTTP surfaces.
+- Node WebViews typically don't send auth headers; after a node is paired and connected, the Gateway allows a private-IP fallback so the node can load canvas/A2UI without leaking secrets into URLs.
+- Injects live-reload client into served HTML.
+- Auto-creates starter `index.html` when empty.
+- Also serves A2UI at `/__bitterbot__/a2ui/`.
+- Changes require a gateway restart.
+- Disable live reload for large directories or `EMFILE` errors.
+
+---
+
+## Discovery
+
+### Wide-area (DNS-SD)
+
+```json5
+{
+  discovery: {
+    wideArea: { enabled: true },
+  },
+}
+```
+
+Writes a unicast DNS-SD zone under `~/.bitterbot/dns/`. For cross-network discovery, pair with a DNS server (CoreDNS recommended) + Tailscale split DNS.
+
+Setup: `bitterbot dns setup --apply`.
+
+---
+
+## Environment
+
+### `env` (inline env vars)
+
+```json5
+{
+  env: {
+    OPENROUTER_API_KEY: "sk-or-...",
+    vars: {
+      GROQ_API_KEY: "gsk-...",
+    },
+    shellEnv: {
+      enabled: true,
+      timeoutMs: 15000,
+    },
+  },
+}
+```
+
+- Inline env vars are only applied if the process env is missing the key.
+- `.env` files: CWD `.env` + `~/.bitterbot/.env` (neither overrides existing vars).
+- `shellEnv`: imports missing expected keys from your login shell profile.
+- See [Environment](/help/environment) for full precedence.
+
+### Env var substitution
+
+Reference env vars in any config string with `${VAR_NAME}`:
+
+```json5
+{
+  gateway: {
+    auth: { token: "${BITTERBOT_GATEWAY_TOKEN}" },
+  },
+}
+```
+
+- Only uppercase names matched: `[A-Z_][A-Z0-9_]*`.
+- Missing/empty vars throw an error at config load.
+- Escape with `$${VAR}` for a literal `${VAR}`.
+- Works with `$include`.
+
+### Startup skip flags (`BITTERBOT_SKIP_*`)
+
+These env vars disable individual gateway subsystems at startup. Useful for
+fast-iterating during development, running a lightweight P2P-only node, or
+minimizing side effects while debugging. Set to `1` / `true` to skip the
+subsystem; leave unset for normal behavior.
+
+| Var                                     | Effect                                                                                                                                                                       |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BITTERBOT_SKIP_CHANNELS`               | Don't start configured channels (WhatsApp, Telegram, Discord, etc.). Your agent stays reachable via the gateway API but won't auto-reply on external messaging surfaces.     |
+| `BITTERBOT_SKIP_PROVIDERS`              | Legacy alias for `BITTERBOT_SKIP_CHANNELS`.                                                                                                                                  |
+| `BITTERBOT_SKIP_GMAIL_WATCHER`          | Don't start the Gmail watcher hook. Mail polling stays off until the gateway is restarted without this flag.                                                                 |
+| `BITTERBOT_SKIP_CRON`                   | Don't start the internal cron scheduler. Scheduled jobs won't fire.                                                                                                          |
+| `BITTERBOT_SKIP_CANVAS_HOST`            | Don't start the local canvas rendering host. Canvas-related tool calls fall back to no-op.                                                                                   |
+| `BITTERBOT_SKIP_BROWSER_CONTROL_SERVER` | Don't start the Bitterbot browser control server. Browser tools will fail at runtime.                                                                                        |
+| `BITTERBOT_SKIP_ORCHESTRATOR_DOWNLOAD`  | Skip the `postinstall` download of the prebuilt P2P orchestrator binary. For airgapped installs — the gateway will still attempt to use a local cargo build if you have one. |
+
+These flags are primarily for development, tests, and narrow P2P-only
+deployments. Production gateways should usually leave all subsystems enabled
+so the agent's capabilities match what the system prompt advertises.
+
+**Example — fast dev boot focused on the agent loop only:**
+
+```bash
+BITTERBOT_SKIP_CHANNELS=1 \
+BITTERBOT_SKIP_GMAIL_WATCHER=1 \
+BITTERBOT_SKIP_CRON=1 \
+BITTERBOT_SKIP_BROWSER_CONTROL_SERVER=1 \
+pnpm start gateway
+```
+
+---
+
+## Auth storage
+
+```json5
+{
+  auth: {
+    profiles: {
+      "anthropic:me@example.com": { provider: "anthropic", mode: "oauth", email: "me@example.com" },
+      "anthropic:work": { provider: "anthropic", mode: "api_key" },
+    },
+    order: {
+      anthropic: ["anthropic:me@example.com", "anthropic:work"],
+    },
+  },
+}
+```
+
+- Per-agent auth profiles stored at `<agentDir>/auth-profiles.json`.
+- Legacy OAuth imports from `~/.bitterbot/credentials/oauth.json`.
+- See [OAuth](/concepts/oauth).
+
+---
+
+## Logging
+
+```json5
+{
+  logging: {
+    level: "info",
+    file: "/tmp/bitterbot/bitterbot.log",
+    consoleLevel: "info",
+    consoleStyle: "pretty", // pretty | compact | json
+    redactSensitive: "tools", // off | tools
+    redactPatterns: ["\\bTOKEN\\b\\s*[=:]\\s*([\"']?)([^\\s\"']+)\\1"],
+  },
+}
+```
+
+- Default log file: `/tmp/bitterbot.bitterbot-YYYY-MM-DD.log`.
+- Set `logging.file` for a stable path.
+- `consoleLevel` bumps to `debug` when `--verbose`.
+
+---
+
+## Wizard
+
+Metadata written by CLI wizards (`onboard`, `configure`, `doctor`):
+
+```json5
+{
+  wizard: {
+    lastRunAt: "2026-01-01T00:00:00.000Z",
+    lastRunVersion: "1.4.0",
+    lastRunCommit: "abc1234",
+    lastRunCommand: "configure",
+    lastRunMode: "local",
+  },
+}
+```
+
+---
+
+## Identity
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "main",
+        identity: {
+          name: "Samantha",
+          theme: "helpful sloth",
+          emoji: "🦥",
+          avatar: "avatars/samantha.png",
+        },
+      },
+    ],
+  },
+}
+```
+
+Written by the onboarding assistant. Derives defaults:
+
+- `messages.ackReaction` from `identity.emoji` (falls back to 👀)
+- `mentionPatterns` from `identity.name`/`identity.emoji`
+- `avatar` accepts: workspace-relative path, `http(s)` URL, or `data:` URI
+
+---
+
+---
+
+## Cron
+
+```json5
+{
+  cron: {
+    enabled: true,
+    maxConcurrentRuns: 2,
+    webhook: "https://example.invalid/cron-finished", // optional, must be http:// or https://
+    webhookToken: "replace-with-dedicated-token", // optional bearer token for outbound webhook auth
+    sessionRetention: "24h", // duration string or false
+  },
+}
+```
+
+- `sessionRetention`: how long to keep completed cron sessions before pruning. Default: `24h`.
+- `webhook`: finished-run webhook endpoint, only used when the job has `notify: true`.
+- `webhookToken`: dedicated bearer token for webhook auth, if omitted no auth header is sent.
+
+See [Cron Jobs](/automation/cron-jobs).
+
+---
+
+## Media model template variables
+
+Template placeholders expanded in `tools.media.*.models[].args`:
+
+| Variable           | Description                                       |
+| ------------------ | ------------------------------------------------- |
+| `{{Body}}`         | Full inbound message body                         |
+| `{{RawBody}}`      | Raw body (no history/sender wrappers)             |
+| `{{BodyStripped}}` | Body with group mentions stripped                 |
+| `{{From}}`         | Sender identifier                                 |
+| `{{To}}`           | Destination identifier                            |
+| `{{MessageSid}}`   | Channel message id                                |
+| `{{SessionId}}`    | Current session UUID                              |
+| `{{IsNewSession}}` | `"true"` when new session created                 |
+| `{{MediaUrl}}`     | Inbound media pseudo-URL                          |
+| `{{MediaPath}}`    | Local media path                                  |
+| `{{MediaType}}`    | Media type (image/audio/document/…)               |
+| `{{Transcript}}`   | Audio transcript                                  |
+| `{{Prompt}}`       | Resolved media prompt for CLI entries             |
+| `{{MaxChars}}`     | Resolved max output chars for CLI entries         |
+| `{{ChatType}}`     | `"direct"` or `"group"`                           |
+| `{{GroupSubject}}` | Group subject (best effort)                       |
+| `{{GroupMembers}}` | Group members preview (best effort)               |
+| `{{SenderName}}`   | Sender display name (best effort)                 |
+| `{{SenderE164}}`   | Sender phone number (best effort)                 |
+| `{{Provider}}`     | Provider hint (whatsapp, telegram, discord, etc.) |
+
+---
+
+## Config includes (`$include`)
+
+Split config into multiple files:
+
+```json5
+// ~/.bitterbot/bitterbot.json
+{
+  gateway: { port: 19001 },
+  agents: { $include: "./agents.json5" },
+  broadcast: {
+    $include: ["./clients/mueller.json5", "./clients/schmidt.json5"],
+  },
+}
+```
+
+**Merge behavior:**
+
+- Single file: replaces the containing object.
+- Array of files: deep-merged in order (later overrides earlier).
+- Sibling keys: merged after includes (override included values).
+- Nested includes: up to 10 levels deep.
+- Paths: relative (to the including file), absolute, or `../` parent references.
+- Errors: clear messages for missing files, parse errors, and circular includes.
+
+---
+
+_Related: [Configuration](/gateway/configuration) · [Configuration Examples](/gateway/configuration-examples) · [Doctor](/gateway/doctor)_

@@ -1,0 +1,274 @@
+import { createHash } from "node:crypto";
+import fsSync from "node:fs";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveConfigPath, resolveGatewayLockDir, resolveStateDir } from "../config/paths.js";
+import { acquireGatewayLock, GatewayLockError, RESTART_PARENT_PID_ENV } from "./gateway-lock.js";
+
+let fixtureRoot = "";
+let fixtureCount = 0;
+
+async function makeEnv() {
+  const dir = path.join(fixtureRoot, `case-${fixtureCount++}`);
+  await fs.mkdir(dir, { recursive: true });
+  const configPath = path.join(dir, "bitterbot.json");
+  await fs.writeFile(configPath, "{}", "utf8");
+  await fs.mkdir(resolveGatewayLockDir(), { recursive: true });
+  return {
+    env: {
+      ...process.env,
+      BITTERBOT_STATE_DIR: dir,
+      BITTERBOT_CONFIG_PATH: configPath,
+    },
+    cleanup: async () => {},
+  };
+}
+
+function resolveLockPath(env: NodeJS.ProcessEnv) {
+  const stateDir = resolveStateDir(env);
+  const configPath = resolveConfigPath(env, stateDir);
+  const hash = createHash("sha1").update(configPath).digest("hex").slice(0, 8);
+  const lockDir = resolveGatewayLockDir();
+  return { lockPath: path.join(lockDir, `gateway.${hash}.lock`), configPath };
+}
+
+function makeProcStat(pid: number, startTime: number) {
+  const fields = [
+    "R",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    String(startTime),
+    "1",
+    "1",
+  ];
+  return `${pid} (node) ${fields.join(" ")}`;
+}
+
+describe("gateway lock", () => {
+  beforeAll(async () => {
+    fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bitterbot-gateway-lock-"));
+  });
+
+  beforeEach(() => {
+    // Other suites occasionally leave global spies behind (Date.now, setTimeout, etc.).
+    // This test relies on fake timers advancing Date.now and setTimeout deterministically.
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  afterAll(async () => {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("blocks concurrent acquisition until release", async () => {
+    // Fake timers can hang on Windows CI when combined with fs open loops.
+    // Keep this test on real timers and use small timeouts.
+    vi.useRealTimers();
+    const { env, cleanup } = await makeEnv();
+    const lock = await acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 50,
+      pollIntervalMs: 2,
+    });
+    expect(lock).not.toBeNull();
+
+    const pending = acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 15,
+      pollIntervalMs: 2,
+    });
+    await expect(pending).rejects.toBeInstanceOf(GatewayLockError);
+
+    await lock?.release();
+    const lock2 = await acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 30,
+      pollIntervalMs: 2,
+    });
+    await lock2?.release();
+    await cleanup();
+  });
+
+  it("treats recycled linux pid as stale when start time mismatches", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-02-06T10:05:00.000Z"));
+    const { env, cleanup } = await makeEnv();
+    const { lockPath, configPath } = resolveLockPath(env);
+    const payload = {
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      configPath,
+      startTime: 111,
+    };
+    await fs.writeFile(lockPath, JSON.stringify(payload), "utf8");
+
+    const readFileSync = fsSync.readFileSync;
+    const statValue = makeProcStat(process.pid, 222);
+    const spy = vi.spyOn(fsSync, "readFileSync").mockImplementation((filePath, encoding) => {
+      if (filePath === `/proc/${process.pid}/stat`) {
+        return statValue;
+      }
+      return readFileSync(filePath as never, encoding as never) as never;
+    });
+
+    const lock = await acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 80,
+      pollIntervalMs: 5,
+      platform: "linux",
+    });
+    expect(lock).not.toBeNull();
+
+    await lock?.release();
+    spy.mockRestore();
+    await cleanup();
+  });
+
+  it("keeps lock on linux when proc access fails unless stale", async () => {
+    vi.useRealTimers();
+    const { env, cleanup } = await makeEnv();
+    const { lockPath, configPath } = resolveLockPath(env);
+    const payload = {
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      configPath,
+      startTime: 111,
+    };
+    await fs.writeFile(lockPath, JSON.stringify(payload), "utf8");
+
+    const readFileSync = fsSync.readFileSync;
+    const spy = vi.spyOn(fsSync, "readFileSync").mockImplementation((filePath, encoding) => {
+      if (filePath === `/proc/${process.pid}/stat`) {
+        throw new Error("EACCES");
+      }
+      return readFileSync(filePath as never, encoding as never) as never;
+    });
+
+    const pending = acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 15,
+      pollIntervalMs: 2,
+      staleMs: 10_000,
+      platform: "linux",
+    });
+    await expect(pending).rejects.toBeInstanceOf(GatewayLockError);
+
+    spy.mockRestore();
+
+    const stalePayload = {
+      ...payload,
+      createdAt: new Date(0).toISOString(),
+    };
+    await fs.writeFile(lockPath, JSON.stringify(stalePayload), "utf8");
+
+    const staleSpy = vi.spyOn(fsSync, "readFileSync").mockImplementation((filePath, encoding) => {
+      if (filePath === `/proc/${process.pid}/stat`) {
+        throw new Error("EACCES");
+      }
+      return readFileSync(filePath as never, encoding as never) as never;
+    });
+
+    const lock = await acquireGatewayLock({
+      env,
+      allowInTests: true,
+      // Generous timeout: this acquire SHOULD succeed via stale takeover, and
+      // a healthy takeover completes in one or two loop iterations regardless
+      // of the ceiling. 30ms flaked on CI when the 2026-08 runner image
+      // slowed cold fs I/O enough that a single iteration (open EEXIST →
+      // read payload → mocked /proc throw → stat → rm) could exhaust it.
+      timeoutMs: 2000,
+      pollIntervalMs: 2,
+      staleMs: 1,
+      platform: "linux",
+    });
+    expect(lock).not.toBeNull();
+
+    await lock?.release();
+    staleSpy.mockRestore();
+    await cleanup();
+  });
+});
+
+describe("restart handoff", () => {
+  // Real timers: the loop polls the filesystem.
+  it("outlives a parent that is still shutting down when spawned as its restart", async () => {
+    vi.useRealTimers();
+    const { env, cleanup } = await makeEnv();
+    const parent = await acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 50,
+      pollIntervalMs: 2,
+    });
+    expect(parent).not.toBeNull();
+    // The lock owner is this process; the child is told this process is its parent.
+    const childEnv = { ...env, [RESTART_PARENT_PID_ENV]: String(process.pid) };
+    const waited: number[] = [];
+    const pending = acquireGatewayLock({
+      env: childEnv,
+      allowInTests: true,
+      timeoutMs: 30,
+      restartHandoffTimeoutMs: 3000,
+      pollIntervalMs: 2,
+      onRestartHandoffWait: (pid) => waited.push(pid),
+    });
+    // Well past the plain timeout, the parent finally lets go.
+    await new Promise((r) => setTimeout(r, 150));
+    await parent?.release();
+    const child = await pending;
+    expect(child).not.toBeNull();
+    expect(waited).toEqual([process.pid]);
+    await child?.release();
+    await cleanup();
+  });
+
+  it("still gives up at the plain timeout when the owner is not its parent", async () => {
+    vi.useRealTimers();
+    const { env, cleanup } = await makeEnv();
+    const owner = await acquireGatewayLock({
+      env,
+      allowInTests: true,
+      timeoutMs: 50,
+      pollIntervalMs: 2,
+    });
+    const childEnv = { ...env, [RESTART_PARENT_PID_ENV]: String(process.pid + 100_000) };
+    await expect(
+      acquireGatewayLock({
+        env: childEnv,
+        allowInTests: true,
+        timeoutMs: 30,
+        restartHandoffTimeoutMs: 3000,
+        pollIntervalMs: 2,
+      }),
+    ).rejects.toBeInstanceOf(GatewayLockError);
+    await owner?.release();
+    await cleanup();
+  });
+});

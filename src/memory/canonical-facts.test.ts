@@ -1,0 +1,1116 @@
+/**
+ * PLAN-33 Phase 1 — canonical facts ledger.
+ *
+ * The contract under test: exact key-value facts, one current belief per key,
+ * closed reconcile op set (ADD / STRENGTHEN / SUPERSEDE / REJECT), bitemporal
+ * supersession (nothing deleted), deterministic score-based cap demotion, and
+ * a rendered block that is a pure projection of the table — the failure mode
+ * this kills is canonical facts being paraphrased or evicted by LLM prose
+ * rewrites and similarity gates.
+ */
+import { DatabaseSync } from "node:sqlite";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  CANONICAL_RENDER_MAX_CHARS,
+  CanonicalFactsStore,
+  canonicalPromotionScore,
+  isCanonicalFactVisibleInScope,
+  normalizeCanonicalKey,
+  normalizeCanonicalScope,
+} from "./canonical-facts.js";
+import { ensureMemoryIndexSchema } from "./memory-schema.js";
+
+function makeDb(): DatabaseSync {
+  // Production-faithful setup: base schema + full migration chain (incl. v33).
+  const db = new DatabaseSync(":memory:");
+  ensureMemoryIndexSchema({
+    db,
+    embeddingCacheTable: "embedding_cache",
+    ftsTable: "chunks_fts",
+    ftsEnabled: false,
+  });
+  return db;
+}
+
+describe("migration v33", () => {
+  it("creates canonical_facts with one-current-belief-per-key enforcement", () => {
+    const db = makeDb();
+    const now = Date.now();
+    const ins = db.prepare(
+      `INSERT INTO canonical_facts (id, key, value, statement, category, confidence,
+        first_seen_at, last_confirmed_at, valid_from, source)
+       VALUES (?, ?, 'v', 's', 'project', 0.9, ?, ?, ?, 'seed')`,
+    );
+    ins.run("a", "project.repo", now, now, now);
+    expect(() => ins.run("b", "project.repo", now, now, now)).toThrow(); // partial unique index
+    // A superseded (closed-window) row for the same key is allowed.
+    db.prepare(
+      `INSERT INTO canonical_facts (id, key, value, statement, category, confidence,
+        first_seen_at, last_confirmed_at, valid_from, valid_until, source, status)
+       VALUES ('c', 'project.repo', 'old', 's', 'project', 0.9, ?, ?, ?, ?, 'seed', 'superseded')`,
+    ).run(now - 10, now - 10, now - 10, now);
+    db.close();
+  });
+});
+
+describe("normalizeCanonicalKey", () => {
+  it("slugifies and validates", () => {
+    expect(normalizeCanonicalKey("Project Repo")).toBe("project_repo");
+    expect(normalizeCanonicalKey("project.repo")).toBe("project.repo");
+    expect(normalizeCanonicalKey("  IDENTITY.User-Name ")).toBe("identity.user-name");
+    expect(normalizeCanonicalKey("!!!")).toBeNull();
+    expect(normalizeCanonicalKey("")).toBeNull();
+  });
+});
+
+describe("CanonicalFactsStore reconcile verbs", () => {
+  let db: DatabaseSync;
+  let store: CanonicalFactsStore;
+
+  beforeEach(() => {
+    db = makeDb();
+    store = new CanonicalFactsStore(db);
+  });
+
+  it("ADD inserts a new current belief", () => {
+    const result = store.pin({
+      key: "project.repo",
+      value: "github.com/Bitterbot-AI/bitterbot-desktop",
+      statement: "The project repository is github.com/Bitterbot-AI/bitterbot-desktop.",
+      category: "project",
+      source: "agent_pin",
+    });
+    expect(result.op).toBe("add");
+    const fact = store.get("project.repo");
+    expect(fact?.value).toBe("github.com/Bitterbot-AI/bitterbot-desktop");
+    expect(fact?.mentionCount).toBe(1);
+    expect(fact?.status).toBe("active");
+  });
+
+  it("STRENGTHEN on re-pin of the same value — the daily-confirmation signal", () => {
+    store.pin({ key: "project.repo", value: "repo-x", source: "agent_pin", confidence: 0.7 });
+    const second = store.pin({ key: "project.repo", value: "repo-x", source: "extraction" });
+    expect(second.op).toBe("strengthen");
+    const fact = store.get("project.repo");
+    expect(fact?.mentionCount).toBe(2);
+    expect(fact?.confidence).toBeGreaterThan(0.7); // repetition finally strengthens
+    // Paraphrase-duplication regression: strengthening never creates a second row.
+    expect(store.history("project.repo").length).toBe(1);
+  });
+
+  it("SUPERSEDE on contradiction — old belief keeps its validity window", () => {
+    store.pin({ key: "project.repo", value: "VGIL77/old-repo", source: "agent_pin" });
+    // PLAN-55 Phase 1: an agent pin over a tier >= 2 belief is held, so the
+    // deliberate supersede here comes from the owner.
+    const result = store.pin({
+      key: "project.repo",
+      value: "Bitterbot-AI/bitterbot-desktop",
+      source: "owner",
+    });
+    expect(result.op).toBe("supersede");
+    const current = store.get("project.repo");
+    expect(current?.value).toBe("Bitterbot-AI/bitterbot-desktop");
+    const history = store.history("project.repo");
+    expect(history.length).toBe(2);
+    const old = history.find((f) => f.value === "VGIL77/old-repo");
+    expect(old?.status).toBe("superseded");
+    expect(old?.validUntil).not.toBeNull(); // window closed, not deleted
+    expect(old?.supersededBy).toBe(current?.id);
+  });
+
+  it("REJECTS invalid input instead of writing partially", () => {
+    expect(store.pin({ key: "??", value: "x", source: "agent_pin" }).op).toBe("rejected");
+    expect(store.pin({ key: "ok.key", value: "  ", source: "agent_pin" }).op).toBe("rejected");
+    expect(store.pin({ key: "ok.key", value: "y".repeat(600), source: "agent_pin" }).op).toBe(
+      "rejected",
+    );
+    expect(store.get("ok.key")).toBeNull();
+  });
+
+  it("re-pinning a retired fact reactivates it via STRENGTHEN", () => {
+    store.pin({ key: "infra.gateway", value: "a2a.bitterbot.ai", source: "agent_pin" });
+    // Decay-retired: the agent's own retire of a tier-2 row is held (Phase 1 review).
+    expect(store.retire("infra.gateway", { reason: "decay" })).toBe(true);
+    expect(store.listActive().length).toBe(0);
+    const result = store.pin({
+      key: "infra.gateway",
+      value: "a2a.bitterbot.ai",
+      source: "agent_pin",
+    });
+    expect(result.op).toBe("strengthen");
+    expect(store.get("infra.gateway")?.status).toBe("active");
+  });
+});
+
+describe("cap enforcement", () => {
+  it("demotes the lowest promotion score deterministically, never deletes", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db, { maxFacts: 3 });
+    store.pin({ key: "project.one", value: "alpha", source: "agent_pin", confidence: 0.95 });
+    store.pin({ key: "project.two", value: "beta", source: "agent_pin", confidence: 0.9 });
+    store.pin({ key: "project.low", value: "gamma", source: "promotion", confidence: 0.3 });
+    // Confirm project.one again so it clearly outranks.
+    store.pin({ key: "project.one", value: "alpha", source: "extraction" });
+    store.pin({ key: "project.new", value: "delta", source: "agent_pin", confidence: 0.95 });
+    const active = store.listActive().map((f) => f.key);
+    expect(active.length).toBe(3);
+    expect(active).not.toContain("project.low"); // lowest score demoted
+    expect(active).toContain("project.new");
+    // Demoted, not deleted: still the current belief for its key.
+    expect(store.get("project.low")?.status).toBe("retired");
+  });
+});
+
+describe("renderBlock", () => {
+  it("renders a deterministic block ordered by promotion score", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({
+      key: "project.repo",
+      value: "github.com/Bitterbot-AI/bitterbot-desktop",
+      statement: "The project repository is github.com/Bitterbot-AI/bitterbot-desktop.",
+      category: "project",
+      source: "agent_pin",
+      confidence: 0.95,
+    });
+    store.pin({
+      key: "project.repo",
+      value: "github.com/Bitterbot-AI/bitterbot-desktop",
+      source: "extraction",
+    });
+    store.pin({
+      key: "identity.user_name",
+      value: "Victor",
+      statement: "The user's name is Victor.",
+      category: "identity",
+      source: "seed",
+      confidence: 0.8,
+    });
+    const block = store.renderBlock();
+    expect(block).toContain("## Canonical Facts");
+    // W6: `- [key] value`, sorted by key, no counts or dates (they moved the
+    // cached prefix on every confirmation) and no statement sentence (which
+    // repeated the key and doubled the token cost).
+    expect(block).toContain("- [identity.user_name] Victor");
+    expect(block).toContain("- [project.repo] github.com/Bitterbot-AI/bitterbot-desktop");
+    expect(block).not.toContain("confirmed 2x");
+    expect(block).not.toMatch(/\(since \d{4}/);
+    expect(block).not.toContain("The project repository is");
+    expect(block?.indexOf("[identity.user_name]")).toBeLessThan(block!.indexOf("[project.repo]"));
+    // Exact string survives verbatim — the anti-paraphrase guarantee.
+    expect(block).toContain("github.com/Bitterbot-AI/bitterbot-desktop");
+  });
+
+  it("filters by category (minimal prompt mode) and returns undefined when empty", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    expect(store.renderBlock()).toBeUndefined();
+    store.pin({
+      key: "preference.editor",
+      value: "vscode",
+      category: "preference",
+      source: "seed",
+    });
+    store.pin({ key: "project.repo", value: "x/y", category: "project", source: "seed" });
+    const minimal = store.renderBlock({ categories: ["identity", "project"] });
+    expect(minimal).toContain("project.repo");
+    expect(minimal).not.toContain("preference.editor");
+  });
+
+  it("includes whole facts only, within the token budget", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db, { budgetTokens: 100 }); // ~400 chars
+    for (let i = 0; i < 20; i++) {
+      store.pin({
+        key: `k.fact${i}`,
+        value: `value-${i}`,
+        statement: `Statement number ${i} with a reasonably long body to consume budget quickly.`,
+        source: "agent_pin",
+      });
+    }
+    const block = store.renderBlock()!;
+    expect(block.length).toBeLessThanOrEqual(400 + 10);
+    // No truncated mid-line entries: every fact line is complete.
+    for (const line of block.split("\n").filter((l) => l.startsWith("- ["))) {
+      expect(line).toMatch(/^- \[k\.fact\d+\] value-\d+$/);
+    }
+  });
+
+  it("never renders heartbeat scaffolding or placeholder values, whatever key they hide under", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "identity.user_name", value: "not stated", source: "extraction" });
+    store.pin({
+      key: "identity.user_name_2",
+      value: "If nothing needs attention, the user requests to reply HEARTBEAT_OK.",
+      source: "agent_pin",
+    });
+    store.pin({ key: "identity.user.name", value: "Victor M. Gil", source: "agent_pin" });
+    const block = store.renderBlock()!;
+    expect(block).toContain("- [identity.user.name] Victor M. Gil");
+    expect(block).not.toContain("not stated");
+    expect(block).not.toContain("HEARTBEAT_OK");
+    expect(block.split("\n- [").length - 1).toBe(1);
+  });
+
+  it("caps the rendered block regardless of a generous budgetTokens", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db, { budgetTokens: 100_000 });
+    for (let i = 0; i < 48; i++) {
+      store.pin({ key: `k.fact${i}`, value: "v".repeat(120), source: "agent_pin" });
+    }
+    expect(store.renderBlock()!.length).toBeLessThanOrEqual(CANONICAL_RENDER_MAX_CHARS);
+  });
+});
+
+describe("seedFromIdentityPreferences", () => {
+  it("seeds identity prefs once, guarded by the meta flag", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    const prefs = [
+      { category: "identity", key: "user_name", value: "Victor", confidence: 0.9 },
+      { category: "identity", key: "user_role", value: "neuroscientist", confidence: 0.7 },
+      { category: "identity", key: "low_conf", value: "x", confidence: 0.3 }, // below floor
+      { category: "tool", key: "editor", value: "vscode", confidence: 0.9 }, // wrong category
+    ];
+    expect(store.seedFromIdentityPreferences(prefs)).toBe(2);
+    expect(store.get("identity.user_name")?.value).toBe("Victor");
+    expect(store.get("identity.low_conf")).toBeNull();
+    expect(store.get("identity.editor")).toBeNull();
+    // Idempotent: second call is a no-op even with new prefs.
+    expect(store.seedFromIdentityPreferences(prefs)).toBe(0);
+  });
+});
+
+describe("canonicalPromotionScore", () => {
+  it("rewards confirmation frequency and recency", () => {
+    const now = Date.now();
+    const fresh = { confidence: 0.8, mentionCount: 40, lastConfirmedAt: now };
+    const stale = { confidence: 0.8, mentionCount: 1, lastConfirmedAt: now - 400 * 86_400_000 };
+    expect(canonicalPromotionScore(fresh, now)).toBeGreaterThan(
+      canonicalPromotionScore(stale, now),
+    );
+  });
+});
+
+describe("trust-tier supersession (PLAN-33 Phase 3)", () => {
+  it("background sources cannot overwrite deliberate pins", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "project.repo", value: "right/repo", source: "agent_pin", confidence: 0.95 });
+
+    const promo = store.pin({ key: "project.repo", value: "wrong/repo", source: "promotion" });
+    expect(promo.op).toBe("rejected");
+    const extract = store.pin({ key: "project.repo", value: "wrong/repo", source: "extraction" });
+    expect(extract.op).toBe("rejected");
+    expect(store.get("project.repo")?.value).toBe("right/repo");
+
+    // An explicit pin (same tier) still supersedes — user corrections propagate.
+    const userFix = store.pin({ key: "project.repo", value: "new/repo", source: "user_directive" });
+    expect(userFix.op).toBe("supersede");
+    expect(store.get("project.repo")?.value).toBe("new/repo");
+  });
+
+  it("corroboration is welcome from any tier (STRENGTHEN is never blocked) — but tier-0 counts separately (PLAN-34 Phase 2b)", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "project.repo", value: "right/repo", source: "agent_pin", confidence: 0.95 });
+    const result = store.pin({ key: "project.repo", value: "right/repo", source: "promotion" });
+    expect(result.op).toBe("strengthen");
+    // Tier-0 agreement (promotion/web) goes to the corroboration counter,
+    // never into mention_count/confidence/recency.
+    const fact = store.get("project.repo")!;
+    expect(fact.mentionCount).toBe(1);
+    expect(fact.corroborationCount).toBe(1);
+    // Tier >= 1 confirmation is the full strengthen, as before.
+    store.pin({ key: "project.repo", value: "right/repo", source: "extraction" });
+    expect(store.get("project.repo")!.mentionCount).toBe(2);
+  });
+
+  it("extraction supersedes promotion, and promotion supersedes promotion", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "infra.gateway", value: "old.example.com", source: "promotion" });
+    expect(
+      store.pin({ key: "infra.gateway", value: "new.example.com", source: "extraction" }).op,
+    ).toBe("supersede");
+    expect(
+      store.pin({ key: "infra.gateway", value: "newer.example.com", source: "promotion" }).op,
+    ).toBe("rejected"); // promotion (tier 0) < extraction (tier 1)
+  });
+});
+
+describe("decayTick (PLAN-33 Phase 3)", () => {
+  const DAY = 86_400_000;
+
+  it("retires stale unconfirmed facts; confirmed facts survive", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    const now = Date.now();
+
+    // Promotion-entry confidence (0.6), as the dream mode pins it.
+    store.pin({
+      key: "infra.stale",
+      value: "old.example.internal",
+      source: "promotion",
+      confidence: 0.6,
+    });
+    store.pin({
+      key: "infra.confirmed",
+      value: "live.example.internal",
+      source: "promotion",
+      confidence: 0.6,
+    });
+    for (let i = 0; i < 10; i++) {
+      store.pin({ key: "infra.confirmed", value: "live.example.internal", source: "extraction" }); // heavily confirmed
+    }
+    // Age both by 200 days without confirmation.
+    db.prepare(`UPDATE canonical_facts SET last_confirmed_at = ?`).run(now - 200 * DAY);
+
+    const retired = store.decayTick(now);
+    expect(retired).toBe(1);
+    expect(store.get("infra.stale")?.status).toBe("retired");
+    expect(store.get("infra.confirmed")?.status).toBe("active"); // frequency held it
+
+    // Idempotent and interval-independent: a second tick changes nothing.
+    expect(store.decayTick(now)).toBe(0);
+  });
+
+  it("never touches facts confirmed within the stale window", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    const now = Date.now();
+    store.pin({ key: "infra.fresh", value: "fresh.example.internal", source: "promotion" }); // low confidence but fresh
+    expect(store.decayTick(now)).toBe(0);
+    expect(store.get("infra.fresh")?.status).toBe("active");
+  });
+});
+
+describe("background transient-shape guards (first-live-hour hotfix)", () => {
+  it("rejects the observed junk shapes for background sources", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    const bad = [
+      { key: "world.current_time", value: "2026-07-10T11:39:00-04:00" }, // other-category + timestamp + transient key
+      { key: "project.repo.clones.yesterday", value: "5,315" }, // count + moving window
+      { key: "project.bounties.open", value: "3" }, // bare count
+      { key: "mental_model.memory_grounding_failure", value: "true" }, // other category
+      { key: "project.no_inference", value: "true" }, // boolean assertion
+      { key: "project.latest_release", value: "v2" }, // transient key token
+    ];
+    for (const b of bad) {
+      const r = store.pin({ ...b, source: "extraction" });
+      expect(r.op, b.key).toBe("rejected");
+    }
+    expect(store.listActive().length).toBe(0);
+  });
+
+  it("still accepts durable identifier-shaped background pins", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    const good = [
+      { key: "project.repo", value: "github.com/Bitterbot-AI/bitterbot-desktop" },
+      { key: "infra.gateway", value: "a2a.bitterbot.ai" },
+      { key: "preference.editor", value: "vscode" },
+      { key: "infra.node_version", value: "22.22.1" }, // dotted version, not a bare count
+      { key: "identity.user_name", value: "Victor" },
+    ];
+    for (const g of good) {
+      const r = store.pin({ ...g, source: "extraction" });
+      expect(r.op, g.key).toBe("add");
+    }
+  });
+
+  it("does not restrict deliberate pins — the user may pin anything valid", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    const r = store.pin({
+      key: "project.launch_count",
+      value: "3",
+      source: "agent_pin",
+    });
+    expect(r.op).toBe("add");
+  });
+});
+
+describe("conflict-event recording (PLAN-34 Phase 1 fuel)", () => {
+  function conflicts(
+    db: DatabaseSync,
+  ): Array<{ key: string; kind: string; proposed_value: string }> {
+    return db
+      .prepare(`SELECT key, kind, proposed_value FROM canonical_conflicts ORDER BY created_at`)
+      .all() as Array<{ key: string; kind: string; proposed_value: string }>;
+  }
+
+  it("a tier rejection records a tier_rejection conflict event", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "project.repo", value: "github.com/org/alpha", source: "user_directive" });
+    const r = store.pin({
+      key: "project.repo",
+      value: "github.com/org/beta",
+      source: "extraction",
+    });
+    expect(r.op).toBe("rejected");
+    const rows = conflicts(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      key: "project.repo",
+      kind: "tier_rejection",
+      proposed_value: "github.com/org/beta",
+    });
+  });
+
+  it("a rapid same-key supersede of a corroborated belief records rapid_supersede", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "infra.gateway", value: "a2a.example.com", source: "extraction" });
+    // Corroborate (mention_count -> 2, last_confirmed_at -> now)...
+    store.pin({ key: "infra.gateway", value: "a2a.example.com", source: "extraction" });
+    // ...then flip inside the window: supersedes AND records the ambiguity.
+    const r = store.pin({ key: "infra.gateway", value: "gw.example.com", source: "extraction" });
+    expect(r.op).toBe("supersede");
+    const rows = conflicts(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: "rapid_supersede", proposed_value: "gw.example.com" });
+  });
+
+  it("uncorroborated or stale beliefs supersede silently", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    // Single mention: a plain correction, no conflict.
+    store.pin({ key: "preference.editor", value: "vscode", source: "extraction" });
+    expect(store.pin({ key: "preference.editor", value: "neovim", source: "extraction" }).op).toBe(
+      "supersede",
+    );
+    // Corroborated but last confirmed outside the 72h window: silent too.
+    store.pin({ key: "infra.region", value: "us-east-1", source: "extraction" });
+    store.pin({ key: "infra.region", value: "us-east-1", source: "extraction" });
+    db.prepare(`UPDATE canonical_facts SET last_confirmed_at = ? WHERE key = 'infra.region'`).run(
+      Date.now() - 96 * 3_600_000,
+    );
+    expect(store.pin({ key: "infra.region", value: "eu-west-1", source: "extraction" }).op).toBe(
+      "supersede",
+    );
+    expect(conflicts(db)).toHaveLength(0);
+  });
+
+  it("keeps at most one UNCONSUMED conflict per key (dream-cycle retries must not grow the table)", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "project.repo", value: "github.com/org/alpha", source: "user_directive" });
+    // The same background proposal rejected over and over (e.g. canonical
+    // promotion retrying every dream cycle).
+    for (let i = 0; i < 5; i++) {
+      store.pin({ key: "project.repo", value: "github.com/org/beta", source: "promotion" });
+    }
+    const count = db
+      .prepare(`SELECT COUNT(*) AS c FROM canonical_conflicts WHERE consumed_at IS NULL`)
+      .get() as { c: number };
+    expect(count.c).toBe(1);
+    // Once consumed, a fresh conflict may be recorded again.
+    db.prepare(`UPDATE canonical_conflicts SET consumed_at = ?`).run(Date.now());
+    store.pin({ key: "project.repo", value: "github.com/org/beta", source: "promotion" });
+    const after = db
+      .prepare(`SELECT COUNT(*) AS c FROM canonical_conflicts WHERE consumed_at IS NULL`)
+      .get() as { c: number };
+    expect(after.c).toBe(1);
+  });
+
+  it("conflict recording never breaks pin() when the table is missing (pre-v34 DB)", () => {
+    const db = makeDb();
+    db.exec(`DROP TABLE canonical_conflicts`);
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "project.repo", value: "a", source: "user_directive" });
+    const r = store.pin({ key: "project.repo", value: "b", source: "extraction" });
+    expect(r.op).toBe("rejected"); // the reject verdict itself is unaffected
+  });
+});
+
+describe("web_research tier (PLAN-34 Phase 2b)", () => {
+  it("web_research can never supersede any existing belief (tier 0 vs 1+)", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "project.repo", value: "github.com/org/alpha", source: "extraction" });
+    const r = store.pin({
+      key: "project.repo",
+      value: "github.com/org/evil",
+      source: "web_research",
+    });
+    expect(r.op).toBe("rejected");
+    expect(store.get("project.repo")!.value).toBe("github.com/org/alpha");
+  });
+
+  it("tier-0 strengthen is corroboration-only: no confidence motion, no recency refresh", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({
+      key: "infra.gateway",
+      value: "a2a.example.com",
+      source: "extraction",
+      confidence: 0.7,
+    });
+    const before = store.get("infra.gateway")!;
+
+    const r = store.pin({ key: "infra.gateway", value: "a2a.example.com", source: "web_research" });
+    expect(r.op).toBe("strengthen");
+    const after = store.get("infra.gateway")!;
+    expect(after.confidence).toBe(before.confidence); // no motion from tier 0
+    expect(after.lastConfirmedAt).toBe(before.lastConfirmedAt); // no recency refresh
+    expect(after.mentionCount).toBe(before.mentionCount); // separate counter
+    expect(after.corroborationCount).toBe(1);
+  });
+
+  it("tier-0 strengthen cannot reactivate a retired fact", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db);
+    store.pin({ key: "infra.old_host", value: "h1.example", source: "extraction" });
+    store.retire("infra.old_host");
+    const r = store.pin({ key: "infra.old_host", value: "h1.example", source: "web_research" });
+    expect(r.op).toBe("strengthen");
+    expect(store.get("infra.old_host")!.status).toBe("retired"); // stays retired
+    // A tier-1 confirmation still reactivates, as before.
+    store.pin({ key: "infra.old_host", value: "h1.example", source: "extraction" });
+    expect(store.get("infra.old_host")!.status).toBe("active");
+  });
+
+  it("N repeated web strengthens never outrank or evict a deliberate pin", () => {
+    const db = makeDb();
+    // Room for all three so the web fact really ADDs then STRENGTHENs.
+    const store = new CanonicalFactsStore(db, { maxFacts: 3 });
+    store.pin({ key: "identity.user_name", value: "Victor", source: "user_directive" });
+    store.pin({ key: "project.repo", value: "github.com/org/alpha", source: "agent_pin" });
+    expect(store.pin({ key: "infra.cdn", value: "cdn.example", source: "web_research" }).op).toBe(
+      "add",
+    );
+    // Hammer the web fact with 25 real STRENGTHENs...
+    for (let i = 0; i < 25; i++) {
+      expect(store.pin({ key: "infra.cdn", value: "cdn.example", source: "web_research" }).op).toBe(
+        "strengthen",
+      );
+    }
+    const web = store.get("infra.cdn")!;
+    expect(web.corroborationCount).toBe(25); // counted...
+    expect(web.mentionCount).toBe(1); // ...but confidence/mentions never moved
+    // Now a deliberate pin needs the slot: the web fact is the tier-0 victim,
+    // never either deliberate pin.
+    store.pin({ key: "infra.gateway", value: "gw.example", source: "user_directive" });
+    expect(store.get("infra.cdn")!.status).toBe("retired");
+    expect(store.get("identity.user_name")!.status).toBe("active");
+    expect(store.get("project.repo")!.status).toBe("active");
+  });
+
+  it("tier-first eviction: a web_research ADD evicts only equal-or-lower-tier victims", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db, { maxFacts: 2 });
+    store.pin({ key: "identity.user_name", value: "Victor", source: "user_directive" });
+    store.pin({ key: "infra.old", value: "old.example", source: "web_research" });
+    // Cap full: user_directive (tier 2) + web_research (tier 0). A new
+    // web ADD may displace the tier-0 fact, never the deliberate pin.
+    const r = store.pin({ key: "infra.new", value: "new.example", source: "web_research" });
+    expect(r.op).toBe("add");
+    expect(store.get("identity.user_name")!.status).toBe("active");
+    expect(store.get("infra.old")!.status).toBe("retired");
+  });
+
+  it("corroboration contributes a hard-capped promotion-score bonus", () => {
+    const base = { confidence: 0.8, mentionCount: 3, lastConfirmedAt: Date.now() };
+    const now = Date.now();
+    const plain = canonicalPromotionScore(base, now);
+    const capped = canonicalPromotionScore({ ...base, corroborationCount: 1000 }, now);
+    expect(capped).toBeGreaterThan(plain);
+    expect(capped / plain).toBeLessThanOrEqual(1.05 + 1e-9); // hard cap: +5%
+  });
+});
+
+describe("tier-first eviction atomicity (PLAN-34 Phase 2 adversarial fix)", () => {
+  it("a rejected lower-tier ADD retires NOTHING (atomic — no partial evictions)", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db, { maxFacts: 2 });
+    store.pin({ key: "identity.user_name", value: "Victor", source: "user_directive" });
+    store.pin({ key: "project.repo", value: "github.com/org/a", source: "agent_pin" });
+    // Ledger full of tier-2 facts; a tier-0 ADD cannot displace them.
+    const r = store.pin({ key: "infra.cdn", value: "cdn.example", source: "web_research" });
+    expect(r.op).toBe("rejected");
+    // Both deliberate pins remain ACTIVE — nothing was retired.
+    expect(store.get("identity.user_name")!.status).toBe("active");
+    expect(store.get("project.repo")!.status).toBe("active");
+    expect(store.listActive()).toHaveLength(2);
+  });
+
+  it("a same-tier ADD does not displace a higher-scored same-tier fact", () => {
+    const db = makeDb();
+    const store = new CanonicalFactsStore(db, { maxFacts: 1 });
+    // A well-confirmed extraction fact holds the single slot.
+    store.pin({ key: "infra.a", value: "v1", source: "extraction", confidence: 0.9 });
+    store.pin({ key: "infra.a", value: "v1", source: "extraction" }); // strengthen
+    // A fresh same-tier ADD (mention_count 1) scores lower → rejected.
+    const r = store.pin({ key: "infra.b", value: "v2", source: "extraction", confidence: 0.3 });
+    expect(r.op).toBe("rejected");
+    expect(store.get("infra.a")!.status).toBe("active");
+    expect(store.get("infra.b")).toBeNull();
+  });
+});
+
+describe("CanonicalFactsStore.lookup — PLAN-33 Phase 4 ledger-first hits", () => {
+  let db: DatabaseSync;
+  let store: CanonicalFactsStore;
+
+  beforeEach(() => {
+    db = makeDb();
+    store = new CanonicalFactsStore(db);
+    store.pin({
+      key: "project.repo",
+      value: "github.com/Bitterbot-AI/bitterbot-desktop",
+      statement: "The project repository is github.com/Bitterbot-AI/bitterbot-desktop.",
+      category: "project",
+      source: "agent_pin",
+    });
+    store.pin({
+      key: "identity.user-name",
+      value: "Victor",
+      category: "identity",
+      source: "agent_pin",
+    });
+  });
+
+  it("matches when every human token of the key is present in the query", () => {
+    const hits = store.lookup("what is the project repo again?");
+    expect(hits[0]?.fact.key).toBe("project.repo");
+    expect(hits[0]?.matchKind).toBe("key");
+    expect(hits[0]?.score).toBeGreaterThanOrEqual(0.6);
+  });
+
+  it("matches when the query verbatim contains the fact value", () => {
+    const hits = store.lookup("is github.com/Bitterbot-AI/bitterbot-desktop still the right one?");
+    expect(hits[0]?.fact.key).toBe("project.repo");
+    expect(hits[0]?.matchKind).toBe("value");
+    expect(hits[0]?.score).toBeGreaterThanOrEqual(0.95);
+  });
+
+  it("matches when the query normalizes to the exact canonical key", () => {
+    const hits = store.lookup("identity.user-name");
+    expect(hits[0]?.fact.key).toBe("identity.user-name");
+    expect(hits[0]?.score).toBe(1);
+  });
+
+  it("does NOT fuzzy-fire on an unrelated query (precision-first)", () => {
+    expect(store.lookup("what did the weather look like yesterday")).toEqual([]);
+    // Partial key token alone ("project") must not match project.repo.
+    expect(store.lookup("tell me about the project timeline")).toEqual([]);
+  });
+
+  it("never returns retired or superseded facts", () => {
+    store.retire("identity.user-name", { reason: "decay" });
+    expect(store.lookup("identity.user-name")).toEqual([]);
+    // Superseded value is not matchable; only the current belief is.
+    store.pin({ key: "project.repo", value: "VGIL77/fork", source: "owner" });
+    expect(store.lookup("github.com/Bitterbot-AI/bitterbot-desktop")).toEqual([]);
+    expect(store.lookup("VGIL77/fork")[0]?.fact.value).toBe("VGIL77/fork");
+  });
+
+  it("respects the limit and empty-query guard", () => {
+    expect(store.lookup("")).toEqual([]);
+    expect(store.lookup("   ")).toEqual([]);
+    const many = store.lookup("project repo", { limit: 1 });
+    expect(many.length).toBeLessThanOrEqual(1);
+  });
+});
+
+/**
+ * P1-F7 (phase adversarial pass): the staleness ask budget was LIFETIME.
+ * `staleness_asked_count` only ever incremented, so after three unanswered
+ * asks a fact flipped to 'unconfirmed', and every later staleness episode
+ * flipped it again WITHOUT asking — re-confirmation restored status='active'
+ * but left the spent counter. The oldest, most-confirmed facts
+ * (identity.user.name, relationship.spouse.name) sat first in the staleness
+ * queue and would have silently dropped from the active ledger ~2026-10-14.
+ * A confirmation now ends the episode: fresh budget, fresh episode.
+ */
+describe("staleness ask budget resets on re-confirmation", () => {
+  let db: DatabaseSync;
+  let store: CanonicalFactsStore;
+
+  beforeEach(() => {
+    db = makeDb();
+    store = new CanonicalFactsStore(db);
+  });
+
+  function spendBudget(key: string): void {
+    db.prepare(
+      `UPDATE canonical_facts
+          SET staleness_asked_count = 3, last_staleness_ask_at = ?, status = 'unconfirmed'
+        WHERE key = ?`,
+    ).run(Date.now() - 1000, key);
+  }
+
+  function budgetRow(key: string): {
+    staleness_asked_count: number;
+    last_staleness_ask_at: number | null;
+    status: string;
+  } {
+    return db
+      .prepare(
+        `SELECT staleness_asked_count, last_staleness_ask_at, status
+           FROM canonical_facts WHERE key = ? AND valid_until IS NULL`,
+      )
+      .get(key) as never;
+  }
+
+  it("a tier>=1 re-confirmation revives the fact AND refunds the ask budget", () => {
+    store.pin({ key: "identity.user.name", value: "Victor", source: "user_directive" });
+    spendBudget("identity.user.name");
+
+    const result = store.pin({ key: "identity.user.name", value: "Victor", source: "extraction" });
+    expect(result.op).toBe("strengthen");
+
+    const row = budgetRow("identity.user.name");
+    expect(row.status).toBe("active");
+    expect(row.staleness_asked_count, "the next staleness episode gets a fresh budget").toBe(0);
+    expect(row.last_staleness_ask_at).toBeNull();
+  });
+
+  it("a tier-0 corroboration does NOT refund the budget (web agreement is not confirmation)", () => {
+    store.pin({ key: "identity.user.name", value: "Victor", source: "user_directive" });
+    spendBudget("identity.user.name");
+
+    const result = store.pin({
+      key: "identity.user.name",
+      value: "Victor",
+      source: "web_research",
+    });
+    expect(result.op).toBe("strengthen");
+
+    const row = budgetRow("identity.user.name");
+    expect(row.status, "tier-0 must not reactivate").toBe("unconfirmed");
+    expect(row.staleness_asked_count, "tier-0 must not refund the ask budget").toBe(3);
+  });
+
+  it("a supersede starts the new belief with a fresh budget", () => {
+    store.pin({ key: "identity.user.name", value: "Victor", source: "user_directive" });
+    spendBudget("identity.user.name");
+
+    const result = store.pin({
+      key: "identity.user.name",
+      value: "Victor M. Gil",
+      source: "user_directive",
+    });
+    expect(result.op).toBe("supersede");
+
+    const row = budgetRow("identity.user.name");
+    expect(row.staleness_asked_count).toBe(0);
+    expect(row.status).toBe("active");
+  });
+});
+
+/**
+ * PLAN-55 Phase 1: scope and evidence on the fact, and the held agent
+ * supersede (an agent pin never silently replaces a tier >= 2 belief).
+ */
+describe("PLAN-55 Phase 1: scope, evidence_ref, held supersede", () => {
+  let db: DatabaseSync;
+  let store: CanonicalFactsStore;
+
+  beforeEach(() => {
+    db = makeDb();
+    store = new CanonicalFactsStore(db);
+  });
+
+  it("migration v77 adds scope (default global) and evidence_ref (nullable)", () => {
+    const cols = (
+      db.prepare(`PRAGMA table_info(canonical_facts)`).all() as Array<{
+        name: string;
+        dflt_value: string | null;
+        notnull: number;
+      }>
+    ).reduce<Record<string, { dflt: string | null; notnull: number }>>((acc, c) => {
+      acc[c.name] = { dflt: c.dflt_value, notnull: c.notnull };
+      return acc;
+    }, {});
+    expect(cols.scope).toEqual({ dflt: "'global'", notnull: 1 });
+    expect(cols.evidence_ref).toEqual({ dflt: null, notnull: 0 });
+  });
+
+  it("normalizes scopes and rejects shapes nothing could match", () => {
+    expect(normalizeCanonicalScope(undefined)).toBe("global");
+    expect(normalizeCanonicalScope("")).toBe("global");
+    expect(normalizeCanonicalScope(" Global ")).toBe("global");
+    expect(normalizeCanonicalScope("project: Acme Corp")).toBe("project:acme-corp");
+    expect(normalizeCanonicalScope("person:Victor")).toBe("person:victor");
+    expect(normalizeCanonicalScope("team:x")).toBeNull();
+    expect(normalizeCanonicalScope("project:")).toBeNull();
+    expect(normalizeCanonicalScope("project:!!!")).toBeNull();
+    expect(store.pin({ key: "a.b", value: "v", source: "owner", scope: "team:x" }).op).toBe(
+      "rejected",
+    );
+  });
+
+  it("stores scope and evidence_ref on ADD and SUPERSEDE, keeps scope when a correction names none", () => {
+    const added = store.pin({
+      key: "infra.deploy_endpoint",
+      value: "api.acme.com",
+      source: "extraction",
+      scope: "project:acme",
+      evidenceRef: "session:/s/a.jsonl#L4",
+    });
+    expect(added.op).toBe("add");
+    expect(store.get("infra.deploy_endpoint")).toMatchObject({
+      scope: "project:acme",
+      evidenceRef: "session:/s/a.jsonl#L4",
+    });
+    const sup = store.pin({
+      key: "infra.deploy_endpoint",
+      value: "api2.acme.com",
+      source: "owner",
+      evidenceRef: "session:/s/a.jsonl#L9",
+    });
+    expect(sup.op).toBe("supersede");
+    expect(store.get("infra.deploy_endpoint")).toMatchObject({
+      value: "api2.acme.com",
+      scope: "project:acme",
+      evidenceRef: "session:/s/a.jsonl#L9",
+    });
+    // "everywhere": the owner re-pins the same value as global.
+    const widened = store.pin({
+      key: "infra.deploy_endpoint",
+      value: "api2.acme.com",
+      source: "owner",
+      scope: "global",
+    });
+    expect(widened.op).toBe("strengthen");
+    expect(store.get("infra.deploy_endpoint")?.scope).toBe("global");
+  });
+
+  it("a lower tier cannot move the scope a higher tier set; newest evidence wins", () => {
+    store.pin({
+      key: "project.repo",
+      value: "org/repo",
+      source: "owner",
+      scope: "project:acme",
+      evidenceRef: "session:/s/a.jsonl#L1",
+    });
+    const res = store.pin({
+      key: "project.repo",
+      value: "org/repo",
+      source: "extraction",
+      scope: "global",
+      evidenceRef: "session:/s/b.jsonl#L7",
+    });
+    expect(res.op).toBe("strengthen");
+    const fact = store.get("project.repo");
+    expect(fact?.scope).toBe("project:acme");
+    expect(fact?.evidenceRef).toBe("session:/s/b.jsonl#L7");
+    expect(fact?.source).toBe("owner");
+  });
+
+  it("holds an agent pin that would replace a tier >= 2 belief and records pending_supersede", () => {
+    store.pin({ key: "infra.deploy_endpoint", value: "api.acme.com", source: "agent_pin" });
+    const held = store.pin({
+      key: "infra.deploy_endpoint",
+      value: "api2.acme.com",
+      source: "agent_pin",
+    });
+    expect(held.op).toBe("held");
+    if (held.op !== "held") {
+      throw new Error("unreachable");
+    }
+    expect(held.fact.value).toBe("api.acme.com");
+    expect(held.proposedValue).toBe("api2.acme.com");
+    // Nothing written: the current belief and the history are untouched.
+    expect(store.get("infra.deploy_endpoint")?.value).toBe("api.acme.com");
+    expect(store.history("infra.deploy_endpoint")).toHaveLength(1);
+    const conflicts = db
+      .prepare(`SELECT kind, current_value, proposed_value FROM canonical_conflicts WHERE key = ?`)
+      .all("infra.deploy_endpoint") as Array<{
+      kind: string;
+      current_value: string;
+      proposed_value: string;
+    }>;
+    expect(conflicts).toEqual([
+      { kind: "pending_supersede", current_value: "api.acme.com", proposed_value: "api2.acme.com" },
+    ]);
+    // The same holds against the owner's belief.
+    store.pin({ key: "identity.user.name", value: "Victor", source: "owner" });
+    expect(store.pin({ key: "identity.user.name", value: "Vic", source: "agent_pin" }).op).toBe(
+      "held",
+    );
+    // The owner is never held, and a same-value agent pin still strengthens.
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api3.acme.com", source: "owner" }).op,
+    ).toBe("supersede");
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api3.acme.com", source: "agent_pin" }).op,
+    ).toBe("strengthen");
+  });
+
+  it("a second held attempt on the same key refreshes the one pending row to the latest proposal", () => {
+    store.pin({ key: "infra.deploy_endpoint", value: "api.acme.com", source: "owner" });
+    store.pin({ key: "infra.deploy_endpoint", value: "api2.acme.com", source: "agent_pin" });
+    const before = store.listPendingSupersedes()[0]!;
+    store.pin({ key: "infra.deploy_endpoint", value: "api3.acme.com", source: "agent_pin" });
+    const pending = store.listPendingSupersedes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      id: before.id,
+      currentValue: "api.acme.com",
+      proposedValue: "api3.acme.com",
+    });
+    expect(pending[0]!.createdAt).toBeGreaterThanOrEqual(before.createdAt);
+    // `since` filters by the refreshed time.
+    expect(store.listPendingSupersedes({ since: pending[0]!.createdAt + 1 })).toEqual([]);
+  });
+
+  it("an agent pin still supersedes a tier <= 1 belief (extraction, seed)", () => {
+    store.pin({ key: "infra.deploy_endpoint", value: "api.acme.com", source: "extraction" });
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api2.acme.com", source: "agent_pin" }).op,
+    ).toBe("supersede");
+  });
+
+  it("review item 1: the agent cannot retire a tier >= 2 belief; the attempt is held", () => {
+    store.pin({ key: "infra.deploy_endpoint", value: "api.acme.com", source: "agent_pin" });
+    const held = store.retireAgent("infra.deploy_endpoint");
+    expect(held.op).toBe("held");
+    expect(held.reason).toMatch(/held for the owner's confirmation/);
+    // Nothing changed, and the plain retire() path is guarded the same way.
+    expect(store.get("infra.deploy_endpoint")?.status).toBe("active");
+    expect(store.retire("infra.deploy_endpoint", { reason: "agent" })).toBe(false);
+    expect(store.get("infra.deploy_endpoint")?.status).toBe("active");
+    expect(store.listPendingSupersedes()).toMatchObject([
+      {
+        key: "infra.deploy_endpoint",
+        kind: "pending_retire",
+        currentValue: "api.acme.com",
+        proposedValue: "",
+      },
+    ]);
+    // The retire-then-repin bypass is closed: still held.
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api2.acme.com", source: "agent_pin" }).op,
+    ).toBe("held");
+    expect(store.get("infra.deploy_endpoint")?.value).toBe("api.acme.com");
+    // The owner's belief: same.
+    store.pin({ key: "identity.user.name", value: "Victor", source: "owner" });
+    expect(store.retireAgent("identity.user.name").op).toBe("held");
+    expect(store.get("identity.user.name")?.status).toBe("active");
+    // A tier-1 belief the agent may still retire, and that is not held.
+    store.pin({ key: "project.repo", value: "org/a", source: "extraction" });
+    expect(store.retireAgent("project.repo")).toMatchObject({ op: "retired" });
+    expect(store.get("project.repo")?.status).toBe("retired");
+    expect(store.retireAgent("project.repo").op).toBe("noop");
+  });
+
+  it("review item 1: a retired/unconfirmed tier >= 2 row still guards against the agent, not against others", () => {
+    store.pin({ key: "identity.user.name", value: "Victor", source: "owner" });
+    store.retire("identity.user.name", { reason: "decay" });
+    expect(store.get("identity.user.name")?.status).toBe("retired");
+    // The agent: held, nothing written.
+    expect(store.pin({ key: "identity.user.name", value: "Vic", source: "agent_pin" }).op).toBe(
+      "held",
+    );
+    expect(store.get("identity.user.name")?.value).toBe("Victor");
+    // Extraction keeps the Phase 0 reading: a retired row is not a current belief.
+    expect(store.pin({ key: "identity.user.name", value: "Vic", source: "extraction" }).op).toBe(
+      "supersede",
+    );
+    // The owner's own retire (owner_retired) keeps the Phase 0 reading for the agent too.
+    store.pin({ key: "infra.deploy_endpoint", value: "api.acme.com", source: "agent_pin" });
+    store.retire("infra.deploy_endpoint", { reason: "owner" });
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api2.acme.com", source: "agent_pin" }).op,
+    ).toBe("supersede");
+  });
+
+  it("review item 5: credential-shaped values and secret-named keys are refused from every source, without echoing the value", () => {
+    const token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (const source of ["owner", "agent_pin", "extraction"] as const) {
+      const res = store.pin({ key: "identity.github.token", value: "whatever", source });
+      expect(res.op).toBe("rejected");
+      const byValue = store.pin({ key: "infra.github.handle", value: token, source });
+      expect(byValue.op).toBe("rejected");
+      if (byValue.op === "rejected") {
+        expect(byValue.reason).not.toContain(token);
+        expect(byValue.reason).toMatch(/credential/);
+      }
+    }
+    expect(store.listActive()).toEqual([]);
+    // Ordinary values with digits and dots still land.
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api2.acme.com", source: "owner" }).op,
+    ).toBe("add");
+    expect(store.pin({ key: "project.version", value: "v1.4.0-rc.2", source: "owner" }).op).toBe(
+      "add",
+    );
+  });
+
+  it("review item 2: an owner-tier write settles the key: pending conflicts consumed, open canonical directives resolved", () => {
+    store.pin({ key: "infra.deploy_endpoint", value: "api.acme.com", source: "agent_pin" });
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api2.acme.com", source: "agent_pin" }).op,
+    ).toBe("held");
+    expect(store.listPendingSupersedes()).toHaveLength(1);
+    db.prepare(
+      `INSERT INTO epistemic_directives (id, directive_type, question, context, priority, created_at, source_entity_ids)
+       VALUES ('d1', 'contradiction', 'q', 'c', 0.7, ?, ?)`,
+    ).run(
+      Date.now(),
+      JSON.stringify(["canonical:infra.deploy_endpoint", "candidate:a", "candidate:b"]),
+    );
+    db.prepare(
+      `INSERT INTO epistemic_directives (id, directive_type, question, context, priority, created_at, source_entity_ids)
+       VALUES ('d2', 'contradiction', 'q', 'c', 0.7, ?, ?)`,
+    ).run(Date.now(), JSON.stringify(["canonical:infra.deploy_endpoint_other"]));
+    expect(
+      store.pin({ key: "infra.deploy_endpoint", value: "api3.acme.com", source: "owner" }).op,
+    ).toBe("supersede");
+    expect(store.listPendingSupersedes()).toEqual([]);
+    const rows = db
+      .prepare(`SELECT id, resolved_at, status FROM epistemic_directives ORDER BY id`)
+      .all() as Array<{ id: string; resolved_at: number | null; status: string }>;
+    expect(rows[0]).toMatchObject({ id: "d1", status: "answered" });
+    expect(rows[0]!.resolved_at).not.toBeNull();
+    // LIKE is literal: the longer key with the same prefix is untouched.
+    expect(rows[1]).toMatchObject({ id: "d2", resolved_at: null });
+    // A non-owner write settles nothing.
+    store.pin({ key: "project.repo", value: "org/a", source: "agent_pin" });
+    store.pin({ key: "project.repo", value: "org/b", source: "agent_pin" });
+    store.pin({ key: "project.repo", value: "org/a", source: "extraction" });
+    expect(store.listPendingSupersedes()).toHaveLength(1);
+  });
+
+  it("renderBlock includes project-scoped facts only for the matching active project", () => {
+    store.pin({ key: "identity.user.name", value: "Victor", source: "owner" });
+    store.pin({
+      key: "infra.deploy_endpoint",
+      value: "api2.acme.com",
+      source: "owner",
+      scope: "project:Acme",
+    });
+    store.pin({
+      key: "relationship.alice.role",
+      value: "designer",
+      source: "owner",
+      scope: "person:alice",
+    });
+    const none = store.renderBlock() ?? "";
+    expect(none).toContain("[identity.user.name]");
+    expect(none).toContain("[relationship.alice.role]");
+    expect(none).not.toContain("[infra.deploy_endpoint]");
+    const other = store.renderBlock({ activeProject: "globex" }) ?? "";
+    expect(other).not.toContain("[infra.deploy_endpoint]");
+    const acme = store.renderBlock({ activeProject: "acme" }) ?? "";
+    expect(acme).toContain("[infra.deploy_endpoint] api2.acme.com");
+    // Name normalisation on both sides: "Acme" (pinned) matches "ACME" (workspace).
+    expect(store.renderBlock({ activeProject: "ACME" }) ?? "").toContain("[infra.deploy_endpoint]");
+  });
+
+  it("isCanonicalFactVisibleInScope: unknown scopes read as global, no project means no project facts", () => {
+    expect(isCanonicalFactVisibleInScope("global", undefined)).toBe(true);
+    expect(isCanonicalFactVisibleInScope("garbage", undefined)).toBe(true);
+    expect(isCanonicalFactVisibleInScope("person:bob", null)).toBe(true);
+    expect(isCanonicalFactVisibleInScope("project:acme", undefined)).toBe(false);
+    expect(isCanonicalFactVisibleInScope("project:acme", "")).toBe(false);
+    expect(isCanonicalFactVisibleInScope("project:acme", "acme")).toBe(true);
+    expect(isCanonicalFactVisibleInScope("project:acme", "Acme Corp")).toBe(false);
+  });
+});

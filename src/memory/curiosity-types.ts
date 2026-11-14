@@ -1,0 +1,265 @@
+/**
+ * Curiosity Engine types: knowledge regions, exploration targets, surprise
+ * assessment, and configuration.
+ */
+
+export type KnowledgeRegion = {
+  id: string;
+  label: string;
+  centroid: number[];
+  chunkCount: number;
+  totalAccesses: number;
+  meanImportance: number;
+  predictionError: number;
+  learningProgress: number;
+  createdAt: number;
+  lastUpdatedAt: number;
+};
+
+export type SearchQueryRecord = {
+  id: string;
+  query: string;
+  queryEmbedding: number[];
+  resultCount: number;
+  topScore: number;
+  meanScore: number;
+  regionId: string | null;
+  timestamp: number;
+};
+
+export type ExplorationTargetType =
+  | "knowledge_gap"
+  | "contradiction"
+  | "stale_region"
+  | "frontier"
+  | "graph_bridge";
+
+export type ExplorationTarget = {
+  id: string;
+  type: ExplorationTargetType;
+  description: string;
+  priority: number;
+  regionId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  resolvedAt: number | null;
+  expiresAt: number;
+};
+
+export type SurpriseAssessment = {
+  chunkId: string;
+  noveltyScore: number;
+  surpriseFactor: number;
+  informationGain: number;
+  contradictionScore: number;
+  compositeReward: number;
+  regionId: string | null;
+  assessedAt: number;
+  /** GCCRF component breakdown (when unified scoring is active). */
+  gccrfComponents?: {
+    eta: number;
+    deltaEta: number;
+    iAlpha: number;
+    empowerment: number;
+    strategic: number;
+  };
+  /** GCCRF final reward [0,1] (when unified scoring is active). */
+  gccrfReward?: number;
+};
+
+export type LearningProgressEntry = {
+  id: string;
+  regionId: string;
+  predictionError: number;
+  timestamp: number;
+};
+
+export type EmergenceEvent = {
+  id: string;
+  type: "convergence" | "bridge" | "cluster_formation";
+  description: string;
+  involvedRegions: string[];
+  strength: number;
+  detectedAt: number;
+  metadata: Record<string, unknown>;
+};
+
+export type CuriosityState = {
+  regions: KnowledgeRegion[];
+  targets: ExplorationTarget[];
+  recentSurprises: SurpriseAssessment[];
+  recentEmergence?: EmergenceEvent[];
+  queryCount: number;
+};
+
+export type CuriosityWeights = {
+  novelty: number;
+  surprise: number;
+  informationGain: number;
+  contradiction: number;
+};
+
+/**
+ * PLAN-59 Phase 0 evidence telemetry modes. `off` writes nothing (the tables
+ * still exist), `observe` records retrieval hits and surfacing events,
+ * `shadow` adds decision traces from the dream engine.
+ */
+export type CuriosityEvidenceMode = "off" | "observe" | "shadow";
+
+/**
+ * PLAN-59 Phase 2 surfacing trial modes. `off` writes delivered rows with the
+ * `legacy` arm as Phase 0 did; `shadow` logs eligibility and a randomised-block
+ * arm for every proactive surfacing opportunity and delivers exactly as before.
+ * A `live` mode (withholding) is a separate exposure decision and PR.
+ */
+export type CuriositySurfacingTrialMode = "off" | "shadow";
+
+export type CuriositySurfacingTrialConfig = {
+  /** Default: "shadow" (observation only; nothing the owner sees changes). */
+  mode?: CuriositySurfacingTrialMode;
+  /** Length of one randomisation block in minutes. Default: 240. */
+  blockMinutes?: number;
+  /**
+   * An item (same kind and ref id) assigned within this many days keeps its
+   * arm instead of drawing again. Default: 7.
+   */
+  carryOverDays?: number;
+  /**
+   * Trial seed for the arm draw. Absent, it is derived from the node's own
+   * evidence digest key, so assignment is deterministic per node and cannot
+   * be reconstructed from the logged rows.
+   */
+  seed?: string;
+};
+
+export type CuriosityEvidenceConfig = {
+  /**
+   * Default: "shadow" (every tier of evidence, so the GCCRF retirement decision
+   * in PLAN-59 section 7 can be evaluated on any node without a config change).
+   */
+  mode?: CuriosityEvidenceMode;
+  /** Rows older than this are pruned on the consolidation tick. Default: 90. */
+  retentionDays?: number;
+  /** At most this many retrieval rows per search. Default: 10. */
+  topK?: number;
+  /**
+   * PLAN-59 Phase 2: shadow eligibility and assignment for proactive surfacing.
+   * Writes nothing when `mode` (the evidence layer) is `off`.
+   */
+  surfacingTrial?: CuriositySurfacingTrialConfig;
+};
+
+export type CuriosityConfig = {
+  /** Enable curiosity engine. Default: true. */
+  enabled?: boolean;
+  /**
+   * PLAN-34 Phase 2c: autonomous research egress controls — the ONLY new
+   * config the plan introduces on the curiosity side. enabled default
+   * true; maxPerDay default 10 (persisted UTC-day attempt counter,
+   * reserve-then-act). External research additionally requires a local
+   * depersonalization model (memory.dream.modelTiers.localModel); without
+   * one it fails closed to zero egress.
+   */
+  autoResearch?: { enabled?: boolean; maxPerDay?: number };
+  /** Component weights for reward computation (legacy heuristic — ignored when GCCRF active). */
+  weights?: Partial<CuriosityWeights>;
+  /** Composite reward threshold to boost importance. Default: 0.4. */
+  boostThreshold?: number;
+  /** Multiplier applied to importance when boost fires. Default: 1.3. */
+  boostMultiplier?: number;
+  /** Maximum number of knowledge regions. Default: 50. */
+  maxRegions?: number;
+  /** Maximum active exploration targets. Default: 10. */
+  maxTargets?: number;
+  /** Exploration target TTL in hours. Default: 168 (7 days). */
+  targetTtlHours?: number;
+  /** Maximum stored search queries for gap detection. Default: 200. */
+  maxQueryHistory?: number;
+  /** Score threshold below which a query indicates a gap. Default: 0.5. */
+  gapScoreThreshold?: number;
+  /**
+   * Let the dream engine's FSHO order parameter modulate GCCRF's alpha
+   * schedule (`effective_alpha = base_alpha + 0.5 * (R_avg - 0.5)`). Default:
+   * false. Off, FSHO R is tracked for telemetry only and novelty uses the pure
+   * dream-cycle maturity schedule.
+   */
+  fshoCoupling?: boolean;
+  /**
+   * PLAN-59 Phase 0: the evidence layer. Records what retrieval surfaced,
+   * what the agent proactively surfaced to the owner and what came of it,
+   * and (shadow mode only) what a GCCRF-as-diagnostic routing would have
+   * decided next to what the legacy routing did. Observation changes no
+   * behaviour in any mode. Default mode `shadow`.
+   */
+  evidence?: CuriosityEvidenceConfig;
+  /** GCCRF reward function configuration. When provided, GCCRF replaces heuristic scoring. */
+  gccrf?:
+    | import("./gccrf-reward.js").GCCRFConfig
+    | Partial<import("./gccrf-reward.js").GCCRFConfig>;
+  /** PLAN-11 Gap 1: converts repeated user queries into knowledge_gap targets. */
+  /**
+   * PLAN-54: autonomous research on the maintenance tick. On by default; the
+   * agent abstracts a question to a topic phrase, searches, reads, and
+   * remembers a cited answer. Visible on the Curiosity page, pausable there.
+   */
+  research?: import("./curiosity-researcher.js").CuriosityResearchConfig;
+  requestFrequency?: {
+    /** Enable the analyzer (default: true). */
+    enabled?: boolean;
+    /** Lookback window in days for scanning curiosity_queries. Default: 7. */
+    lookbackDays?: number;
+    /** Minimum phrase frequency to surface as a signal. Default: 3. */
+    minFrequency?: number;
+    /** Only emit the top N signals per run. Default: 5. */
+    maxSignals?: number;
+    /** TTL in days for injected knowledge_gap targets. Default: 14. */
+    ttlDays?: number;
+  };
+};
+
+export const DEFAULT_CURIOSITY_WEIGHTS: CuriosityWeights = {
+  novelty: 0.3,
+  surprise: 0.25,
+  informationGain: 0.25,
+  contradiction: 0.2,
+};
+
+export const DEFAULT_CURIOSITY_CONFIG = {
+  enabled: true,
+  weights: DEFAULT_CURIOSITY_WEIGHTS,
+  boostThreshold: 0.4,
+  boostMultiplier: 1.3,
+  maxRegions: 50,
+  maxTargets: 10,
+  targetTtlHours: 48, // 48h keeps exploration targets fresh (was 168h/7 days — too stale)
+  maxQueryHistory: 200,
+  gapScoreThreshold: 0.5,
+} as const;
+
+export type EmotionalConfig = {
+  /** Enable emotional valence modulation. Default: true. */
+  enabled?: boolean;
+  /** Max decay rate reduction from strong emotions. Default: 0.5. */
+  decayResistance?: number;
+  /** Sentiment analysis method. Default: "keyword". */
+  sentimentAnalysis?: "keyword" | "hybrid" | "llm" | "none";
+  /** Hormonal modulation configuration. */
+  hormonal?: {
+    enabled?: boolean;
+    dopamineHalflife?: number;
+    cortisolHalflife?: number;
+    oxytocinHalflife?: number;
+  };
+  /** User model configuration. */
+  userModel?: {
+    enabled?: boolean;
+    extractPreferences?: boolean;
+    detectPatterns?: boolean;
+  };
+};
+
+export const DEFAULT_EMOTIONAL_CONFIG = {
+  enabled: true,
+  decayResistance: 0.5,
+  sentimentAnalysis: "keyword",
+} as const;

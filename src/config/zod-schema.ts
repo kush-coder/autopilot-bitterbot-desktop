@@ -1,0 +1,1410 @@
+import { z } from "zod";
+import { LearningConfigSchema } from "../memory/procedural-learning-contract.js";
+import { ToolsSchema } from "./zod-schema.agent-runtime.js";
+import { AgentsSchema, AudioSchema, BindingsSchema, BroadcastSchema } from "./zod-schema.agents.js";
+import { ApprovalsSchema } from "./zod-schema.approvals.js";
+import { HexColorSchema, ModelsConfigSchema } from "./zod-schema.core.js";
+import { HookMappingSchema, HooksGmailSchema, InternalHooksSchema } from "./zod-schema.hooks.js";
+import { ChannelsSchema } from "./zod-schema.providers.js";
+import { sensitive } from "./zod-schema.sensitive.js";
+import { CommandsSchema, MessagesSchema, SessionSchema } from "./zod-schema.session.js";
+
+const BrowserSnapshotDefaultsSchema = z
+  .object({
+    mode: z.literal("efficient").optional(),
+  })
+  .strict()
+  .optional();
+
+const NodeHostSchema = z
+  .object({
+    browserProxy: z
+      .object({
+        enabled: z.boolean().optional(),
+        allowProfiles: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * PLAN-59 Phase 0: `memory.curiosity.evidence`. Exported so the typed branch can
+ * be tested on its own: inside MemorySchema it sits in a union whose fallback
+ * is `z.unknown()`, so a bad mode there degrades to the unknown branch and the
+ * code-read site (`resolveEvidenceConfig`) falls back to the default.
+ */
+/**
+ * PLAN-59 Phase 2: `memory.curiosity.evidence.surfacingTrial`. Same arrangement
+ * as the evidence block: the typed branch feeds the form; the read site
+ * (`resolveSurfacingTrialConfig`) does its own coercion.
+ */
+export const CuriositySurfacingTrialSchema = z
+  .object({
+    mode: z.enum(["off", "shadow"]).optional(),
+    blockMinutes: z.number().positive().optional(),
+    carryOverDays: z.number().positive().optional(),
+    seed: z.string().min(1).optional(),
+  })
+  .strict();
+
+export const CuriosityEvidenceSchema = z
+  .object({
+    mode: z.enum(["off", "observe", "shadow"]).optional(),
+    retentionDays: z.number().positive().optional(),
+    topK: z.number().int().positive().optional(),
+    surfacingTrial: CuriositySurfacingTrialSchema.optional(),
+  })
+  .strict();
+
+const MemorySchema = z
+  .object({
+    proceduralLearning: LearningConfigSchema.optional(),
+    backend: z.literal("builtin").optional(),
+    citations: z.union([z.literal("auto"), z.literal("on"), z.literal("off")]).optional(),
+    // Token-efficiency item 3: Anthropic Message Batches for latency-tolerant lanes.
+    batch: z
+      .object({
+        enabled: z.boolean().optional(),
+        lanes: z.array(z.string()).optional(),
+        maxWaitMinutes: z.number().positive().optional(),
+      })
+      .strict()
+      .optional(),
+    // PLAN-56 Phase 1: the curiosity keys the Settings form labels, so the
+    // generated JSON schema carries typed leaves for them. ACCEPTANCE IS
+    // UNCHANGED: `memory` was fully passthrough before, so every shape falls
+    // back to the `z.unknown()` branch (null, false, "3" from ${ENV}, ...).
+    // The typed branch exists only for the form's control types; the code-read
+    // sites (curiosity-researcher.ts, manager.ts) keep doing their own coercion.
+    curiosity: z
+      .union([
+        z
+          .object({
+            enabled: z.boolean().optional(),
+            fshoCoupling: z.boolean().optional(),
+            evidence: CuriosityEvidenceSchema.optional(),
+            research: z
+              .union([
+                z
+                  .object({
+                    enabled: z.boolean().optional(),
+                    strictEgress: z.boolean().optional(),
+                    intervalMinutes: z.unknown().optional(),
+                    maxPerDay: z.unknown().optional(),
+                  })
+                  .passthrough(),
+                z.unknown(),
+              ])
+              .optional(),
+            autoResearch: z
+              .union([
+                z
+                  .object({
+                    enabled: z.boolean().optional(),
+                    maxPerDay: z.unknown().optional(),
+                  })
+                  .passthrough(),
+                z.unknown(),
+              ])
+              .optional(),
+          })
+          .passthrough(),
+        z.unknown(),
+      ])
+      .optional(),
+    architectEvolution: z
+      .union([
+        z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .passthrough(),
+        z.unknown(),
+      ])
+      .optional(),
+    // PLAN-55 Phase 1: the per-turn correction capture and its confirmation
+    // line. Same typed-branch-or-unknown shape as curiosity (acceptance unchanged).
+    correction: z
+      .union([
+        z
+          .object({
+            enabled: z.boolean().optional(),
+            confirm: z.boolean().optional(),
+          })
+          .passthrough(),
+        z.unknown(),
+      ])
+      .optional(),
+  })
+  // Memory subsystems (dream, consolidation, digest, requestFrequency, etc.)
+  // are typed in src/config/types.memory.ts but haven't all been mirrored into zod.
+  // Passthrough keeps user configs from being rejected for those fields until the
+  // schema catches up; strong typing at the code-read sites still applies.
+  .passthrough()
+  .optional();
+
+const _HttpUrlSchema = z
+  .string()
+  .url()
+  .refine((value) => {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  }, "Expected http:// or https:// URL");
+
+const UsageBudgetLimitSchema = z.object({ usd: z.number().positive() }).strict();
+
+export const BitterbotSchema = z
+  .object({
+    $schema: z.string().optional(),
+    meta: z
+      .object({
+        lastTouchedVersion: z.string().optional(),
+        lastTouchedAt: z.string().optional(),
+      })
+      .strict()
+      .optional(),
+    env: z
+      .object({
+        shellEnv: z
+          .object({
+            enabled: z.boolean().optional(),
+            timeoutMs: z.number().int().nonnegative().optional(),
+          })
+          .strict()
+          .optional(),
+        vars: z.record(z.string(), z.string()).optional(),
+      })
+      .catchall(z.string())
+      .optional(),
+    wizard: z
+      .object({
+        lastRunAt: z.string().optional(),
+        lastRunVersion: z.string().optional(),
+        lastRunCommit: z.string().optional(),
+        lastRunCommand: z.string().optional(),
+        lastRunMode: z.union([z.literal("local"), z.literal("remote")]).optional(),
+      })
+      .strict()
+      .optional(),
+    usage: z
+      .object({
+        ledger: z
+          .object({
+            enabled: z.boolean().optional(),
+            retentionDays: z.number().int().positive().optional(),
+          })
+          .strict()
+          .optional(),
+        budgets: z
+          .object({
+            mode: z.union([z.literal("warn"), z.literal("enforce")]).optional(),
+            daily: UsageBudgetLimitSchema.optional(),
+            weekly: UsageBudgetLimitSchema.optional(),
+            monthly: UsageBudgetLimitSchema.optional(),
+            perModel: z.record(z.string(), UsageBudgetLimitSchema).optional(),
+            perFeature: z.record(z.string(), UsageBudgetLimitSchema).optional(),
+          })
+          .strict()
+          .optional(),
+        pricing: z
+          .object({
+            liveRefresh: z.boolean().optional(),
+            openRouterUrl: z.string().url().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    diagnostics: z
+      .object({
+        enabled: z.boolean().optional(),
+        flags: z.array(z.string()).optional(),
+        otel: z
+          .object({
+            enabled: z.boolean().optional(),
+            endpoint: z.string().optional(),
+            protocol: z.union([z.literal("http/protobuf"), z.literal("grpc")]).optional(),
+            headers: z.record(z.string(), z.string()).optional(),
+            serviceName: z.string().optional(),
+            traces: z.boolean().optional(),
+            metrics: z.boolean().optional(),
+            logs: z.boolean().optional(),
+            sampleRate: z.number().min(0).max(1).optional(),
+            flushIntervalMs: z.number().int().nonnegative().optional(),
+          })
+          .strict()
+          .optional(),
+        cacheTrace: z
+          .object({
+            enabled: z.boolean().optional(),
+            filePath: z.string().optional(),
+            includeMessages: z.boolean().optional(),
+            includePrompt: z.boolean().optional(),
+            includeSystem: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    logging: z
+      .object({
+        level: z
+          .union([
+            z.literal("silent"),
+            z.literal("fatal"),
+            z.literal("error"),
+            z.literal("warn"),
+            z.literal("info"),
+            z.literal("debug"),
+            z.literal("trace"),
+          ])
+          .optional(),
+        file: z.string().optional(),
+        consoleLevel: z
+          .union([
+            z.literal("silent"),
+            z.literal("fatal"),
+            z.literal("error"),
+            z.literal("warn"),
+            z.literal("info"),
+            z.literal("debug"),
+            z.literal("trace"),
+          ])
+          .optional(),
+        consoleStyle: z
+          .union([z.literal("pretty"), z.literal("compact"), z.literal("json")])
+          .optional(),
+        redactSensitive: z.union([z.literal("off"), z.literal("tools")]).optional(),
+        redactPatterns: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
+    update: z
+      .object({
+        channel: z.union([z.literal("stable"), z.literal("beta"), z.literal("dev")]).optional(),
+        checkOnStart: z.boolean().optional(),
+        promptBehindCommits: z.number().int().min(1).optional(),
+        autoRollback: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        // DEPRECATED, accepted-but-ignored (PLAN-39 Phase 4): the restarter this
+        // gated is deleted. Kept so configs that set it keep validating — the
+        // strict schema rejecting a removed key would refuse to boot (024c7fa).
+        // Warned at load via DEPRECATED_PATHS (PLAN-56 Phase 2); removed next release.
+        uiRestart: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    browser: z
+      .object({
+        enabled: z.boolean().optional(),
+        evaluateEnabled: z.boolean().optional(),
+        cdpUrl: z.string().optional(),
+        remoteCdpTimeoutMs: z.number().int().nonnegative().optional(),
+        remoteCdpHandshakeTimeoutMs: z.number().int().nonnegative().optional(),
+        color: z.string().optional(),
+        executablePath: z.string().optional(),
+        headless: z.boolean().optional(),
+        noSandbox: z.boolean().optional(),
+        attachOnly: z.boolean().optional(),
+        defaultProfile: z.string().optional(),
+        perAgentProfiles: z.boolean().optional(),
+        snapshotDefaults: BrowserSnapshotDefaultsSchema,
+        liveView: z
+          .object({
+            enabled: z.boolean().optional(),
+            maxFps: z.number().int().min(1).max(30).optional(),
+            quality: z.number().int().min(10).max(95).optional(),
+          })
+          .strict()
+          .optional(),
+        replay: z
+          .object({
+            enabled: z.boolean().optional(),
+            retentionDays: z.number().int().min(1).max(90).optional(),
+          })
+          .strict()
+          .optional(),
+        profiles: z
+          .record(
+            z
+              .string()
+              .regex(/^[a-z0-9-]+$/, "Profile names must be alphanumeric with hyphens only"),
+            z
+              .object({
+                cdpPort: z.number().int().min(1).max(65535).optional(),
+                cdpUrl: z.string().optional(),
+                driver: z.union([z.literal("bitterbot"), z.literal("extension")]).optional(),
+                color: HexColorSchema,
+              })
+              .strict()
+              .refine((value) => value.cdpPort || value.cdpUrl, {
+                message: "Profile must set cdpPort or cdpUrl",
+              }),
+          )
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    ui: z
+      .object({
+        seamColor: HexColorSchema.optional(),
+        assistant: z
+          .object({
+            name: z.string().max(50).optional(),
+            avatar: z.string().max(200).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    auth: z
+      .object({
+        profiles: z
+          .record(
+            z.string(),
+            z
+              .object({
+                provider: z.string(),
+                mode: z.union([z.literal("api_key"), z.literal("oauth"), z.literal("token")]),
+                email: z.string().optional(),
+              })
+              .strict(),
+          )
+          .optional(),
+        order: z.record(z.string(), z.array(z.string())).optional(),
+        cooldowns: z
+          .object({
+            billingBackoffHours: z.number().positive().optional(),
+            billingBackoffHoursByProvider: z.record(z.string(), z.number().positive()).optional(),
+            billingMaxHours: z.number().positive().optional(),
+            failureWindowHours: z.number().positive().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    models: ModelsConfigSchema,
+    nodeHost: NodeHostSchema,
+    agents: AgentsSchema,
+    tools: ToolsSchema,
+    bindings: BindingsSchema,
+    broadcast: BroadcastSchema,
+    audio: AudioSchema,
+    media: z
+      .object({
+        preserveFilenames: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    messages: MessagesSchema,
+    commands: CommandsSchema,
+    approvals: ApprovalsSchema,
+    session: SessionSchema,
+    hooks: z
+      .object({
+        enabled: z.boolean().optional(),
+        path: z.string().optional(),
+        token: z.string().optional().register(sensitive),
+        defaultSessionKey: z.string().optional(),
+        allowRequestSessionKey: z.boolean().optional(),
+        allowedSessionKeyPrefixes: z.array(z.string()).optional(),
+        allowedAgentIds: z.array(z.string()).optional(),
+        maxBodyBytes: z.number().int().positive().optional(),
+        presets: z.array(z.string()).optional(),
+        transformsDir: z.string().optional(),
+        mappings: z.array(HookMappingSchema).optional(),
+        gmail: HooksGmailSchema,
+        internal: InternalHooksSchema,
+      })
+      .strict()
+      .optional(),
+    web: z
+      .object({
+        enabled: z.boolean().optional(),
+        heartbeatSeconds: z.number().int().positive().optional(),
+        reconnect: z
+          .object({
+            initialMs: z.number().positive().optional(),
+            maxMs: z.number().positive().optional(),
+            factor: z.number().positive().optional(),
+            jitter: z.number().min(0).max(1).optional(),
+            maxAttempts: z.number().int().min(0).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    channels: ChannelsSchema,
+    discovery: z
+      .object({
+        wideArea: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    canvasHost: z
+      .object({
+        enabled: z.boolean().optional(),
+        root: z.string().optional(),
+        port: z.number().int().positive().optional(),
+        liveReload: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    talk: z
+      .object({
+        voiceId: z.string().optional(),
+        voiceAliases: z.record(z.string(), z.string()).optional(),
+        modelId: z.string().optional(),
+        outputFormat: z.string().optional(),
+        apiKey: z.string().optional().register(sensitive),
+        interruptOnSpeech: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    gateway: z
+      .object({
+        port: z.number().int().positive().optional(),
+        mode: z.union([z.literal("local"), z.literal("remote")]).optional(),
+        bind: z
+          .union([
+            z.literal("auto"),
+            z.literal("lan"),
+            z.literal("loopback"),
+            z.literal("custom"),
+            z.literal("tailnet"),
+          ])
+          .optional(),
+        controlUi: z
+          .object({
+            enabled: z.boolean().optional(),
+            basePath: z.string().optional(),
+            root: z.string().optional(),
+            allowedOrigins: z.array(z.string()).optional(),
+            // Extra hostnames the same-origin token handoff will answer for
+            // (a Tailscale Serve name, say). Loopback names are always allowed.
+            // This is a DNS-rebinding control: see control-ui-session-token.ts.
+            allowedHosts: z.array(z.string()).optional(),
+            bootstrapPairing: z.boolean().optional(),
+            allowInsecureAuth: z.boolean().optional(),
+            dangerouslyDisableDeviceAuth: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        auth: z
+          .object({
+            mode: z
+              .union([z.literal("token"), z.literal("password"), z.literal("trusted-proxy")])
+              .optional(),
+            token: z.string().optional().register(sensitive),
+            password: z.string().optional().register(sensitive),
+            allowTailscale: z.boolean().optional(),
+            rateLimit: z
+              .object({
+                maxAttempts: z.number().optional(),
+                windowMs: z.number().optional(),
+                lockoutMs: z.number().optional(),
+                exemptLoopback: z.boolean().optional(),
+              })
+              .strict()
+              .optional(),
+            trustedProxy: z
+              .object({
+                userHeader: z.string().min(1, "userHeader is required for trusted-proxy mode"),
+                requiredHeaders: z.array(z.string()).optional(),
+                allowUsers: z.array(z.string()).optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        trustedProxies: z.array(z.string()).optional(),
+        tools: z
+          .object({
+            deny: z.array(z.string()).optional(),
+            allow: z.array(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
+        tailscale: z
+          .object({
+            mode: z.union([z.literal("off"), z.literal("serve"), z.literal("funnel")]).optional(),
+            resetOnExit: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        remote: z
+          .object({
+            url: z.string().optional(),
+            transport: z.union([z.literal("ssh"), z.literal("direct")]).optional(),
+            token: z.string().optional().register(sensitive),
+            password: z.string().optional().register(sensitive),
+            tlsFingerprint: z.string().optional(),
+            sshTarget: z.string().optional(),
+            sshIdentity: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        reload: z
+          .object({
+            mode: z
+              .union([
+                z.literal("off"),
+                z.literal("restart"),
+                z.literal("hot"),
+                z.literal("hybrid"),
+              ])
+              .optional(),
+            debounceMs: z.number().int().min(0).optional(),
+          })
+          .strict()
+          .optional(),
+        tls: z
+          .object({
+            enabled: z.boolean().optional(),
+            autoGenerate: z.boolean().optional(),
+            certPath: z.string().optional(),
+            keyPath: z.string().optional(),
+            caPath: z.string().optional(),
+          })
+          .optional(),
+        http: z
+          .object({
+            endpoints: z
+              .object({
+                chatCompletions: z
+                  .object({
+                    enabled: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                responses: z
+                  .object({
+                    enabled: z.boolean().optional(),
+                    maxBodyBytes: z.number().int().positive().optional(),
+                    maxUrlParts: z.number().int().nonnegative().optional(),
+                    files: z
+                      .object({
+                        allowUrl: z.boolean().optional(),
+                        urlAllowlist: z.array(z.string()).optional(),
+                        allowedMimes: z.array(z.string()).optional(),
+                        maxBytes: z.number().int().positive().optional(),
+                        maxChars: z.number().int().positive().optional(),
+                        maxRedirects: z.number().int().nonnegative().optional(),
+                        timeoutMs: z.number().int().positive().optional(),
+                        pdf: z
+                          .object({
+                            maxPages: z.number().int().positive().optional(),
+                            maxPixels: z.number().int().positive().optional(),
+                            minTextChars: z.number().int().nonnegative().optional(),
+                          })
+                          .strict()
+                          .optional(),
+                      })
+                      .strict()
+                      .optional(),
+                    images: z
+                      .object({
+                        allowUrl: z.boolean().optional(),
+                        urlAllowlist: z.array(z.string()).optional(),
+                        allowedMimes: z.array(z.string()).optional(),
+                        maxBytes: z.number().int().positive().optional(),
+                        maxRedirects: z.number().int().nonnegative().optional(),
+                        timeoutMs: z.number().int().positive().optional(),
+                      })
+                      .strict()
+                      .optional(),
+                  })
+                  .strict()
+                  .optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        nodes: z
+          .object({
+            browser: z
+              .object({
+                mode: z
+                  .union([z.literal("auto"), z.literal("manual"), z.literal("off")])
+                  .optional(),
+                node: z.string().optional(),
+              })
+              .strict()
+              .optional(),
+            allowCommands: z.array(z.string()).optional(),
+            denyCommands: z.array(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    memory: MemorySchema,
+    // PLAN-29: Forage bounty economy.
+    forage: z
+      .object({
+        nightShift: z
+          .object({
+            enabled: z.boolean().optional(),
+            maxConcurrentHunts: z.number().int().positive().optional(),
+            maxRewardUsdc: z.number().positive().optional(),
+          })
+          .strict()
+          .optional(),
+        pools: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        audit: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        genesis: z
+          .object({
+            treasuryWallets: z.array(z.string()).optional(),
+            maxDailyTreasuryUsdcPerHunter: z.number().positive().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    // PLAN-31: Circles — the agent social fabric. ON by default since the 2026-07-09 red-team phase (§8).
+    circles: z
+      .object({
+        enabled: z.boolean().optional(),
+        a2aPublicUrl: z.string().optional(),
+        displayName: z.string().optional(),
+        mailbox: z
+          .object({
+            enabled: z.boolean().optional(),
+            url: z.string().optional(),
+            serve: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        // The three keys below are read by `src/circles/service.ts` (dial:286,
+        // p2pDial:303, meshTopic:312) and documented in `docs/network/circles.md`,
+        // but were never declared here. Because this object is `.strict()`, setting
+        // any of them made config validation fail and the gateway refuse to boot,
+        // and `bitterbot doctor` then "repaired" the file by deleting the key.
+        // That made the documented kill switch for a default-ON network feature
+        // unusable. See docs/reviews/v1-release-audit-2026-08-21.md.
+        dial: z
+          .object({
+            allowPrivate: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        meshTopic: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        p2pDial: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        briefing: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        practicePartner: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        agentDrafts: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        sandbox: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    skills: z
+      .object({
+        allowBundled: z.array(z.string()).optional(),
+        load: z
+          .object({
+            extraDirs: z.array(z.string()).optional(),
+            watch: z.boolean().optional(),
+            watchDebounceMs: z.number().int().min(0).optional(),
+          })
+          .strict()
+          .optional(),
+        install: z
+          .object({
+            preferBrew: z.boolean().optional(),
+            nodeManager: z
+              .union([z.literal("npm"), z.literal("pnpm"), z.literal("yarn"), z.literal("bun")])
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        entries: z
+          .record(
+            z.string(),
+            z
+              .object({
+                enabled: z.boolean().optional(),
+                apiKey: z.string().optional().register(sensitive),
+                env: z.record(z.string(), z.string()).optional(),
+                config: z.record(z.string(), z.unknown()).optional(),
+              })
+              .strict(),
+          )
+          .optional(),
+        // PLAN-44 Phase 0: defaults are declared on the schema (describe) so
+        // every consumer (help, labels, status RPC, UI) reads one source.
+        evolution: z
+          .object({
+            enabled: z.boolean().optional().describe("Default: true"),
+            cadenceHours: z.number().positive().optional().describe("Default: 24"),
+            maxProposerTurns: z.number().int().positive().optional().describe("Default: 24"),
+            maxActiveEvolved: z.number().int().min(0).optional().describe("Default: 5"),
+            validationMode: z
+              .union([z.literal("records"), z.literal("tasks")])
+              .optional()
+              .describe(
+                "Default: tasks ('records' is deprecated: diagnostic only, never promotes)",
+              ),
+            trialsPerTask: z.number().int().min(2).max(10).optional().describe("Default: 3"),
+            maxTokenDelta: z.number().min(0).max(5).optional().describe("Default: 0.5"),
+            judgeModel: z.string().optional().describe("Default: dream model, else cheap model"),
+            proposerModel: z
+              .string()
+              .optional()
+              .describe("Default: judgeModel, else dream model, else cheap model"),
+            minFailsForProposer: z.number().int().min(0).optional().describe("Default: 1"),
+            wikiMaxPatterns: z.number().int().positive().optional().describe("Default: 100"),
+            semanticLintCadenceDays: z.number().positive().optional().describe("Default: 7"),
+            propagate: z.boolean().optional().describe("Default: true"),
+            maturityDays: z.number().positive().optional().describe("Default: 3"),
+            requireCrossModel: z.boolean().optional().describe("Default: false"),
+            applicabilityProfile: z
+              .object({
+                enabled: z.boolean().optional().describe("Default: true"),
+                publish: z.boolean().optional().describe("Default: true"),
+                windowDays: z.number().int().positive().optional().describe("Default: 14"),
+              })
+              .strict()
+              .optional()
+              .describe(
+                "PLAN-58: build and publish the skill applicability profile (conditions a skill was measured under)",
+              ),
+            validationBudgetMinutes: z.number().positive().optional().describe("Default: 45"),
+            descriptionRepair: z.boolean().optional().describe("Default: true"),
+            routingRepair: z.boolean().optional().describe("Default: true"),
+            validationTools: z
+              .object({
+                alsoAllow: z.array(z.string()).optional(),
+                exec: z.boolean().optional().describe("Default: true (PLAN-45 D-2)"),
+              })
+              .strict()
+              .optional()
+              .describe(
+                "Extra tools for validation rollouts (never network/messaging/memory/skills/wallet)",
+              ),
+          })
+          .strict()
+          .optional(),
+        skillSeekers: z
+          .object({
+            enabled: z.boolean().optional(),
+            maxSkillsPerCycle: z.number().int().min(1).optional(),
+            maxConcurrentScrapes: z.number().int().min(1).optional(),
+            allowedDomains: z.array(z.string()).optional(),
+            blockedDomains: z.array(z.string()).optional(),
+            defaultTtlDays: z.number().int().min(1).optional(),
+            mcpEndpoint: z.string().optional(),
+            useWebSearchFallback: z.boolean().optional(),
+            enableMarketplaceDemand: z.boolean().optional(),
+            trending: z
+              .object({
+                enabled: z.boolean().optional(),
+                intervalHours: z.number().positive().optional(),
+                maxPerSweep: z.number().int().positive().optional(),
+                sources: z
+                  .array(
+                    z.union([
+                      z
+                        .object({
+                          kind: z.literal("github"),
+                          since: z.enum(["daily", "weekly", "monthly"]).optional(),
+                          minStars: z.number().int().nonnegative().optional(),
+                          limit: z.number().int().positive().optional(),
+                        })
+                        .strict(),
+                      z
+                        .object({
+                          kind: z.literal("hackernews"),
+                          minPoints: z.number().int().nonnegative().optional(),
+                          limit: z.number().int().positive().optional(),
+                        })
+                        .strict(),
+                      z
+                        .object({
+                          kind: z.literal("curated"),
+                          urls: z.array(z.string()),
+                          limit: z.number().int().positive().optional(),
+                        })
+                        .strict(),
+                    ]),
+                  )
+                  .optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        marketability: z
+          .object({
+            predictor: z
+              .object({
+                enabled: z.boolean().optional(),
+                maxPerCycle: z.number().int().positive().optional(),
+                predictionTtlDays: z.number().positive().optional(),
+                pricingInfluence: z.number().min(0).max(1).optional(),
+                refinerBlendWeight: z.number().min(0).max(1).optional(),
+                model: z.string().optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        p2p: z
+          .object({
+            ingestPolicy: z.enum(["auto", "review", "deny"]).optional(),
+            trustList: z.array(z.string()).optional(),
+            quarantineDir: z.string().optional(),
+            maxIngestedPerHour: z.number().int().positive().optional(),
+            injectionScanner: z.enum(["regex", "off"]).optional(),
+            quarantineTtlDays: z.number().int().nonnegative().optional(),
+            // PLAN-29 Phase 0.3: load-time capability gate kill switch.
+            loadTimeCapabilityGate: z.boolean().optional(),
+            // PLAN-42: auto-reject legacy unvalidated dream crystals.
+            rejectLegacyCrystals: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        // Experience-guided skill prior (index ordering and evidence), default on.
+        prior: z
+          .object({
+            enabled: z.boolean().optional().describe("Default: true"),
+            writer: z.enum(["shadow", "on", "off"]).optional().describe("Default: shadow"),
+            mode: z
+              .union([z.literal("mean"), z.literal("thompson")])
+              .optional()
+              .describe("Default: mean"),
+            placement: z
+              .union([z.literal("first"), z.literal("last")])
+              .optional()
+              .describe("Default: first"),
+            evidence: z
+              .enum(["verbal", "counts", "verdict", "off"])
+              .optional()
+              .describe("Default: verbal"),
+            discount: z.number().min(0).max(1).optional().describe("Default: 0.98"),
+            pseudoCount: z.number().min(0).max(100).optional().describe("Default: 4"),
+            ledgerPath: z.string().optional().describe("Default: CONFIG_DIR/skill-prior.json"),
+          })
+          .strict()
+          .optional(),
+        agentskills: z
+          .object({
+            enabled: z.boolean().optional(),
+            registryBaseUrl: z.string().optional(),
+            defaultTrust: z.enum(["auto", "review"]).optional(),
+            transformThreshold: z.number().min(0).max(1).optional(),
+            royaltyBps: z.number().int().nonnegative().optional(),
+            royaltyWallet: z
+              .string()
+              .regex(/^0x[a-fA-F0-9]{40}$/, "must be a 0x-prefixed 20-byte hex address")
+              .optional(),
+            maxBytes: z.number().int().positive().optional(),
+            apiKey: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    plugins: z
+      .object({
+        enabled: z.boolean().optional(),
+        allow: z.array(z.string()).optional(),
+        deny: z.array(z.string()).optional(),
+        load: z
+          .object({
+            paths: z.array(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
+        slots: z
+          .object({
+            memory: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        entries: z
+          .record(
+            z.string(),
+            z
+              .object({
+                enabled: z.boolean().optional(),
+                config: z.record(z.string(), z.unknown()).optional(),
+              })
+              .strict(),
+          )
+          .optional(),
+        installs: z
+          .record(
+            z.string(),
+            z
+              .object({
+                source: z.union([z.literal("npm"), z.literal("archive"), z.literal("path")]),
+                spec: z.string().optional(),
+                sourcePath: z.string().optional(),
+                installPath: z.string().optional(),
+                version: z.string().optional(),
+                installedAt: z.string().optional(),
+              })
+              .strict(),
+          )
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    p2p: z
+      .object({
+        enabled: z.boolean().optional(),
+        orchestratorBinary: z.string().optional(),
+        listenAddrs: z.array(z.string()).optional(),
+        bootstrapPeers: z.array(z.string()).optional(),
+        bootstrapDns: z.string().optional(),
+        keyDir: z.string().optional(),
+        topics: z
+          .object({
+            skills: z.boolean().optional(),
+            telemetry: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        security: z
+          .object({
+            maxSkillSizeBytes: z.number().int().nonnegative().optional(),
+            maxSkillsPerMinutePerPeer: z.number().int().nonnegative().optional(),
+            requireSignature: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        httpAddr: z.string().optional(),
+        httpAuthToken: z.string().optional(),
+        nodeTier: z.enum(["edge", "management"]).optional(),
+        genesisTrustListPath: z.string().optional(),
+        genesisTrustList: z.array(z.string()).optional(),
+        relayMode: z.enum(["off", "client", "server", "auto"]).optional(),
+        relayServers: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
+    cron: z
+      .object({
+        enabled: z.boolean().optional(),
+        store: z.string().optional(),
+        maxConcurrentRuns: z.number().int().positive().optional(),
+        webhook: z.string().optional(),
+        webhookToken: z.string().optional(),
+        autoDisableAfterErrors: z.number().int().min(0).max(1000).optional(),
+      })
+      .strict()
+      .optional(),
+    a2a: z
+      .object({
+        enabled: z.boolean().optional(),
+        name: z.string().optional(),
+        description: z.string().optional(),
+        url: z.string().url().optional(),
+        authentication: z
+          .object({
+            type: z.enum(["none", "bearer"]).optional(),
+            bearerToken: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        maxTasksPerMinute: z.number().int().nonnegative().optional(),
+        skills: z
+          .object({
+            expose: z.enum(["all", "none"]).optional(),
+            allowlist: z.array(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
+        // PLAN-43 Phase 3: attestation exchange
+        attestation: z
+          .object({
+            enabled: z.boolean().optional(),
+            peers: z
+              .array(
+                z
+                  .string()
+                  .url()
+                  .refine(
+                    (u) => {
+                      try {
+                        const h = new URL(u).hostname;
+                        return !(
+                          h === "localhost" ||
+                          h.startsWith("127.") ||
+                          h === "::1" ||
+                          h === "[::1]" ||
+                          h.startsWith("169.254.")
+                        );
+                      } catch {
+                        return false;
+                      }
+                    },
+                    { message: "attestation peers must not be loopback or link-local" },
+                  ),
+              )
+              .optional(),
+            trustedAttesters: z.array(z.string()).optional(),
+            blockedAttesters: z.array(z.string()).optional(),
+            unknownAttesterWeight: z.number().min(0).max(1).optional(),
+          })
+          .strict()
+          .optional(),
+        // PLAN-43 s3.2b: hermetic remote-caller execution bounds
+        remoteExecution: z
+          .object({
+            tools: z
+              .object({
+                allow: z.array(z.string()).optional(),
+                deny: z.array(z.string()).optional(),
+              })
+              .strict()
+              .optional(),
+            maxInputChars: z.number().int().positive().optional(),
+            maxOutputChars: z.number().int().positive().optional(),
+            timeoutSeconds: z.number().int().positive().optional(),
+          })
+          .strict()
+          .optional(),
+        payment: z
+          .object({
+            enabled: z.boolean().optional(),
+            allowUnsignedProofs: z.boolean().optional(),
+            x402: z
+              .object({
+                address: z
+                  .string()
+                  .regex(/^0x[a-fA-F0-9]{40}$/, "must be a 0x-prefixed 20-byte hex address")
+                  .optional(),
+                minPayment: z.number().nonnegative().optional(),
+              })
+              .strict()
+              .optional(),
+            nano: z
+              .object({
+                address: z
+                  .string()
+                  .regex(
+                    /^(?:nano|xrb)_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$/,
+                    "must be a nano_ account",
+                  ),
+                rawPerUsd: z.string().regex(/^[1-9][0-9]*$/, "must be a positive integer string"),
+                rpcUrl: z.string().url().optional(),
+                maxAgeSeconds: z.number().int().positive().optional(),
+              })
+              .strict()
+              .optional(),
+            ap2: z
+              .object({
+                enabled: z.boolean().optional(),
+              })
+              .strict()
+              .optional(),
+            consent: z
+              .object({
+                grantsRequired: z.boolean().optional(),
+                gateThresholdUsd: z.number().nonnegative().optional(),
+              })
+              .strict()
+              .optional(),
+            enforcement: z
+              .object({
+                enabled: z.boolean().optional(),
+              })
+              .strict()
+              .optional(),
+            escalation: z
+              .object({
+                stepUpThresholdUsd: z.number().nonnegative().optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        mesh: z
+          .object({
+            delegation: z.boolean().optional(),
+            gatewayFeePercent: z.number().min(0).max(100).optional(),
+          })
+          .strict()
+          .optional(),
+        marketplace: z
+          .object({
+            enabled: z.boolean().optional(),
+            freezeListings: z.boolean().optional(),
+            pricing: z
+              .object({
+                basePriceUsdc: z.number().nonnegative().optional(),
+                minPriceUsdc: z.number().nonnegative().optional(),
+                maxPriceUsdc: z.number().positive().optional(),
+                fixedPriceUsdc: z.number().nonnegative().optional(),
+                minExecutionsForListing: z.number().int().nonnegative().optional(),
+                minSuccessRateForListing: z.number().min(0).max(1).optional(),
+              })
+              .strict()
+              .optional(),
+            client: z
+              .object({
+                maxTaskCostUsdc: z.number().nonnegative().optional(),
+                dailySpendLimitUsdc: z.number().nonnegative().optional(),
+                taskTimeoutMs: z.number().int().positive().optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+        // PLAN-8 Phase 5 — onchain identity via ERC-8004
+        erc8004: z
+          .object({
+            enabled: z.boolean().optional(),
+            tokenId: z.string().optional(),
+            registry: z
+              .string()
+              .regex(/^0x[a-fA-F0-9]{40}$/, "must be a 0x-prefixed 20-byte hex address")
+              .optional(),
+            chain: z.enum(["base", "base-sepolia"]).optional(),
+            cacheTtlMs: z.number().int().nonnegative().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    commerce: z
+      .object({
+        groupbuy: z
+          .object({
+            enabled: z.boolean().optional(),
+            coordinatorFeeBps: z.number().int().min(0).max(10_000).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    payments: z
+      .object({
+        link: z
+          .object({
+            enabled: z.boolean().optional(),
+            perPurchaseCapUsd: z.number().positive().max(100_000).optional(),
+            command: z.array(z.string()).min(1).optional(),
+            authFile: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        privacy: z
+          .object({
+            enabled: z.boolean().optional(),
+            apiKey: z.string().optional().register(sensitive),
+            perPurchaseCapUsd: z.number().positive().max(100_000).optional(),
+            sandbox: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        fiat: z
+          .object({
+            uiDollars: z.boolean().optional(),
+            onramp: z
+              .object({
+                enabled: z.boolean().optional(),
+                monthlyCeilingUsd: z.number().nonnegative().optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    monitors: z.object({ enabled: z.boolean().optional() }).strict().optional(),
+    compute: z
+      .object({
+        enabled: z.boolean().optional(),
+        awareness: z
+          .object({
+            stateBlock: z.boolean().optional(),
+            maxTokens: z.number().int().min(40).max(400).optional(),
+            creditFloor: z.number().min(0).optional(),
+            wakeBudgetPerHour: z.number().int().min(0).max(1000).optional(),
+            nudges: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        pools: z
+          .record(
+            z.string().min(1).max(64),
+            z.object({ trust: z.enum(["trusted", "untrusted"]).optional() }).strict(),
+          )
+          .optional(),
+        embeddings: z
+          .object({
+            provider: z.enum(["pool", "local"]).optional(),
+            marginMs: z.number().int().min(0).max(600_000).optional(),
+            cooldownMs: z.number().int().min(1000).max(86_400_000).optional(),
+            timeoutMs: z.number().int().min(1000).max(600_000).optional(),
+            modelDigest: z.string().min(8).max(128).optional(),
+          })
+          .strict()
+          .optional(),
+        egress: z
+          .object({
+            transcriptsDefaultClass: z.enum(["normal", "personal", "confidential"]).optional(),
+          })
+          .strict()
+          .optional(),
+        paid: z
+          .object({
+            enabled: z.boolean().optional(),
+            maxUsdcPerJob: z.number().min(0).max(10_000).optional(),
+            maxUsdcPerDay: z.number().min(0).max(100_000).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    shop: z
+      .object({ enabled: z.boolean().optional(), ucpProfileUrl: z.string().url().optional() })
+      .strict()
+      .optional(),
+    notifications: z
+      .object({
+        owner: z
+          .object({
+            channel: z.string().optional(),
+            to: z.string().optional(),
+            accountId: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        quietHours: z
+          .object({
+            start: z.string().optional(),
+            end: z.string().optional(),
+            timezone: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        maxPerHour: z.number().int().min(0).max(1000).optional(),
+      })
+      .strict()
+      .optional(),
+    review: z
+      .object({
+        spend: z.union([z.literal("ask"), z.literal("allow")]).optional(),
+        publish: z.union([z.literal("ask"), z.literal("allow")]).optional(),
+        contact: z.union([z.literal("first"), z.literal("ask"), z.literal("allow")]).optional(),
+        connector: z.union([z.literal("ask"), z.literal("allow")]).optional(),
+        ttlHours: z
+          .number()
+          .positive()
+          .max(24 * 30)
+          .optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((cfg, ctx) => {
+    const agents = cfg.agents?.list ?? [];
+    if (agents.length === 0) {
+      return;
+    }
+    const agentIds = new Set(agents.map((agent) => agent.id));
+
+    const broadcast = cfg.broadcast;
+    if (!broadcast) {
+      return;
+    }
+
+    for (const [peerId, ids] of Object.entries(broadcast)) {
+      if (peerId === "strategy") {
+        continue;
+      }
+      if (!Array.isArray(ids)) {
+        continue;
+      }
+      for (let idx = 0; idx < ids.length; idx += 1) {
+        const agentId = ids[idx];
+        if (!agentIds.has(agentId)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["broadcast", peerId, idx],
+            message: `Unknown agent id "${agentId}" (not in agents.list).`,
+          });
+        }
+      }
+    }
+  });

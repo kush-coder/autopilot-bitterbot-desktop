@@ -1,0 +1,8230 @@
+import crypto from "node:crypto";
+import { appendFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { type FSWatcher } from "chokidar";
+import {
+  resolveAgentDir,
+  resolveAgentWorkspaceDir,
+  resolveDefaultAgentId,
+} from "../agents/agent-scope.js";
+import { resolveHarnessPolicy } from "../agents/embedded-runner/harness-policy.js";
+import type { ResolvedMemorySearchConfig } from "../agents/memory-search.js";
+import { resolveMemorySearchConfig } from "../agents/memory-search.js";
+import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
+import { registerSkillsChangeListener } from "../agents/skills/refresh.js";
+import {
+  type ComputeEpisode,
+  type ComputeEpisodeSink,
+  formatComputeEpisode,
+  getComputeEpisodeSink,
+  registerComputeEpisodeSink,
+} from "../compute/awareness/episodes.js";
+import { computeNicheFacts, hasComputeActivity } from "../compute/awareness/niche.js";
+import {
+  type ComputeNudgeSink,
+  getComputeNudgeSink,
+  registerComputeNudgeSink,
+} from "../compute/awareness/nudges.js";
+import { getComputeRuntime } from "../compute/awareness/runtime.js";
+import { getComputeSnapshot } from "../compute/awareness/state.js";
+import { loadConfig, type BitterbotConfig } from "../config/config.js";
+import {
+  architectCycleEnabled,
+  architectRulesEnabled,
+  canonicalLedgerEnabled,
+  conversationMemoryEnabled,
+  correctionCaptureEnabled,
+  curiosityEnabled,
+  dreamBriefEnabled,
+  dreamEngineEnabled,
+  harnessEvolveEnabled,
+  marketabilityPredictorEnabled,
+  skillEvolutionEnabled,
+  skillSeekersEnabled,
+} from "../config/feature-switches.js";
+import { isBackgroundUsagePaused } from "../infra/usage-budgets.js";
+import { USAGE_FEATURES } from "../infra/usage-features.js";
+import { getUsageLedger } from "../infra/usage-ledger.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { withSpan, withSpanAttrs } from "../observability/otel.js";
+import type { PluginHookAfterToolCallEvent, PluginHookToolContext } from "../plugins/types.js";
+import {
+  evidenceTouchesUntrusted,
+  findExternalUntrustedLineRanges,
+} from "../security/external-content.js";
+import { registerTaskRewardHook } from "../tasks/judge.js";
+import { CanonicalFactsStore } from "./canonical-facts.js";
+import {
+  applySupersededMarks,
+  CANONICAL_CHANGED_EVENT,
+  CanonicalPropagation,
+  hasSupersessionMarks,
+  loadCanonicalSynthesisContext,
+  preserveOwnerSections,
+  stripOwnerSections,
+} from "./canonical-propagation.js";
+import { setChunkLifecycle } from "./chunk-writer.js";
+import { ConsolidationEngine, type ConsolidationStats } from "./consolidation.js";
+import { ContributorStatusLedger } from "./contributor-status.js";
+import { CORRECTION_LLM_LANE } from "./correction-capture.js";
+import { CuriosityEngine } from "./curiosity-engine.js";
+import {
+  insertNovelTargets,
+  looksLikeOwnerQuestion,
+  parseCuriosityGaps,
+} from "./curiosity-gaps.js";
+import { resolveCuriosityResearchConfig } from "./curiosity-researcher.js";
+import type { CuriosityState } from "./curiosity-types.js";
+import { recordCuriosityUse, recordCuriosityUseByTarget } from "./curiosity-use.js";
+import { applyDirectiveResolutions, finalizeAnsweredDirectives } from "./directive-resolution.js";
+import {
+  DiscoveryAgent,
+  type SkillSuggestion,
+  type SuggestSkillsConfig,
+} from "./discovery-agent.js";
+import { DreamEngine, createDefaultSynthesizeFn } from "./dream-engine.js";
+import {
+  AUTO_SCRATCH_PREFIX,
+  autoScratchEventText,
+  DreamGateState,
+  evaluateDreamGate,
+  HormonalDeltaTrigger,
+  isDreamLearningIdle,
+  lastAutoScratchEvent,
+} from "./dream-gate.js";
+import { searchDreamInsights, type DreamSearchResult } from "./dream-search.js";
+import type { DreamStats, SynthesizeFn } from "./dream-types.js";
+import { applyDreamModeKillSwitches, DEFAULT_DREAM_CONFIG } from "./dream-types.js";
+import { type EmbeddingProfile, embeddingProfileKey } from "./embedding-profile.js";
+import { createPoolEmbeddingProvider, isPoolEmbeddingProvider } from "./embeddings-pool.js";
+import {
+  createEmbeddingProvider,
+  type EmbeddingProvider,
+  type EmbeddingProviderResult,
+  type GeminiEmbeddingClient,
+  type OpenAiEmbeddingClient,
+  type VoyageEmbeddingClient,
+} from "./embeddings.js";
+import { EpistemicDirectiveEngine } from "./epistemic-directives.js";
+import { yieldToEventLoop } from "./event-loop.js";
+import { parseEvidenceRefs, scoreCitationSupport } from "./evidence-expand.js";
+import { EvidenceTelemetry, resolveEvidenceConfig } from "./evidence-telemetry.js";
+import { createExecutionTrackingHook } from "./execution-tracking-hook.js";
+import { ExperienceSignalCollector } from "./experience-signal-collector.js";
+import {
+  clearExtractionFailure,
+  recordExtractionFailure,
+  shouldSkipExtraction,
+} from "./extraction-failures.js";
+import { MemoryGovernance } from "./governance.js";
+import { detectGraphGaps, emitGraphBridgeSignal } from "./graph-bridge-target.js";
+import { insertTrainingPair } from "./graph-optimizer.js";
+import { filterGuestResults, guestMayReadPath } from "./guest-access.js";
+import { HormonalStateManager } from "./hormonal.js";
+import {
+  bm25RankToScore,
+  boundPostFusionBoost,
+  buildFtsQuery,
+  mergeHybridResults,
+  mergeHybridResultsRRF,
+  type HybridGraphResult,
+} from "./hybrid.js";
+import { resolveEmotionDecayResistance } from "./importance.js";
+import { embeddingToBlob, isMemoryPath, normalizeExtraMemoryPaths } from "./internal.js";
+import { backfillTypedRelationships } from "./kg-backfill.js";
+import * as kgAdmission from "./kg-entity-admission.js";
+import * as kgExtract from "./kg-relationship-extract.js";
+import { KnowledgeGraphManager } from "./knowledge-graph.js";
+import { MaintenanceMutex } from "./maintenance-mutex.js";
+import type { ManagementNodeService } from "./management-node-service.js";
+import { memoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
+import { searchKeyword, searchVector } from "./manager-search.js";
+import { memoryManagerSyncOps } from "./manager-sync-ops.js";
+import { MarketplaceEconomics } from "./marketplace-economics.js";
+import { MarketplaceIntelligence } from "./marketplace-intelligence.js";
+import { MemStore } from "./mem-store.js";
+import { runArchitectCycle, selectRulesForState } from "./memory-architect.js";
+import { type ExportSink, MemoryExportInterrupted, writeMemoryExport } from "./memory-export.js";
+import { type ImportActor, importMemories } from "./memory-import.js";
+import { chunkTextHash, isSuppressed } from "./memory-suppressions.js";
+import { moodCongruentBonus } from "./mood-congruent-boost.js";
+import {
+  deletePreference as ownerDeletePreference,
+  editMemory as ownerEditMemory,
+  exportMemories as ownerExportMemories,
+  forgetMemory as ownerForgetMemory,
+  getMemory as ownerGetMemory,
+  type IndexTables,
+  listMemories as ownerListMemories,
+  type ListOptions as OwnerListOptions,
+  listAuditLog as ownerListAuditLog,
+  listPreferences as ownerListPreferences,
+  collectSessionChunks as ownerCollectSessionChunks,
+  forgetSessionMemories as ownerForgetSessionMemories,
+  sessionChunksForFiles as ownerSessionChunksForFiles,
+  OwnerEditRefused,
+  type OwnerPinInput,
+  previewEdit as ownerPreviewEdit,
+  previewForget as ownerPreviewForget,
+  pinFact as ownerPinFact,
+  retireFact as ownerRetireFact,
+  unretireFact as ownerUnretireFact,
+} from "./owner-controls.js";
+import { PeerReputationManager } from "./peer-reputation.js";
+import { truncateAtSentence } from "./proactive-recall.js";
+import { resolveLearningConfig } from "./procedural-learning-contract.js";
+import { ProceduralLearningStore } from "./procedural-learning-store.js";
+import { ProceduralLearning } from "./procedural-learning.js";
+import { ProspectiveMemoryEngine } from "./prospective-memory.js";
+import { computeRecencyBoost, type RecencyConfig } from "./recency-boost.js";
+import { ReconsolidationEngine } from "./reconsolidation.js";
+import { readRegistryProvenances } from "./registry-provenance.js";
+import {
+  RetrievalObservability,
+  TIME_WINDOW_LANE_MS,
+  emptyRecallCounts,
+  emptySearchCounts,
+  recordRetrievalTrace,
+  resolveTraceSampleRate,
+  type RecallLayerCounts,
+  type SearchLayerCounts,
+} from "./retrieval-trace.js";
+import { sageRetrieve, DEFAULT_SAGE_CONFIG, type SageConfig } from "./sage-memory.js";
+import { MemoryScheduler } from "./scheduler.js";
+import { attachResultMetadata } from "./search-result-metadata.js";
+import { runSeedCrystalMigration, runSkillBootstrap } from "./seed-crystal-migration.js";
+import { SessionCoherenceTracker } from "./session-coherence.js";
+import { extractSessionFacts, type HormonalBias } from "./session-extractor.js";
+import { listSessionFilesForAgent } from "./session-files.js";
+import { formatHandoverBrief, handoverPath, briefToChunkText } from "./session-handover.js";
+import { stripHeartbeatTurns } from "./session-transcript-prep.js";
+import { setActiveEvolutionLlm } from "./skill-evolution/active-llm.js";
+import { makeAttesterWeight, resolveOwnAttesterPubkey } from "./skill-evolution/attester-weight.js";
+import { readValidationSummaries } from "./skill-evolution/validation-summaries.js";
+import { SkillExecutionTracker, runEvidenceWhere } from "./skill-execution-tracker.js";
+import { SkillMarketplace } from "./skill-marketplace.js";
+import { SkillNetworkBridge, type OrchestratorBridgeLike } from "./skill-network-bridge.js";
+import { SkillPriorWriterService } from "./skill-prior-service.js";
+import { SkillVerifier } from "./skill-verifier.js";
+import { recordAccess } from "./spacing-effect.js";
+import { requireNodeSqlite } from "./sqlite.js";
+import { SurfacingTrial, resolveSurfacingTrialConfig } from "./surfacing-trial.js";
+import { captureNearbyWeakChunks, shouldTriggerCapture } from "./synaptic-tagging.js";
+import { TaskMemoryManager } from "./task-memory.js";
+import type {
+  MemoryEmbeddingProbeResult,
+  MemoryProviderStatus,
+  MemorySearchManager,
+  MemorySearchResult,
+  MemorySource,
+  MemorySyncProgressUpdate,
+} from "./types.js";
+import { UserModelManager } from "./user-model.js";
+import {
+  synthesizeValidatedWorkingMemory,
+  buildHeuristicWorkingMemory,
+  WORKING_MEMORY_SECTIONS,
+  type WorkingMemoryContext,
+} from "./working-memory-prompt.js";
+import {
+  snapshotWorkingMemory,
+  restoreWorkingMemorySnapshot,
+  listWorkingMemorySnapshots,
+  readWorkingMemoryProvenance,
+  type WorkingMemoryProvenance,
+} from "./working-memory-snapshots.js";
+import { scanForOpenLoops } from "./zeigarnik-effect.js";
+
+const SNIPPET_MAX_CHARS = 700;
+const VECTOR_TABLE = "chunks_vec";
+const FTS_TABLE = "chunks_fts";
+/** PLAN-55 Phase 2: extra results fetched while superseded marks exist. */
+const SUPERSEDED_OVERFETCH = 10;
+const EMBEDDING_CACHE_TABLE = "embedding_cache";
+const BATCH_FAILURE_LIMIT = 2;
+/** PLAN-55 Phase 3 review: concurrent forget/edit previews (unlocked full scans). */
+const MAX_OWNER_PREVIEWS_IN_FLIGHT = 2;
+
+const log = createSubsystemLogger("memory");
+
+import { isLocalModelSpec } from "./local-model-spec.js";
+
+export { isLocalModelSpec };
+
+const INDEX_CACHE = new Map<string, MemoryIndexManager>();
+/**
+ * In-flight construction promises, keyed identically to INDEX_CACHE. The manager
+ * is only inserted into INDEX_CACHE after its (synchronous, multi-second)
+ * constructor returns, so concurrent boot callers (gateway memory backend,
+ * interceptor autoboot, capability runtime, endocrine state) all miss the cache
+ * and each build a full manager — doubling the ~20-minute cold warm-up. Caching
+ * the promise here collapses concurrent gets for the same key into one build.
+ */
+const INDEX_INFLIGHT = new Map<string, Promise<MemoryIndexManager>>();
+
+/** A sweep older than this means the daily window was missed (reboot/redeploy). */
+const HEALTH_SWEEP_STALE_MS = 20 * 60 * 60_000;
+/** Delay before the catch-up sweep, so it never competes with the boot path. */
+const HEALTH_SWEEP_CATCHUP_DELAY_MS = 3 * 60_000;
+
+export class MemoryIndexManager implements MemorySearchManager {
+  private proceduralLearningService: ProceduralLearning | null = null;
+  // oxlint-disable-next-line typescript/no-explicit-any
+  [key: string]: any;
+  private readonly cacheKey: string;
+  private readonly cfg: BitterbotConfig;
+  private readonly agentId: string;
+  private readonly workspaceDir: string;
+  private readonly settings: ResolvedMemorySearchConfig;
+  private provider: EmbeddingProvider;
+  /** PLAN-57 §4.6: resolved once per process on the first sync (digest may need I/O). */
+  private embeddingProfile: EmbeddingProfile | null = null;
+  /** Set when the live profile conflicts with the index; writes and vector search pause until migration. */
+  private embeddingProfileHold: { conflicts: string[]; stored: EmbeddingProfile } | null = null;
+  private embeddingHoldLogged = false;
+  /** PLAN-57 §4.7: the compute episode sink this manager registered, if any. */
+  private episodeSink: ComputeEpisodeSink | null = null;
+  /** PLAN-57 Phase 6: the compute nudge sink this manager registered, if any. */
+  private nudgeSink: ComputeNudgeSink | null = null;
+  private readonly requestedProvider: "openai" | "local" | "gemini" | "voyage" | "auto";
+  private fallbackFrom?: "openai" | "local" | "gemini" | "voyage";
+  private fallbackReason?: string;
+  private openAi?: OpenAiEmbeddingClient;
+  private gemini?: GeminiEmbeddingClient;
+  private voyage?: VoyageEmbeddingClient;
+  private batch: {
+    enabled: boolean;
+    wait: boolean;
+    concurrency: number;
+    pollIntervalMs: number;
+    timeoutMs: number;
+  };
+  private batchFailureCount = 0;
+  private batchFailureLastError?: string;
+  private batchFailureLastProvider?: string;
+  private batchFailureLock: Promise<void> = Promise.resolve();
+  // When batch embedding is disabled by transient failures, the timestamp of
+  // the disable so it can be retried after a cooldown. null when batch is on,
+  // or when it was disabled for a hard reason (provider lacks batch support).
+  private batchDisabledAt: number | null = null;
+  private db: DatabaseSync;
+  private readonly sources: Set<MemorySource>;
+  private providerKey: string;
+  private readonly cache: { enabled: boolean; maxEntries?: number };
+  private readonly vector: {
+    enabled: boolean;
+    available: boolean | null;
+    extensionPath?: string;
+    loadError?: string;
+    dims?: number;
+  };
+  private readonly fts: {
+    enabled: boolean;
+    available: boolean;
+    loadError?: string;
+  };
+  private vectorReady: Promise<boolean> | null = null;
+  private watcher: FSWatcher | null = null;
+  private watchTimer: NodeJS.Timeout | null = null;
+  private sessionWatchTimer: NodeJS.Timeout | null = null;
+  private sessionUnsubscribe: (() => void) | null = null;
+  private intervalTimer: NodeJS.Timeout | null = null;
+  private closed = false;
+  private dirty = false;
+  private sessionsDirty = false;
+  private sessionsDirtyFiles = new Set<string>();
+  private skillsDirty = false;
+  private skillsUnsubscribe: (() => void) | null = null;
+  private sessionPendingFiles = new Set<string>();
+  private sessionDeltas = new Map<
+    string,
+    {
+      lastSize: number;
+      pendingBytes: number;
+      pendingMessages: number;
+      /** When unindexed content first appeared, for the staleness backstop. */
+      pendingSince?: number;
+    }
+  >();
+  private sessionWarm = new Set<string>();
+  private syncing: Promise<void> | null = null;
+  /** PLAN-46 Phase 4: serializes heavy maintenance jobs (I4). */
+  private readonly maintenanceMutex = new MaintenanceMutex();
+  private failureLearningPending: Promise<unknown> | null = null;
+  private consolidationTimer: NodeJS.Timeout | null = null;
+  private dreamTimer: NodeJS.Timeout | null = null;
+  /**
+   * PLAN-40: wall-clock timestamp of the next scheduled dream fire under the
+   * adaptive controller, so status surfaces report the real ETA instead of a
+   * hardcoded interval (adversarial F16). Null under fixed-interval mode.
+   */
+  nextDreamFireAt: number | null = null;
+  private dreamInitialTimer: NodeJS.Timeout | null = null;
+  private digestTimer: NodeJS.Timeout | null = null;
+  private healthSweepTimer: NodeJS.Timeout | null = null;
+  private healthSweepCatchUpDone = false;
+  private trendingSweepTimer: NodeJS.Timeout | null = null;
+  private marketplaceIntelligence: MarketplaceIntelligence | null = null;
+  private marketabilityPredictor:
+    | import("./skill-marketability-predictor.js").SkillMarketabilityPredictor
+    | null = null;
+  private adaptiveIntervalController:
+    | import("./dream-adaptive-interval.js").AdaptiveIntervalController
+    | null = null;
+  private dreamEngine: DreamEngine | null = null;
+  private dreamLlmCall: ((prompt: string) => Promise<string>) | null = null;
+  /** PLAN-50: dedicated session-extraction lane (attributed to memory/extraction). */
+  private extractionLlmCall: ((prompt: string) => Promise<string>) | null = null;
+  /** PLAN-55 Phase 1: the per-turn correction lane (same model as extraction, live, own feature). */
+  private correctionLlmCallFn:
+    | ((prompt: string, callOpts?: { signal?: AbortSignal }) => Promise<string>)
+    | null = null;
+  private dreamSynthesisLlmCall: ((prompt: string) => Promise<string>) | null = null;
+  /** PLAN-18 Phase 1 — small fast LLM call for query decomposition. Lazy-built. */
+  private sagePlannerLlmCall: ((prompt: string) => Promise<string>) | null = null;
+  private sagePlannerLlmTried = false;
+  private curiosityEngine: CuriosityEngine | null = null;
+  /**
+   * PLAN-59 Phase 0: evidence telemetry (retrieval hits, surfacing events,
+   * shadow decision traces). Observation only; never alters a result.
+   */
+  private evidenceTelemetry: EvidenceTelemetry | null = null;
+  /**
+   * PLAN-59 Phase 2: shadow eligibility and assignment for the proactive
+   * surfaces. Every delivery routes through it; in shadow it adds the
+   * eligible/assigned rows and the arm label, and changes nothing delivered.
+   * Reads the connection through the telemetry writer, so a rebind covers it.
+   */
+  private surfacingTrial: SurfacingTrial | null = null;
+  /**
+   * Chunk ids of the result objects searchInner built, keyed by identity so
+   * the final returned list can be recorded without changing the public
+   * result shape. WeakMap: entries die with the result objects.
+   */
+  private readonly resultChunkIds = new WeakMap<MemorySearchResult, string>();
+  private hormonalManager: HormonalStateManager | null = null;
+  private userModelManager: UserModelManager | null = null;
+  private governance: MemoryGovernance | null = null;
+  private taskMemory: TaskMemoryManager | null = null;
+  private scheduler: MemoryScheduler | null = null;
+  private memStore: MemStore | null = null;
+  private skillNetworkBridge: SkillNetworkBridge | null = null;
+  private executionTracker: SkillExecutionTracker | null = null;
+  private skillPriorWriter: SkillPriorWriterService | null = null;
+  private executionTrackingHook:
+    | ((event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => void)
+    | null = null;
+  private experienceCollector: ExperienceSignalCollector | null = null;
+  private peerReputationManager: PeerReputationManager | null = null;
+  private discoveryAgent: DiscoveryAgent | null = null;
+  private marketplaceEconomics: MarketplaceEconomics | null = null;
+  private skillMarketplace: SkillMarketplace | null = null;
+  private contributorStatus?: ContributorStatusLedger;
+  managementNodeService: ManagementNodeService | null = null;
+  private knowledgeGraph: KnowledgeGraphManager | null = null;
+  private reconsolidationEngine: ReconsolidationEngine | null = null;
+  private epistemicDirectiveEngine: EpistemicDirectiveEngine | null = null;
+  private prospectiveMemoryEngine: ProspectiveMemoryEngine | null = null;
+  /** Warn once (not per cycle) when dream predictions have no engine to land in. */
+  private dreamPredictionEngineWarned = false;
+  private skillSeekersAdapter: import("./skill-seekers-adapter.js").SkillSeekersAdapter | null =
+    null;
+
+  /**
+   * Called by manager-sync-ops after a reindex swaps the database file.
+   * Propagates the new DB handle to all subsystems that hold a direct reference.
+   */
+  protected onDbSwapped(): void {
+    if (this.dreamEngine) {
+      this.dreamEngine.updateDb(this.db);
+    }
+    // PLAN-59 Phase 0: the evidence writer holds the handle too.
+    this.evidenceTelemetry?.rebind(this.db);
+    if (this.curiosityEngine) {
+      (this.curiosityEngine as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.executionTracker) {
+      (this.executionTracker as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.memStore) {
+      (this.memStore as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.skillNetworkBridge) {
+      (this.skillNetworkBridge as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.marketplaceEconomics) {
+      (this.marketplaceEconomics as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.governance) {
+      (this.governance as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.taskMemory) {
+      (this.taskMemory as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.peerReputationManager) {
+      (this.peerReputationManager as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.experienceCollector) {
+      (this.experienceCollector as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.discoveryAgent) {
+      (this.discoveryAgent as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.userModelManager) {
+      (this.userModelManager as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.hormonalManager) {
+      (this.hormonalManager as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.curiosityEngine) {
+      this.curiosityEngine.updateDb(this.db);
+    }
+    // PLAN-9 subsystems
+    if (this.knowledgeGraph) {
+      (this.knowledgeGraph as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.reconsolidationEngine) {
+      (this.reconsolidationEngine as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.epistemicDirectiveEngine) {
+      (this.epistemicDirectiveEngine as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    if (this.prospectiveMemoryEngine) {
+      (this.prospectiveMemoryEngine as unknown as { db: DatabaseSync }).db = this.db;
+    }
+    // Re-ensure subsystem schemas on the new DB.
+    // The main chunks/meta/dream/curiosity schemas are re-created by ensureSchema()
+    // in manager-sync-ops. But subsystem-specific tables (marketplace, peer_reputation,
+    // skill_executions) need explicit re-creation here.
+    try {
+      if (this.marketplaceEconomics) {
+        (this.marketplaceEconomics as unknown as { ensureSchema(): void }).ensureSchema();
+      }
+      // Skill execution tracking table
+      this.db.exec(`CREATE TABLE IF NOT EXISTS skill_executions (
+        id TEXT PRIMARY KEY, skill_crystal_id TEXT NOT NULL, session_id TEXT,
+        started_at INTEGER NOT NULL, completed_at INTEGER, success INTEGER,
+        reward_score REAL, error_type TEXT, error_detail TEXT,
+        execution_time_ms INTEGER, tool_calls_count INTEGER, user_feedback INTEGER,
+        context_json TEXT, tool_name TEXT, recorded_by TEXT,
+        run_id TEXT, tool_call_id TEXT, evidence TEXT,
+        run_outcome_level INTEGER, run_outcome_label TEXT, run_outcome_at INTEGER
+      )`);
+      // Peer reputation table
+      this.db.exec(`CREATE TABLE IF NOT EXISTS peer_reputation (
+        peer_pubkey TEXT PRIMARY KEY, peer_id TEXT,
+        skills_received INTEGER DEFAULT 0, skills_accepted INTEGER DEFAULT 0,
+        skills_rejected INTEGER DEFAULT 0, avg_skill_quality REAL DEFAULT 0,
+        reputation_score REAL DEFAULT 0.5, trust_level TEXT DEFAULT 'provisional',
+        first_seen_at INTEGER, last_seen_at INTEGER,
+        is_banned INTEGER DEFAULT 0, eigentrust_score REAL DEFAULT 0,
+        wallet_address TEXT DEFAULT NULL
+      )`);
+      // Memory audit log. Schema MUST match ensureMemoryIndexSchema
+      // (memory-schema.ts), which is the source of truth and creates this table
+      // first — every insert uses id TEXT + chunk_id/actor/metadata. This
+      // statement previously declared an incompatible id-INTEGER/detail shape;
+      // it was dead (the IF NOT EXISTS no-oped against the real table) but a
+      // footgun: if it ever ran first on a fresh DB it would create the wrong
+      // table and every actor/chunk_id insert would throw "no such column".
+      // Kept identical here so it is order-independent and harmless.
+      this.db.exec(`CREATE TABLE IF NOT EXISTS memory_audit_log (
+        id TEXT PRIMARY KEY,
+        chunk_id TEXT,
+        event TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        actor TEXT NOT NULL DEFAULT 'system',
+        metadata TEXT DEFAULT '{}'
+      )`);
+      // Task goals table
+      this.db.exec(`CREATE TABLE IF NOT EXISTS task_goals (
+        id TEXT PRIMARY KEY, description TEXT NOT NULL,
+        progress REAL DEFAULT 0, related_crystal_ids TEXT DEFAULT '[]',
+        session_key TEXT, status TEXT DEFAULT 'active',
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      )`);
+      // Re-run subsystem ensureSchema methods
+      if (this.taskMemory) {
+        try {
+          (this.taskMemory as unknown as { ensureSchema(): void }).ensureSchema();
+        } catch {}
+      }
+      if (this.governance) {
+        try {
+          (this.governance as unknown as { ensureSchema?(): void }).ensureSchema?.();
+        } catch {}
+      }
+    } catch (err) {
+      log.debug(`schema re-creation after reindex failed: ${String(err)}`);
+    }
+    log.debug("propagated new DB handle and schemas to subsystems after reindex");
+  }
+
+  /**
+   * PLAN-55 Phase 1: the already-open manager for this agent, or null. Never
+   * builds one: a caller that only wants to read what an earlier tool call
+   * wrote (the confirmation line after a turn with no corrective shape) must
+   * not open the memory database on a turn that never touched memory.
+   */
+  static peek(params: { cfg: BitterbotConfig; agentId: string }): MemoryIndexManager | null {
+    const settings = resolveMemorySearchConfig(params.cfg, params.agentId);
+    if (!settings) {
+      return null;
+    }
+    const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
+    return INDEX_CACHE.get(`${params.agentId}:${workspaceDir}:${JSON.stringify(settings)}`) ?? null;
+  }
+
+  static async get(params: {
+    cfg: BitterbotConfig;
+    agentId: string;
+    purpose?: "default" | "status";
+  }): Promise<MemoryIndexManager | null> {
+    const { cfg, agentId } = params;
+    const settings = resolveMemorySearchConfig(cfg, agentId);
+    if (!settings) {
+      return null;
+    }
+    const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+    const key = `${agentId}:${workspaceDir}:${JSON.stringify(settings)}`;
+    const existing = INDEX_CACHE.get(key);
+    if (existing) {
+      // The cached instance is shared across purposes; a status probe may have
+      // built it, so the sinks are attached on every get, not only on build.
+      existing.ensureComputeSinks(cfg);
+      return existing;
+    }
+    // De-dupe concurrent first-time builds for the same key (see INDEX_INFLIGHT).
+    const inflight = INDEX_INFLIGHT.get(key);
+    if (inflight) {
+      return inflight;
+    }
+    const build = (async (): Promise<MemoryIndexManager> => {
+      const providerStart = Date.now();
+      const baseProviderResult = await createEmbeddingProvider({
+        config: cfg,
+        agentDir: resolveAgentDir(cfg, agentId),
+        agentId,
+        provider: settings.provider,
+        remote: settings.remote,
+        model: settings.model,
+        fallback: settings.fallback,
+        local: settings.local,
+      });
+      // PLAN-57 §4.6: batches may route to a compute pool. The wrapper keeps
+      // the provider's id and model (the index key) and is a pass-through
+      // until a backend, a runtime and a resolved profile all exist.
+      let built: MemoryIndexManager | null = null;
+      const providerResult: EmbeddingProviderResult =
+        cfg.compute?.enabled !== false && cfg.compute?.embeddings?.provider !== "local"
+          ? {
+              ...baseProviderResult,
+              provider: createPoolEmbeddingProvider({
+                local: baseProviderResult.provider,
+                config: cfg,
+                agentId,
+                getProfile: () => built?.currentEmbeddingProfile() ?? null,
+              }),
+            }
+          : baseProviderResult;
+      const providerMs = Date.now() - providerStart;
+      const ctorStart = Date.now();
+      const manager = new MemoryIndexManager({
+        cacheKey: key,
+        cfg,
+        agentId,
+        workspaceDir,
+        settings,
+        providerResult,
+        purpose: params.purpose,
+      });
+      built = manager;
+      // PLAN-57 §4.7 / Phase 6: this manager takes compute episodes and nudges.
+      manager.ensureComputeSinks(cfg);
+      log.info("memory manager build timing", {
+        agentId,
+        purpose: params.purpose ?? "default",
+        embeddingProviderMs: providerMs,
+        constructorMs: Date.now() - ctorStart,
+      });
+      INDEX_CACHE.set(key, manager);
+      return manager;
+    })();
+    INDEX_INFLIGHT.set(key, build);
+    try {
+      return await build;
+    } finally {
+      INDEX_INFLIGHT.delete(key);
+    }
+  }
+
+  private constructor(params: {
+    cacheKey: string;
+    cfg: BitterbotConfig;
+    agentId: string;
+    workspaceDir: string;
+    settings: ResolvedMemorySearchConfig;
+    providerResult: EmbeddingProviderResult;
+    purpose?: "default" | "status";
+  }) {
+    this.cacheKey = params.cacheKey;
+    this.cfg = params.cfg;
+    this.agentId = params.agentId;
+    this.workspaceDir = params.workspaceDir;
+    this.settings = params.settings;
+    this.provider = params.providerResult.provider;
+    this.requestedProvider = params.providerResult.requestedProvider;
+    this.fallbackFrom = params.providerResult.fallbackFrom;
+    this.fallbackReason = params.providerResult.fallbackReason;
+    this.openAi = params.providerResult.openAi;
+    this.gemini = params.providerResult.gemini;
+    this.voyage = params.providerResult.voyage;
+    this.sources = new Set(params.settings.sources);
+
+    // Boot profiling: the constructor runs synchronously and is the gateway's
+    // dominant cold-boot cost (it blocks the event loop until it returns). Time
+    // each step so the (otherwise unlogged) heavy phases are attributable. Steps
+    // over the threshold log individually; a summary always logs. Threshold
+    // keeps steady-state noise down while surfacing the multi-second offenders.
+    const ctorStart = Date.now();
+    let stepLast = ctorStart;
+    const STEP_LOG_THRESHOLD_MS = 100;
+    const stepTimings: Record<string, number> = {};
+    const step = (label: string): void => {
+      const now = Date.now();
+      const ms = now - stepLast;
+      stepLast = now;
+      stepTimings[label] = ms;
+      if (ms >= STEP_LOG_THRESHOLD_MS) {
+        log.info("memory init step", { label, ms });
+      }
+    };
+
+    this.db = this.openDatabase();
+    step("openDatabase");
+    this.providerKey = this.computeProviderKey();
+    this.cache = {
+      enabled: params.settings.cache.enabled,
+      maxEntries: params.settings.cache.maxEntries,
+    };
+    this.fts = { enabled: params.settings.query.hybrid.enabled, available: false };
+    this.ensureSchema();
+    step("ensureSchema");
+    this.vector = {
+      enabled: params.settings.store.vector.enabled,
+      available: null,
+      extensionPath: params.settings.store.vector.extensionPath,
+    };
+    const meta = this.readMeta();
+    if (meta?.vectorDims) {
+      this.vector.dims = meta.vectorDims;
+    }
+    step("readMeta");
+    // Seed Crystal Migration: convert existing MEMORY.md content into crystals (runs once)
+    void runSeedCrystalMigration({ db: this.db, workspaceDir: this.workspaceDir }).catch((err) => {
+      log.warn(`seed crystal migration failed: ${String(err)}`);
+    });
+    // Skill Bootstrap: load skills/ directory as frozen skill crystals (runs once)
+    void runSkillBootstrap({ db: this.db, workspaceDir: this.workspaceDir }).catch((err) => {
+      log.warn(`skill bootstrap failed: ${String(err)}`);
+    });
+    this.ensureWatcher();
+    step("ensureWatcher");
+    this.ensureSessionListener();
+    this.ensureSkillsListener();
+    this.ensureIntervalSync();
+    this.ensureConsolidationInterval();
+    this.ensureDreamEngine();
+    step("ensureDreamEngine");
+    this.ensureDigestInterval();
+    this.ensureHealthSweepInterval();
+    this.ensureTrendingSweepInterval();
+    this.ensureCuriosityEngine();
+    step("ensureCuriosityEngine");
+    this.ensureHormonalManager();
+    step("ensureHormonalManager");
+    this.ensureUserModelManager();
+    step("ensureUserModelManager");
+    this.ensureCanonicalFacts();
+    step("ensureCanonicalFacts");
+    this.ensureExecutionTracker();
+    this.ensureGovernance();
+    this.ensureTaskMemory();
+    this.ensureScheduler();
+    this.ensureMemStore();
+    step("ensureMemStore");
+    // Peer reputation must exist before the bridge: ensureSkillNetworkBridge
+    // gates SkillMarketplace creation on it (creating it after left the
+    // browse/search marketplace permanently uninstantiated).
+    this.ensurePeerReputationManager();
+    step("ensurePeerReputationManager");
+    this.ensureSkillNetworkBridge();
+    step("ensureSkillNetworkBridge");
+    log.info("memory init complete", {
+      agentId: this.agentId,
+      purpose: params.purpose ?? "default",
+      totalMs: Date.now() - ctorStart,
+      steps: stepTimings,
+    });
+    const statusOnly = params.purpose === "status";
+    this.dirty = this.sources.has("memory") && (statusOnly ? !meta : true);
+    this.skillsDirty = this.sources.has("skills") && (statusOnly ? !meta : true);
+    this.batch = this.resolveBatchConfig();
+  }
+
+  private ensureSkillsListener(): void {
+    if (!this.sources.has("skills") || this.skillsUnsubscribe) {
+      return;
+    }
+    this.skillsUnsubscribe = registerSkillsChangeListener(() => {
+      if (this.closed) {
+        return;
+      }
+      this.skillsDirty = true;
+      this.scheduleWatchSync();
+    });
+  }
+
+  async warmSession(sessionKey?: string): Promise<void> {
+    if (!this.settings.sync.onSessionStart) {
+      return;
+    }
+    const key = sessionKey?.trim() || "";
+    if (key && this.sessionWarm.has(key)) {
+      return;
+    }
+    void this.sync({ reason: "session-start" }).catch((err) => {
+      log.warn(`memory sync failed (session-start): ${String(err)}`);
+    });
+    if (key) {
+      this.sessionWarm.add(key);
+    }
+  }
+
+  /**
+   * Stimulate the hormonal system from a live user message.
+   * Call this when a user message arrives (pre-LLM) so the agent's
+   * emotional state reacts in real-time, not retroactively at index time.
+   */
+  stimulateFromLiveMessage(text: string): void {
+    if (!text) {
+      return;
+    }
+    // Dream gate: count live (non-heartbeat) user turns. Heartbeat prompt
+    // builds skip recallForUserTurn entirely, so they never land here.
+    if (text !== this.lastLiveMessage || Date.now() - this.lastLiveMessageAt >= 5_000) {
+      try {
+        this.getDreamGateState().recordUserTurn();
+      } catch {
+        // Non-critical.
+      }
+    }
+    if (!this.hormonalManager) {
+      return;
+    }
+    // Dedupe: prompt assembly can run more than once for the same user turn
+    // (generation retries, compaction passes). React + advance the turn counter
+    // only once per distinct message within a short window so hormonal state and
+    // proactive-recall cooldowns stay calibrated to real turns.
+    const now = Date.now();
+    if (text === this.lastLiveMessage && now - this.lastLiveMessageAt < 5_000) {
+      return;
+    }
+    this.lastLiveMessage = text;
+    this.lastLiveMessageAt = now;
+
+    const events = this.hormonalManager.stimulateFromText(text);
+    if (events.length > 0) {
+      log.debug(`live hormonal stimulation: ${events.join(", ")}`);
+      // Check if message stimulation triggered an emotional mini-dream
+      this.checkEmotionalDreamTrigger();
+    }
+
+    // Plan 7, Phase 2+9: Update coherence tracker + intent from user message
+    this.turnCount++;
+    this.coherenceTracker.updateIntent(text, this.turnCount);
+    this.coherenceTracker.update(
+      [{ role: "user", content: text, turn: this.turnCount }],
+      this.turnCount,
+    );
+  }
+
+  /**
+   * Involuntary proactive recall for a live user turn (Plan 7, Phase 1).
+   *
+   * Embeds the user's message and surfaces what the agent already knows —
+   * identity facts plus semantically-matched directive/world_fact/mental_model
+   * crystals and open loops — so the model answers already grounded in stored
+   * memory instead of hallucinating about things it has discussed before. Also
+   * drives the live hormonal/coherence reaction (idempotent per turn via the
+   * dedupe in stimulateFromLiveMessage).
+   *
+   * Best-effort: returns no facts if embedding or the vector table is
+   * unavailable. Returns the query embedding so callers (e.g. prospective
+   * memory triggers) can reuse it without re-embedding.
+   */
+  async recallForUserTurn(
+    text: string,
+    opts?: {
+      /**
+       * Conversation identity (session key) for cooldown scoping. The cooldown
+       * map lives on this process-singleton manager, so without a scope key a
+       * new conversation in a warm process inherits the previous session's
+       * suppression window and silently withholds recently-surfaced facts on
+       * its first turns. When the key changes, the map is cleared.
+       */
+      scopeKey?: string;
+    },
+  ): Promise<{
+    facts: string | undefined;
+    embedding: number[] | null;
+    /** PLAN-40 funnel: dream-origin chunk ids that survived the render. */
+    renderedDreamChunkIds?: string[];
+    renderedChunkIds?: string[];
+  }> {
+    if (!text || !text.trim()) {
+      return { facts: undefined, embedding: null };
+    }
+
+    // Live emotional reaction + turn advance (deduped within the turn).
+    this.stimulateFromLiveMessage(text);
+
+    // PLAN-27: lazily backfill historical family edges so the very first
+    // entity query benefits. Guarded to run once; no-op thereafter.
+    this.backfillIdentityRelationships();
+    // PLAN-28 A3: likewise backfill general typed edges (X works on Y, etc.)
+    // from fact/insight history so the graph channel has substrate to traverse.
+    this.backfillGeneralRelationships();
+
+    let embedding: number[] | null = null;
+    try {
+      const vec = (await this.embedQueryWithTimeout(text, USAGE_FEATURES.memoryRecall)) as number[];
+      embedding = Array.isArray(vec) && vec.length > 0 ? vec : null;
+    } catch (err) {
+      log.debug(`proactive recall: query embed failed: ${String(err)}`);
+    }
+
+    try {
+      const { proactiveRecall, formatProactiveFacts, applyRecallScope } =
+        await import("./proactive-recall.js");
+      // Scope the cooldown map to this conversation before recalling.
+      this.recallScopeKey = applyRecallScope(
+        this.proactiveRecallCooldown,
+        this.recallScopeKey,
+        opts?.scopeKey,
+      );
+      const recallCounts: RecallLayerCounts = emptyRecallCounts();
+      const result = await withSpanAttrs(
+        "memory.recall",
+        async (setAttr) => {
+          const r = proactiveRecall({
+            userMessage: text,
+            queryEmbedding: embedding,
+            db: this.db,
+            userModelManager: this.userModelManager,
+            recentlySurfaced: this.proactiveRecallCooldown,
+            currentTurn: this.turnCount,
+            hormonalModulation: this.hormonalManager?.getRetrievalModulation() ?? null,
+            hormonalState: this.hormonalManager?.getState() ?? null,
+            // PLAN-27: graph-anchored recall for entity/identity turns.
+            kg: this.knowledgeGraph,
+            userName: this.resolveUserName(),
+            // Keyword fallback keeps the crystal stage alive when the query
+            // embedding is unavailable (cold-process timeout, provider down).
+            keywordFallback: { ftsTable: FTS_TABLE },
+          });
+          Object.assign(recallCounts, r.layerCounts);
+          setAttr("memory.graph_facts", recallCounts.graphFacts);
+          setAttr("memory.identity_facts", recallCounts.identityFacts);
+          setAttr("memory.vector_facts", recallCounts.vectorFacts);
+          setAttr("memory.keyword_facts", recallCounts.keywordFacts);
+          setAttr("memory.open_loops", recallCounts.openLoops);
+          return r;
+        },
+        { "memory.query_len": text.length },
+      );
+      // PLAN-28 B3: feed the dead-wire detector. Graph here is the same channel
+      // as search's graph layer (KG), so the two retrieval paths reinforce the
+      // same per-layer rolling counter rather than fragmenting it. Keyword-
+      // fallback hits fold into the vector lane — same semantic crystal
+      // channel, degraded transport — so a rare-but-healthy fallback doesn't
+      // register as its own perpetually-dead layer.
+      this.retrievalObs.record({
+        graph: recallCounts.graphFacts,
+        identity: recallCounts.identityFacts,
+        vector: recallCounts.vectorFacts + recallCounts.keywordFacts,
+        open_loops: recallCounts.openLoops,
+      });
+      recordRetrievalTrace(this.db, "recall", recallCounts, {
+        queryLen: text.length,
+        sampleRate: this.retrievalTraceRate,
+      });
+      // PLAN-40 funnel: collect dream-origin chunk ids that survive the
+      // render (post dream-cap). The consumption stamp happens in the
+      // CALLER (resolveEndocrineState) and only for full prompt mode —
+      // minimal-mode assembly discards this block after selection, and a
+      // selection-time stamp would re-create the vanity-metric disease.
+      const includedDreamChunkIds: string[] = [];
+      const includedChunkIds: string[] = [];
+      // PLAN-54: a self-learned fact that comes to mind unprompted counts as used.
+      recordCuriosityUse(
+        this.db,
+        result.facts
+          .filter((f) => f.origin === "curiosity" && typeof f.chunkId === "string")
+          .map((f) => f.chunkId as string),
+      );
+      const facts =
+        result.facts.length > 0
+          ? formatProactiveFacts(result.facts, { includedDreamChunkIds, includedChunkIds })
+          : undefined;
+      // The prompt renderer acknowledges inclusion; selection alone is not exposure.
+      return {
+        facts,
+        embedding,
+        renderedDreamChunkIds: includedDreamChunkIds,
+        renderedChunkIds: includedChunkIds,
+      };
+    } catch (err) {
+      log.debug(`proactive recall failed: ${String(err)}`);
+      return { facts: undefined, embedding };
+    }
+  }
+
+  /** Prompt inclusion, not owner visibility or usefulness. Retries share a delivery id. */
+  recordProactiveRecallDelivery(
+    chunkIds: readonly string[],
+    delivery: { id: string; sessionKey?: string },
+  ): void {
+    try {
+      const telemetry = this.evidenceTelemetry;
+      if (!telemetry?.isEnabled() || chunkIds.length === 0) return;
+      const key = telemetry.digest(JSON.stringify([delivery.sessionKey ?? null, delivery.id]));
+      if (!key) return;
+      const ids = [...new Set(chunkIds)];
+      // Phase 2: the shadow trial logs eligible and assigned ahead of the
+      // delivered row, so it too must see only facts the prompt included.
+      if (this.surfacingTrial) {
+        const now = Date.now();
+        this.surfacingTrial.surfaceBatch(
+          ids.map((chunkId) => ({
+            eventId: `pr:${key}:${chunkId}`,
+            kind: "proactive_recall",
+            refId: chunkId,
+            sessionKey: delivery.sessionKey,
+            now,
+          })),
+        );
+        return;
+      }
+      telemetry.recordSurfacingBatch(
+        ids.map((chunkId) => ({
+          eventId: `pr:${key}:${chunkId}`,
+          kind: "proactive_recall",
+          refId: chunkId,
+          sessionKey: delivery.sessionKey,
+          stage: "delivered" as const,
+        })),
+      );
+    } catch (err) {
+      log.debug(`proactive recall evidence skipped: ${String(err)}`);
+    }
+  }
+
+  /**
+   * PLAN-40 funnel: set-once consumption stamp for dream artifacts that
+   * provably entered a model prompt. Safe to call with unknown ids (no-op).
+   */
+  markDreamArtifactsConsumed(artifactIds: readonly string[], kind: "retrieved"): void {
+    if (artifactIds.length === 0) {
+      return;
+    }
+    void import("./dream-utility.js")
+      .then(({ markDreamConsumptionMany }) => {
+        markDreamConsumptionMany(this.db, artifactIds, kind);
+      })
+      .catch(() => {
+        /* funnel unavailable — non-critical */
+      });
+  }
+
+  /**
+   * Resolve the user's name from the user model's identity preferences, used to
+   * phrase graph-anchored family facts as "your <relation>" and to link
+   * possessive identity edges ("my wife") to the real person entity. Returns
+   * undefined when no name is stored.
+   */
+  /**
+   * PLAN-27 one-time backfill: the family edges that graph-anchored recall reads
+   * live in historical world_fact crystals ("User's wife is named Donna") that
+   * predate the go-forward identity extractor, so the graph would otherwise have
+   * the entities but no edges. Scans kinship-bearing crystals once per process,
+   * extracts typed family edges, and ingests them (idempotent via upsert).
+   * Guarded so it runs at most once; cheap, bounded, and best-effort.
+   */
+  backfillIdentityRelationships(): number {
+    if (this.identityBackfillDone) {
+      return 0;
+    }
+    this.identityBackfillDone = true;
+    if (!this.knowledgeGraph || process.env.BITTERBOT_KG_RELATIONSHIPS === "0") {
+      return 0;
+    }
+    const userName = this.resolveUserName();
+    if (!userName) {
+      return 0;
+    }
+    let created = 0;
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT id, text FROM chunks
+           WHERE (text LIKE '%wife%' OR text LIKE '%husband%' OR text LIKE '%spouse%'
+                  OR text LIKE '%partner%' OR text LIKE '%mother%' OR text LIKE '% mom%'
+                  OR text LIKE '%father%' OR text LIKE '% dad%' OR text LIKE '%parent%'
+                  OR text LIKE '%daughter%' OR text LIKE '%brother%' OR text LIKE '%sister%'
+                  OR text LIKE '%sibling%')
+             AND COALESCE(lifecycle, 'generated') IN ('generated', 'activated', 'consolidated', 'frozen')
+           LIMIT 1000`,
+        )
+        .all() as Array<{ id: string; text: string }>;
+      for (const row of rows) {
+        const edge = kgExtract.extractIdentityRelationship(row.text, { userName });
+        if (!edge) {
+          continue;
+        }
+        this.knowledgeGraph.ingestExtraction(
+          [
+            { name: edge.sourceName, type: "person" },
+            { name: edge.targetName, type: "person" },
+          ],
+          [edge],
+          [row.id],
+        );
+        created += 1;
+      }
+      if (created > 0) {
+        log.info(`identity backfill: created ${created} family edge(s) in the knowledge graph`);
+      }
+    } catch (err) {
+      log.debug(`identity backfill failed: ${String(err)}`);
+    }
+    return created;
+  }
+
+  /**
+   * PLAN-28 A3 one-time backfill: the graph/SABM layers are complete but
+   * dormant because `relationships` is empty — thousands of "X works on Y" /
+   * "service hosted on AWS" facts live in fact/insight/world_fact crystals that
+   * the relationship-typed hot path never mined. Runs the conservative A1 typed
+   * extractor over that history once per process so the graph populates
+   * immediately instead of waiting for the go-forward path (and the offline A2
+   * miner) to drain it. Bounded, idempotent (upsert), best-effort. Guarded so it
+   * runs at most once; behind the same BITTERBOT_KG_RELATIONSHIPS flag.
+   */
+  backfillGeneralRelationships(): number {
+    if (this.generalBackfillDone) {
+      return 0;
+    }
+    this.generalBackfillDone = true;
+    if (!this.knowledgeGraph || process.env.BITTERBOT_KG_RELATIONSHIPS === "0") {
+      return 0;
+    }
+    try {
+      const created = backfillTypedRelationships(this.db, this.knowledgeGraph, { limit: 2000 });
+      if (created > 0) {
+        log.info(`general backfill: created ${created} typed edge(s) in the knowledge graph`);
+      }
+      return created;
+    } catch (err) {
+      log.debug(`general relationship backfill failed: ${String(err)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * The user's own name — the seed value the whole identity/family layer
+   * depends on.
+   *
+   * 2026-08-11: this returned undefined on a node that demonstrably KNEW the
+   * answer, because it only consulted `user_preferences` rows with
+   * category='identity' (of which there were zero) while the canonical ledger
+   * held `identity.user.name = "Victor M. Gil"`. That one gap disabled the
+   * kinship recall branch, the family-edge backfill (`if (!userName) return
+   * 0`), and the go-forward identity extractor simultaneously — so the only
+   * relation types graph recall accepts could never be written, and graph
+   * recall never fired once in the node's lifetime. The ledger is the
+   * higher-trust store anyway (PLAN-33), so consult it as the fallback.
+   */
+  private resolveUserName(): string | undefined {
+    try {
+      const profile = this.userModelManager?.getUserProfile();
+      const namePref = profile?.preferences.find(
+        (p) => p.category === "identity" && /\bname\b/i.test(p.key) && typeof p.value === "string",
+      );
+      const value = namePref?.value?.toString().trim();
+      if (value && value.length > 0) {
+        return value;
+      }
+    } catch {
+      /* fall through to the ledger */
+    }
+    try {
+      for (const key of ["identity.user.name", "identity.user_name", "user.name"]) {
+        const fact = this.canonicalFactsStore?.get(key);
+        const v = fact?.value?.toString().trim();
+        if (v && v.length > 0) {
+          return v;
+        }
+      }
+    } catch {
+      /* ledger unavailable */
+    }
+    return undefined;
+  }
+
+  // ── Emotional Dream Triggering (Plan 6, Phase 4) ──
+
+  private lastMiniDreamTrigger = 0;
+  /**
+   * Token-efficiency pass (2026-09-19): the cooldown must exceed the 30-min
+   * consolidation tick or a pinned hormone re-fires a mini-dream every tick.
+   */
+  private get miniDreamCooldown(): number {
+    return (
+      (this.cfg.memory?.dream?.miniDreamCooldownMinutes ??
+        DEFAULT_DREAM_CONFIG.miniDreamCooldownMinutes) *
+      60 *
+      1000
+    );
+  }
+  /** Mini-dreams fire on a hormonal RISE since the last check, never on a level. */
+  private miniDreamTriggerInstance: HormonalDeltaTrigger | null = null;
+  private autoScratchTriggerInstance: HormonalDeltaTrigger | null = null;
+  private get hormonalTriggerDelta(): number {
+    return (
+      this.cfg.memory?.dream?.hormonalTriggerDelta ?? DEFAULT_DREAM_CONFIG.hormonalTriggerDelta
+    );
+  }
+  private get miniDreamTrigger(): HormonalDeltaTrigger {
+    this.miniDreamTriggerInstance ??= new HormonalDeltaTrigger(this.hormonalTriggerDelta);
+    return this.miniDreamTriggerInstance;
+  }
+  private get autoScratchTrigger(): HormonalDeltaTrigger {
+    this.autoScratchTriggerInstance ??= new HormonalDeltaTrigger(this.hormonalTriggerDelta);
+    return this.autoScratchTriggerInstance;
+  }
+  /** Persisted counters behind the scheduled full-cycle gate. */
+  private dreamGateState: DreamGateState | null = null;
+  private getDreamGateState(): DreamGateState {
+    if (!this.dreamGateState) {
+      this.dreamGateState = new DreamGateState(this.db);
+    }
+    return this.dreamGateState;
+  }
+
+  // Plan 7: Cognitive coherence state
+  readonly coherenceTracker = new SessionCoherenceTracker();
+  readonly proactiveRecallCooldown = new Map<string, number>();
+  /** Conversation the cooldown map is currently scoped to (see recallForUserTurn). */
+  private recallScopeKey: string | undefined;
+  private turnCount = 0;
+  /** Last live user message + when, to dedupe per-turn stimulation/recall. */
+  private lastLiveMessage = "";
+  private lastLiveMessageAt = 0;
+  /** PLAN-27: ensures the one-time identity-edge backfill runs at most once. */
+  private identityBackfillDone = false;
+  /** PLAN-28 A3: ensures the one-time general relationship backfill runs once. */
+  private generalBackfillDone = false;
+  /** PLAN-34 §6.2: session_trust backfill ran this process (idempotent anyway). */
+  private sessionTrustBackfillDone = false;
+  /** PLAN-28 Part B: rolling per-layer dead-wire detector + trace counters.
+   * PLAN-34 Phase 6 (§8): open_loops is a LOW-FREQUENCY lane — it contributes
+   * only while unfinished work exists, so the 200-call rolling window would
+   * false-alarm it into alarm blindness; it gets the 30-day time window.
+   * Lane baselines persist in memory_meta so restarts (batched gateway
+   * rebuilds happen well inside 30 days) never reset the clock. */
+  readonly retrievalObs = new RetrievalObservability(
+    undefined,
+    { open_loops: TIME_WINDOW_LANE_MS },
+    undefined,
+    {
+      get: (key) => {
+        // Throws while the DB is still initializing (detector retries);
+        // a fresh-but-ready DB just answers null.
+        this.db.exec(
+          `CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+        );
+        const row = this.db.prepare(`SELECT value FROM memory_meta WHERE key = ?`).get(key) as
+          | { value: string }
+          | undefined;
+        if (!row) {
+          return null;
+        }
+        const n = Number(row.value);
+        return Number.isFinite(n) ? n : null;
+      },
+      set: (key, value) => {
+        this.db.exec(
+          `CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+        );
+        this.db
+          .prepare(
+            `INSERT INTO memory_meta (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          )
+          .run(key, String(value));
+      },
+    },
+  );
+  /** PLAN-33: the canonical facts ledger (null when disabled/failed). */
+  private canonicalFactsStore: CanonicalFactsStore | null = null;
+  /** PLAN-55 Phase 2: canonical:changed consumers, run off the write path. */
+  private canonicalPropagation: CanonicalPropagation | null = null;
+  /** PLAN-33: last canonical-block injection, for retrievalHealth. */
+  private lastCanonicalInjection: { at: number; count: number } | null = null;
+  /** PLAN-28 B2: persisted-trace sampling rate (env-tunable, 0 disables). */
+  private readonly retrievalTraceRate = resolveTraceSampleRate();
+
+  /**
+   * Check hormonal state after stimulation and trigger mini-dream if spike detected.
+   * Wired through manager (not direct callback on HormonalStateManager) to keep
+   * the manager as the orchestration layer — consistent with existing wiring patterns.
+   */
+  private checkEmotionalDreamTrigger(): void {
+    if (!this.hormonalManager || !this.dreamEngine) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - this.lastMiniDreamTrigger < this.miniDreamCooldown) {
+      return;
+    }
+
+    const state = this.hormonalManager.getState();
+
+    // Token-efficiency pass (2026-09-19): GCCRF stimulation on every
+    // consolidation tick plus recall_relational on every prompt build pinned
+    // dopamine above 0.7 while idle, so the old absolute-level check fired a
+    // mini-dream every 30 minutes. A spike is now a RISE since the last check.
+    const spikes = this.miniDreamTrigger.check(state);
+    const reason = spikes.includes("dopamine_spike")
+      ? "dopamine_spike"
+      : spikes.includes("cortisol_spike")
+        ? "cortisol_spike"
+        : null;
+    if (reason) {
+      this.lastMiniDreamTrigger = now;
+      void this.dreamEngine
+        .runMiniDream(reason)
+        .catch((err) => log.warn(`mini-dream failed: ${String(err)}`));
+    }
+
+    // Plan 7, Phase 7: State-based emotional anchor recall
+    // When current emotional state matches a stored anchor, blend it mildly
+    if (this.hormonalManager) {
+      try {
+        const similar = this.hormonalManager.findSimilarAnchors(0.85, 1);
+        if (similar.length > 0) {
+          const { anchor, similarity } = similar[0]!;
+          this.hormonalManager.recallAnchor(anchor.id, 0.15);
+          log.debug("associative anchor recall", {
+            label: anchor.label,
+            similarity: similarity.toFixed(2),
+          });
+        }
+      } catch {
+        // findSimilarAnchors not available yet — non-critical
+      }
+    }
+  }
+
+  /** PLAN-53 G2: search for a non-owner sender. Over-fetches, then filters. */
+  async guestSearch(
+    query: string,
+    opts?: { maxResults?: number; minScore?: number; sessionKey?: string },
+  ): Promise<MemorySearchResult[]> {
+    const want = opts?.maxResults ?? this.settings.query.maxResults;
+    // PLAN-55 Phase 2: superseded tags carry ledger values; never for a guest.
+    const results = await this.search(query, {
+      ...opts,
+      maxResults: want * 3,
+      tagSuperseded: false,
+      // PLAN-59 Phase 0: guest searches are not owner evidence.
+      observe: false,
+    });
+    // PLAN-58: a guest learns nothing about the shape of the owner's index.
+    return filterGuestResults(this.db, results)
+      .slice(0, want)
+      .map(({ channels: _c, fusion: _f, ...rest }) => rest);
+  }
+
+  guestMayRead(relPath: string): boolean {
+    return guestMayReadPath(this.db, relPath);
+  }
+
+  async search(
+    query: string,
+    opts?: {
+      maxResults?: number;
+      minScore?: number;
+      sessionKey?: string;
+      /**
+       * PLAN-55 Phase 2: rank superseded results last and tag them with the
+       * ledger's current value. Owner searches only; guestSearch passes false.
+       */
+      tagSuperseded?: boolean;
+      /**
+       * The instant the query is asked, epoch ms. Every age-dependent boost
+       * (recency, temporal intent) measures from here instead of the wall
+       * clock. Benchmarks that replay a dated history pass the question's
+       * date so a 2023 memory is scored as it would have been in 2023.
+       */
+      now?: number;
+      /**
+       * PLAN-59 Phase 0: short tag naming the call site for the retrieval
+       * evidence row (`memory_search`, `deep_recall`, ...). Optional.
+       */
+      caller?: string;
+      /** PLAN-59 Phase 0: `false` skips the evidence row (guest searches). */
+      observe?: boolean;
+    },
+  ): Promise<MemorySearchResult[]> {
+    // PLAN-55 Phase 2: over-fetch while marks exist, so demoted results never
+    // take a slot a current one could fill.
+    const tagSuperseded =
+      opts?.tagSuperseded !== false &&
+      canonicalLedgerEnabled(this.cfg.memory?.canonicalLedger) &&
+      hasSupersessionMarks(this.db);
+    const want = opts?.maxResults ?? this.settings.query.maxResults;
+    const innerOpts = tagSuperseded
+      ? { ...opts, maxResults: want + Math.min(want, SUPERSEDED_OVERFETCH) }
+      : opts;
+    // PLAN-28 B1: per-layer retrieval counts, filled by searchInner and attached
+    // as span attributes + fed to the dead-wire detector / sampled trace below.
+    const layers: SearchLayerCounts = emptySearchCounts();
+    const results = await withSpanAttrs(
+      "memory.search",
+      async (setAttr) => {
+        const r = await this.searchInner(query, innerOpts, layers);
+        setAttr("memory.vector_hits", layers.vectorHits);
+        setAttr("memory.keyword_hits", layers.keywordHits);
+        setAttr("memory.graph_hits", layers.graphHits);
+        setAttr("memory.fused", layers.fused);
+        setAttr("memory.mood_boost_applied", layers.moodBoostApplied);
+        setAttr("memory.temporal_intent", layers.temporalIntent);
+        return r;
+      },
+      {
+        "memory.query_len": query.length,
+        "memory.max_results": opts?.maxResults ?? this.settings.query.maxResults,
+      },
+    );
+    this.retrievalObs.record({
+      vector: layers.vectorHits,
+      keyword: layers.keywordHits,
+      graph: layers.graphHits,
+    });
+    recordRetrievalTrace(this.db, "search", layers, {
+      queryLen: query.length,
+      sampleRate: this.retrievalTraceRate,
+    });
+    this.attachEvidenceRefs(results);
+    if (tagSuperseded) {
+      applySupersededMarks(this.db, results);
+      results.splice(want);
+    }
+    if (results.length === 0) {
+      this.recordCoverageMiss(query);
+    }
+    // PLAN-59 Phase 0: record the top-K of exactly what is returned. Runs
+    // after every reorder above, touches nothing in `results`, never throws.
+    if (opts?.observe !== false) {
+      this.recordRetrievalEvidence(query, results, opts?.sessionKey, opts?.caller);
+    }
+    return results;
+  }
+
+  /** PLAN-59 Phase 0: the evidence telemetry writer, for status and tests. */
+  getEvidenceTelemetry(): EvidenceTelemetry | null {
+    return this.evidenceTelemetry;
+  }
+
+  /** PLAN-59 Phase 2: the shadow surfacing trial, for status and tests. */
+  getSurfacingTrial(): SurfacingTrial | null {
+    return this.surfacingTrial;
+  }
+
+  /**
+   * PLAN-59 Phase 0: write the retrieval evidence row set for one search.
+   * Chunk ids come from the identity map searchInner filled; a result built
+   * elsewhere (a superseded copy) falls back to a bounded indexed lookup.
+   */
+  private recordRetrievalEvidence(
+    query: string,
+    results: MemorySearchResult[],
+    sessionKey: string | undefined,
+    caller: string | undefined,
+  ): void {
+    const telemetry = this.evidenceTelemetry;
+    if (!telemetry || !telemetry.isEnabled() || results.length === 0) {
+      return;
+    }
+    try {
+      const topK = telemetry.config.topK;
+      let lookup: ReturnType<typeof this.db.prepare> | null = null;
+      const hits: Array<{
+        chunkId: string;
+        rank: number;
+        score?: number;
+        channelRanks?: Record<string, number>;
+      }> = [];
+      for (let i = 0; i < results.length && hits.length < topK; i++) {
+        const r = results[i]!;
+        let chunkId = this.resultChunkIds.get(r) ?? (r as { id?: unknown }).id;
+        if (typeof chunkId !== "string") {
+          lookup ??= this.db.prepare(
+            `SELECT id FROM chunks WHERE path = ? AND start_line = ? AND end_line = ? LIMIT 1`,
+          );
+          const row = lookup.get(r.path, r.startLine, r.endLine) as { id: string } | undefined;
+          chunkId = row?.id;
+        }
+        if (typeof chunkId !== "string") {
+          continue;
+        }
+        let channelRanks: Record<string, number> | undefined;
+        if (r.channels) {
+          channelRanks = {};
+          for (const [channel, hit] of Object.entries(r.channels)) {
+            if (hit) {
+              channelRanks[channel] = hit.rank;
+            }
+          }
+        }
+        hits.push({ chunkId, rank: i + 1, score: r.score, channelRanks });
+      }
+      telemetry.recordRetrieval({
+        query,
+        sessionKey,
+        caller,
+        results: hits,
+        embeddingModel: this.provider.model,
+      });
+      // PLAN-59 Phase 2: an explicit owner retrieval of an item a withhold-
+      // assigned opportunity surfaced is the shadow crossover marker.
+      this.surfacingTrial?.noteExplicitRetrieval({
+        chunkIds: hits.map((h) => h.chunkId),
+        caller,
+      });
+    } catch (err) {
+      log.debug(`retrieval evidence skipped: ${String(err)}`);
+    }
+  }
+
+  /**
+   * PLAN-24 HORMA Phase 1: on a recall miss, fire the coverage discriminator to
+   * attribute the failure to construction vs retrieval. Fire-and-forget and
+   * off the execution path; active by default (disable via
+   * memory.coverageDiagnostics.enabled = false).
+   */
+  private recordCoverageMiss(query: string): void {
+    if (this.cfg.memory?.coverageDiagnostics?.enabled === false) {
+      return;
+    }
+    void (async () => {
+      try {
+        const { runCoverageDiagnostic } = await import("./coverage-diagnostics.js");
+        await runCoverageDiagnostic({
+          db: this.db,
+          query,
+          now: Date.now(),
+          scanRaw: (terms) => this.scanRawTranscripts(terms),
+        });
+      } catch (err) {
+        log.debug(`coverage diagnostic failed: ${String(err)}`);
+      }
+    })();
+  }
+
+  /** Do the given terms appear in the recent raw session transcripts? */
+  private async scanRawTranscripts(terms: string[]): Promise<boolean> {
+    if (terms.length === 0) {
+      return false;
+    }
+    try {
+      const RECENT = 25;
+      const files = (await listSessionFilesForAgent(this.agentId)).slice(-RECENT);
+      const { buildSessionEntry } = await import("./session-files.js");
+      const need = Math.ceil(terms.length / 2);
+      for (const f of files) {
+        const entry = await buildSessionEntry(f);
+        if (!entry) {
+          continue;
+        }
+        const lower = entry.content.toLowerCase();
+        let hits = 0;
+        for (const t of terms) {
+          if (lower.includes(t)) {
+            hits++;
+          }
+        }
+        if (hits >= need) {
+          return true;
+        }
+      }
+    } catch {
+      // best-effort
+    }
+    return false;
+  }
+
+  /**
+   * PLAN-24 HORMA Phase 0: surface provenance pointers on extracted-fact results
+   * so the agent can drill back to verbatim source via memory_expand. Extracted
+   * facts are the only rows carrying evidence_refs; they are identified by
+   * source='sessions' with start_line=0/end_line=0 and a fact text short enough
+   * to round-trip as its own snippet. Best-effort; never throws.
+   */
+  private attachEvidenceRefs(results: MemorySearchResult[]): void {
+    if (this.cfg.memory?.provenance?.enabled === false) {
+      return;
+    }
+    let stmt: ReturnType<typeof this.db.prepare> | null = null;
+    for (const r of results) {
+      if (r.source !== "sessions" || r.startLine !== 0 || r.endLine !== 0 || r.evidenceRefs) {
+        continue;
+      }
+      try {
+        stmt ??= this.db.prepare(
+          `SELECT evidence_refs FROM chunks
+           WHERE path = ? AND source = 'sessions' AND text = ? AND evidence_refs IS NOT NULL
+           LIMIT 1`,
+        );
+        const row = stmt.get(r.path, r.snippet) as { evidence_refs: string | null } | undefined;
+        if (row?.evidence_refs) {
+          const refs = parseEvidenceRefs(row.evidence_refs);
+          if (refs.length > 0) {
+            r.evidenceRefs = refs;
+          }
+        }
+      } catch {
+        // provenance surfacing is non-critical
+      }
+    }
+  }
+
+  /**
+   * PLAN-24 HORMA Phase 0: resolve an EvidenceRef back to its raw source window.
+   * Delegates to the standalone resolver; surfaced to the agent via memory_expand.
+   */
+  async expandEvidence(
+    ref: import("./session-extractor.js").EvidenceRef,
+    window?: number,
+  ): Promise<import("./evidence-expand.js").ExpandedEvidence> {
+    const { expandEvidenceRef } = await import("./evidence-expand.js");
+    return expandEvidenceRef(ref, window);
+  }
+
+  private async searchInner(
+    query: string,
+    opts?: {
+      maxResults?: number;
+      minScore?: number;
+      sessionKey?: string;
+      /** See search(): the instant the query is asked, for age-dependent boosts. */
+      now?: number;
+    },
+    layers?: SearchLayerCounts,
+  ): Promise<MemorySearchResult[]> {
+    void this.warmSession(opts?.sessionKey);
+    if (this.settings.sync.onSearch && (this.dirty || this.sessionsDirty || this.skillsDirty)) {
+      void this.sync({ reason: "search" }).catch((err) => {
+        log.warn(`memory sync failed (search): ${String(err)}`);
+      });
+    }
+    const cleaned = query.trim();
+    if (!cleaned) {
+      return [];
+    }
+    const maxResults = opts?.maxResults ?? this.settings.query.maxResults;
+    const hybrid = this.settings.query.hybrid;
+    // RRF scores are on a different scale (~0.01–0.03 for k=60) than cosine
+    // similarity (~0.3–0.9). When using RRF, disable minScore filtering since
+    // rank-based fusion already handles relevance ranking effectively.
+    const minScore =
+      hybrid.mergeStrategy === "rrf" ? 0 : (opts?.minScore ?? this.settings.query.minScore);
+    const candidates = Math.min(
+      200,
+      Math.max(1, Math.floor(maxResults * hybrid.candidateMultiplier)),
+    );
+
+    const keywordResults = hybrid.enabled
+      ? await this.searchKeyword(cleaned, candidates).catch(() => [])
+      : [];
+
+    const queryVec = (await this.embedQueryWithTimeout(cleaned)) as number[];
+    const hasVector = queryVec.some((v) => v !== 0);
+    const vectorResults = hasVector
+      ? await this.searchVector(queryVec, candidates, cleaned).catch(() => [])
+      : [];
+
+    const useRrf = hybrid.mergeStrategy === "rrf";
+
+    // Legacy importance boost — only active when using weighted merge strategy.
+    // With RRF, importance is decoupled from retrieval (used only for lifecycle).
+    const importanceWeight = useRrf ? 0 : this.settings.query.importanceWeight;
+    const applyImportanceBoost = <T extends { score: number; importanceScore?: number }>(
+      items: T[],
+    ): T[] => {
+      if (importanceWeight <= 0) {
+        return items;
+      }
+      return items.map((r) => {
+        const imp = r.importanceScore ?? 1.0;
+        const boost = 1 - importanceWeight + importanceWeight * imp;
+        return { ...r, score: r.score * boost };
+      });
+    };
+
+    // PLAN-18 Phase 4 — capture the channel snapshots so we can detect
+    // graph gaps and harvest training pairs after the merge.
+    let sageGraphChannel: HybridGraphResult[] = [];
+    let sageVectorTopIds: string[] = [];
+    let sageKeywordTopIds: string[] = [];
+
+    if (layers) {
+      layers.vectorHits = vectorResults.length;
+      layers.keywordHits = keywordResults.length;
+    }
+
+    let results: MemorySearchResult[];
+    if (!hybrid.enabled) {
+      // PLAN-58: rank by cosine before the boost so `channels.vector.rank`
+      // is the channel's own order, not the boosted one.
+      const ranked = [...vectorResults]
+        .toSorted((a, b) => b.score - a.score)
+        .map((entry, i) => ({
+          ...entry,
+          channels: { vector: { rank: i + 1, score: entry.score } },
+          fusion: "vector-only" as const,
+        }));
+      const boosted = applyImportanceBoost(ranked);
+      boosted.sort((a, b) => b.score - a.score);
+      results = boosted.filter((entry) => entry.score >= minScore).slice(0, maxResults);
+    } else if (useRrf) {
+      // RRF merge: rank-based fusion that doesn't require comparable score scales.
+      // Importance is NOT applied — it governs memory lifecycle only.
+      const typedVector = vectorResults as Array<
+        (typeof vectorResults)[number] & {
+          id: string;
+          importanceScore: number;
+          updatedAt: number;
+          lastAccessedAt: number | null;
+          emotionalValence: number | null;
+        }
+      >;
+      const typedKeyword = keywordResults as Array<
+        (typeof keywordResults)[number] & {
+          id: string;
+          textScore: number;
+          importanceScore: number;
+          updatedAt: number;
+          lastAccessedAt: number | null;
+          emotionalValence: number | null;
+        }
+      >;
+      // PLAN-18 Phase 2/5 — graph reader as a 3rd RRF channel. Silently
+      // skipped if the knowledge graph isn't yet populated, or if the
+      // sage config disables the reader.
+      const graphChannel = await this.computeGraphChannel(cleaned).catch(() => []);
+      sageGraphChannel = graphChannel;
+      if (layers) {
+        layers.graphHits = graphChannel.length;
+      }
+      sageVectorTopIds = typedVector.slice(0, 5).map((r) => r.id);
+      sageKeywordTopIds = typedKeyword.slice(0, 5).map((r) => r.id);
+
+      const merged = mergeHybridResultsRRF({
+        vector: typedVector.map((r) => ({
+          id: r.id,
+          path: r.path,
+          startLine: r.startLine,
+          endLine: r.endLine,
+          source: r.source,
+          snippet: r.snippet,
+          vectorScore: r.score,
+          importanceScore: r.importanceScore,
+          updatedAt: r.updatedAt,
+          lastAccessedAt: r.lastAccessedAt,
+          emotionalValence: r.emotionalValence,
+        })),
+        keyword: typedKeyword.map((r) => ({
+          id: r.id,
+          path: r.path,
+          startLine: r.startLine,
+          endLine: r.endLine,
+          source: r.source,
+          snippet: r.snippet,
+          textScore: r.textScore,
+          importanceScore: r.importanceScore,
+          updatedAt: r.updatedAt,
+          lastAccessedAt: r.lastAccessedAt,
+          emotionalValence: r.emotionalValence,
+        })),
+        graph: graphChannel,
+        // Weighted RRF (docs/research/fusion-weights-2026-10-29.md): the
+        // resolver has already replaced bad values with the defaults.
+        weights: hybrid.rrfWeights,
+        k: hybrid.rrfK,
+      });
+
+      // The boosts below key on a memory's type, epistemic layer and age, which
+      // the search channels do not select. Look them up once for the merged
+      // set (without this the mood bonus never saw a type, every result aged at
+      // the default rate, and age was measured from "now").
+      attachResultMetadata(this.db, merged);
+      // PLAN-54: a self-learned fact that search returns counts as used.
+      recordCuriosityUse(
+        this.db,
+        merged.map((m) => m.id),
+      );
+
+      // Hormonal retrieval modulation: emotional state influences what memories surface.
+      // Cortisol (stress) sharpens focus on recent memories via recency bias.
+      // Dopamine boosts importance weight slightly (optimism lifts all boats).
+      const hormonalMod = this.hormonalManager?.getRetrievalModulation();
+      // The fused RRF score each boost below starts from; the boosts are
+      // bounded against it afterwards (query.postFusionBoostScale).
+      const fusedBase = merged.map((entry) => entry.score);
+      // "Now" for every age-dependent boost: the caller's instant if given.
+      const boostNow = opts?.now ?? Date.now();
+
+      // Apply recency boost: recent memories get a temporal advantage
+      const recencyCfg: RecencyConfig = this.settings.query.recency;
+      if (recencyCfg.enabled) {
+        // Cortisol-driven recency bias: stressed agent focuses more on recent memories
+        const effectiveRecencyCfg = hormonalMod
+          ? { ...recencyCfg, alpha: recencyCfg.alpha * hormonalMod.recencyBias }
+          : recencyCfg;
+        for (const entry of merged) {
+          entry.score *= computeRecencyBoost(
+            entry.updatedAt ?? boostNow,
+            entry.lastAccessedAt ?? null,
+            effectiveRecencyCfg,
+            boostNow,
+          );
+        }
+      }
+
+      // Emotional retrieval boost: emotionally charged memories surface more easily.
+      // In humans, mood-congruent memory recall is a well-documented phenomenon.
+      for (const entry of merged) {
+        const valence = entry.emotionalValence ?? 0;
+        if (Math.abs(valence) > 0.3) {
+          entry.score *= 1 + Math.abs(valence) * 0.1;
+        }
+      }
+
+      // PLAN-9 GAP-6: Mood-congruent retrieval — hormonal state biases which memories surface
+      if (hormonalMod && this.hormonalManager) {
+        const hState = this.hormonalManager.getState();
+        for (const entry of merged) {
+          const bonus = moodCongruentBonus({
+            hormonalState: hState,
+            emotionalValence: entry.emotionalValence ?? null,
+            semanticType: ((entry as Record<string, unknown>).semanticType as string) ?? null,
+          });
+          if (bonus > 0) {
+            entry.score *= 1 + bonus;
+            if (layers) {
+              layers.moodBoostApplied += 1;
+            }
+          }
+        }
+      }
+
+      // Plan 7, Phase 3: Temporal awareness — query intent determines how age affects scoring.
+      // "What am I working on?" strongly favors recent; "when did I..." favors older.
+      try {
+        const { detectTemporalIntent, temporalRelevanceMultiplier } =
+          await import("./temporal-scoring.js");
+        const temporalIntent = detectTemporalIntent(query);
+        if (layers) {
+          layers.temporalIntent = temporalIntent;
+        }
+        if (temporalIntent !== "timeless") {
+          for (const entry of merged) {
+            entry.score *= temporalRelevanceMultiplier({
+              intent: temporalIntent,
+              epistemicLayer:
+                ((entry as Record<string, unknown>).epistemicLayer as string | null) ?? null,
+              createdAt: ((entry as Record<string, unknown>).createdAt as number) ?? boostNow,
+              updatedAt: entry.updatedAt ?? null,
+              now: boostNow,
+            });
+          }
+        }
+      } catch {
+        // temporal-scoring module not available — non-critical
+      }
+
+      const boostScale = this.settings.query.postFusionBoostScale;
+      if (boostScale < 1) {
+        merged.forEach((entry, i) => {
+          entry.score = boundPostFusionBoost(fusedBase[i] ?? entry.score, entry.score, boostScale);
+        });
+      }
+
+      merged.sort((a, b) => b.score - a.score);
+
+      results = merged
+        .filter((entry) => entry.score >= minScore)
+        .slice(0, maxResults)
+        .map((entry) => {
+          const out: MemorySearchResult = {
+            path: entry.path,
+            startLine: entry.startLine,
+            endLine: entry.endLine,
+            score: entry.score,
+            snippet: entry.snippet,
+            source: entry.source as MemorySource,
+            channels: entry.channels,
+            fusion: entry.fusion,
+          };
+          // PLAN-59 Phase 0: remember the chunk id for the evidence row
+          // without adding it to the public result shape.
+          this.resultChunkIds.set(out, entry.id);
+          return out;
+        });
+    } else {
+      // Legacy weighted merge: score = vectorWeight * vectorScore + textWeight * textScore
+      const merged = this.mergeHybridResults({
+        vector: vectorResults,
+        keyword: keywordResults,
+        vectorWeight: hybrid.vectorWeight,
+        textWeight: hybrid.textWeight,
+      });
+      const boosted = applyImportanceBoost(merged);
+      boosted.sort((a, b) => b.score - a.score);
+      results = boosted.filter((entry) => entry.score >= minScore).slice(0, maxResults);
+    }
+
+    if (layers) {
+      layers.fused = results.length;
+    }
+    this.trackSearchHits(results);
+    this.recordSageSignals(cleaned, results, sageGraphChannel, sageVectorTopIds, sageKeywordTopIds);
+
+    // Limbic memory bridge (Plan 6, Phase 5): retrieved memories influence emotional state.
+    // This creates a feedback loop: emotional state → retrieval bias → recalled content → hormones.
+    if (this.hormonalManager && results.length > 0) {
+      try {
+        // Query emotional valence and semantic type for retrieved chunks
+        const params: (string | number)[] = [];
+        for (const r of results) {
+          params.push(r.path, r.startLine, r.endLine);
+        }
+        const whereClause = results
+          .map(() => "(path = ? AND start_line = ? AND end_line = ?)")
+          .join(" OR ");
+        const retrieved = this.db
+          .prepare(`SELECT emotional_valence, semantic_type FROM chunks WHERE ${whereClause}`)
+          .all(...params) as Array<{
+          emotional_valence: number | null;
+          semantic_type: string | null;
+        }>;
+
+        if (retrieved.length > 0) {
+          const avgValence =
+            retrieved.reduce((sum, r) => sum + (r.emotional_valence ?? 0), 0) / retrieved.length;
+
+          if (avgValence > 0.3) {
+            this.hormonalManager.stimulate("recall_positive");
+          } else if (avgValence < -0.3) {
+            this.hormonalManager.stimulate("recall_negative");
+          }
+
+          const hasRelational = retrieved.some(
+            (r) => r.semantic_type === "relationship" || r.semantic_type === "preference",
+          );
+          if (hasRelational) {
+            this.hormonalManager.stimulate("recall_relational");
+          }
+
+          // Check if limbic recall triggered an emotional mini-dream
+          this.checkEmotionalDreamTrigger();
+        }
+      } catch {
+        // Non-critical: limbic bridge failure shouldn't break search
+      }
+    }
+
+    // Curiosity Engine: record search query for gap detection
+    if (this.curiosityEngine && hasVector && queryVec.length > 0) {
+      try {
+        const topScore = results.length > 0 ? results[0]!.score : 0;
+        const meanScore =
+          results.length > 0 ? results.reduce((sum, r) => sum + r.score, 0) / results.length : 0;
+        this.recordSearchQueryCuriosity(cleaned, queryVec, results.length, topScore, meanScore);
+      } catch {
+        // Non-critical
+      }
+    }
+
+    return results;
+  }
+
+  private trackSearchHits(results: MemorySearchResult[]): void {
+    if (results.length === 0) {
+      return;
+    }
+    const now = Date.now();
+    try {
+      const stmt = this.db.prepare(
+        `UPDATE chunks SET access_count = access_count + 1, last_accessed_at = ?
+         WHERE path = ? AND start_line = ? AND end_line = ?`,
+      );
+      for (const result of results) {
+        stmt.run(now, result.path, result.startLine, result.endLine);
+      }
+
+      // PLAN-9: Spacing effect — record access timestamps for spaced repetition scoring
+      // PLAN-9: Reconsolidation — mark retrieved chunks as labile
+      const idQuery = this.db.prepare(
+        `SELECT id FROM chunks WHERE path = ? AND start_line = ? AND end_line = ?`,
+      );
+      for (const result of results) {
+        try {
+          const row = idQuery.get(result.path, result.startLine, result.endLine) as
+            | { id: string }
+            | undefined;
+          if (row) {
+            recordAccess(this.db, row.id);
+            this.reconsolidationEngine?.markLabile(row.id);
+          }
+        } catch {
+          // Non-critical
+        }
+      }
+    } catch {
+      // Non-critical: access tracking failure shouldn't break search
+    }
+  }
+
+  /**
+   * Lazy-construct an LLM call for the SAGE query planner. Returns the
+   * cached call on subsequent invocations. Returns null if no usable
+   * model could be resolved.
+   *
+   * Uses a small fast model (Haiku-class) by design — query decomposition
+   * is a tight bounded JSON-out task and doesn't need the dream model.
+   */
+  private getSagePlannerLlmCall(): ((prompt: string) => Promise<string>) | null {
+    if (this.sagePlannerLlmCall) {
+      return this.sagePlannerLlmCall;
+    }
+    if (this.sagePlannerLlmTried) {
+      return null;
+    }
+    this.sagePlannerLlmTried = true;
+
+    // Synchronous fast-path check: do we actually have a credential
+    // a Haiku-class or fast-OpenAI model could use? Calling the
+    // resolver chain inside the search hot path is unsafe — the auth
+    // walk can hit OAuth refresh / 1Password CLI / keychain calls
+    // that take seconds. The env-var check is a cheap, deterministic
+    // gate that matches the most common production deployment shape
+    // and degrades safely in CI/test where env keys aren't set.
+    const hasAnthropic = !!process.env.ANTHROPIC_API_KEY?.trim();
+    const hasOpenAi = !!process.env.OPENAI_API_KEY?.trim();
+    if (!hasAnthropic && !hasOpenAi) {
+      log.debug("sage planner llm unavailable (no env api key); using heuristic");
+      return null;
+    }
+
+    const candidates = hasAnthropic
+      ? ["anthropic/claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5"]
+      : ["openai/gpt-4o-mini"];
+    for (const spec of candidates) {
+      const raw = this.buildLlmCallFn(spec, { feature: USAGE_FEATURES.memoryPlanner });
+      if (!raw) {
+        continue;
+      }
+      // Even with a key configured, wrap in a short timeout to bound
+      // worst-case search latency on first cold call. 800ms is enough
+      // for Haiku (typical p95 ~500ms) and well under the production
+      // search budget. On timeout we throw and the planner falls back
+      // to its heuristic decomposer.
+      this.sagePlannerLlmCall = async (prompt: string): Promise<string> => {
+        const TIMEOUT_MS = 800;
+        let timer: NodeJS.Timeout | null = null;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("sage planner llm timeout")), TIMEOUT_MS);
+        });
+        try {
+          return await Promise.race([raw(prompt), timeoutPromise]);
+        } finally {
+          if (timer) {
+            clearTimeout(timer);
+          }
+        }
+      };
+      log.debug("sage planner llm wired", { model: spec });
+      return this.sagePlannerLlmCall;
+    }
+    log.debug("sage planner llm unavailable; falling back to heuristic planner");
+    return null;
+  }
+
+  /**
+   * PLAN-18 Phase 3/4 — best-effort SAGE signal collection on every search.
+   *
+   * 1. Harvest training pairs: with a small sampling probability, record
+   *    (query, top-result-chunk-id) into `graph_gate_training_pairs` so
+   *    the dream-engine optimizer hook eventually has fuel. We sample
+   *    instead of recording every search because the same conversation
+   *    often hits the same chunks repeatedly and the table would fill
+   *    with low-information duplicates. The 5 000-row cap in
+   *    `insertTrainingPair` provides a hard ceiling either way.
+   *
+   * 2. Emit graph-bridge signals: when a chunk is in the vector or
+   *    keyword top-K but missing from the graph channel's top-K, that
+   *    chunk is reachable in content-space but unreachable in
+   *    graph-space — a missing bridge edge the curiosity engine should
+   *    nudge the next extractor to capture.
+   *
+   * Never throws — all storage paths are wrapped.
+   */
+  private recordSageSignals(
+    query: string,
+    results: MemorySearchResult[],
+    graphChannel: HybridGraphResult[],
+    vectorTopIds: string[],
+    keywordTopIds: string[],
+  ): void {
+    if (results.length === 0 || query.length === 0) {
+      return;
+    }
+    try {
+      // Sample ~10% of searches for training-pair collection. Resolve
+      // the top result's chunk id from the chunks table.
+      if (Math.random() < 0.1) {
+        const top = results[0]!;
+        const idRow = this.db
+          .prepare(`SELECT id FROM chunks WHERE path = ? AND start_line = ? AND end_line = ?`)
+          .get(top.path, top.startLine, top.endLine) as { id: string } | undefined;
+        if (idRow) {
+          insertTrainingPair(this.db, query, idRow.id, "access_log");
+        }
+      }
+    } catch {
+      // Non-critical: training-pair persistence failures shouldn't break search.
+    }
+
+    try {
+      if (!this.knowledgeGraph || graphChannel.length === 0) {
+        return;
+      }
+      // Resolve the result paths back to chunk IDs so detectGraphGaps
+      // can compare apples-to-apples against the graph channel.
+      const usedChunkIds: string[] = [];
+      const lookup = this.db.prepare(
+        `SELECT id FROM chunks WHERE path = ? AND start_line = ? AND end_line = ?`,
+      );
+      for (const r of results.slice(0, 5)) {
+        const row = lookup.get(r.path, r.startLine, r.endLine) as { id: string } | undefined;
+        if (row) {
+          usedChunkIds.push(row.id);
+        }
+      }
+      const graphChunkIds = graphChannel.slice(0, 5).map((g) => g.id);
+      const vectorOrKeywordChunkIds = [...new Set([...vectorTopIds, ...keywordTopIds])];
+      const signals = detectGraphGaps({
+        query,
+        usedChunkIds,
+        graphReaderChunkIds: graphChunkIds,
+        vectorOrKeywordChunkIds,
+        graphReaderEntityIds: [],
+      });
+      for (const sig of signals) {
+        emitGraphBridgeSignal(this.db, sig);
+      }
+    } catch {
+      // Non-critical: signal emission failures shouldn't break search.
+    }
+  }
+
+  /**
+   * PLAN-18 Phase 2/5 — graph-reader channel for RRF fusion.
+   *
+   * Resolves the user query into a SAGE-style multi-anchor plan, runs
+   * graph propagation over the knowledge graph, joins the resulting
+   * chunk IDs back to the `chunks` table to recover the path/snippet
+   * metadata RRF needs, and returns a `HybridGraphResult[]`.
+   *
+   * Returns [] when the knowledge graph isn't initialized, no entities
+   * resolve from the query, or the SAGE config disables the reader.
+   * Caller is expected to catch and ignore errors.
+   */
+  private async computeGraphChannel(query: string): Promise<HybridGraphResult[]> {
+    if (!this.knowledgeGraph) {
+      return [];
+    }
+    const cfg: SageConfig = {
+      ...DEFAULT_SAGE_CONFIG,
+      queryPlanning: {
+        enabled: true,
+        // PLAN-18 Phase 1 — pass an LLM call to the planner so query
+        // decomposition uses Haiku rather than the pure heuristic. The
+        // planner caches by query hash for 5 min so repeated turns in a
+        // session don't re-call. Returns null when no env API key is
+        // configured (CI / test environments), so the planner falls
+        // through to its heuristic decomposer.
+        llmCall: this.getSagePlannerLlmCall() ?? undefined,
+      },
+      hormonalModulation: this.hormonalManager
+        ? { enabled: true, getState: () => this.hormonalManager!.getState() }
+        : { enabled: false },
+    };
+    const { graph } = await sageRetrieve(this.db, this.knowledgeGraph, query, cfg);
+    if (!graph || graph.chunks.length === 0) {
+      return [];
+    }
+    const chunkIds = graph.chunks.map((c) => c.chunkId);
+    const placeholders = chunkIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT id, path, source, start_line AS startLine, end_line AS endLine,
+                substr(text, 1, ?) AS snippet, importance_score AS importanceScore,
+                updated_at AS updatedAt, last_accessed_at AS lastAccessedAt,
+                emotional_valence AS emotionalValence
+         FROM chunks WHERE id IN (${placeholders})`,
+      )
+      .all(SNIPPET_MAX_CHARS, ...chunkIds) as Array<{
+      id: string;
+      path: string;
+      source: string;
+      startLine: number;
+      endLine: number;
+      snippet: string;
+      importanceScore: number | null;
+      updatedAt: number | null;
+      lastAccessedAt: number | null;
+      emotionalValence: number | null;
+    }>;
+    const scoreById = new Map(graph.chunks.map((c) => [c.chunkId, c.score]));
+    return rows.map((r) => ({
+      id: r.id,
+      path: r.path,
+      startLine: r.startLine,
+      endLine: r.endLine,
+      source: r.source,
+      snippet: r.snippet,
+      graphScore: scoreById.get(r.id) ?? 0,
+      importanceScore: r.importanceScore ?? undefined,
+      updatedAt: r.updatedAt ?? undefined,
+      lastAccessedAt: r.lastAccessedAt,
+      emotionalValence: r.emotionalValence,
+    }));
+  }
+
+  private async searchVector(
+    queryVec: number[],
+    limit: number,
+    queryText?: string,
+  ): Promise<Array<MemorySearchResult & { id: string; importanceScore: number }>> {
+    if (this.embeddingProfileHold) {
+      // The query vector comes from a profile the stored vectors do not share;
+      // a similarity score between them would be noise. Keyword search still runs.
+      return [];
+    }
+    const results = await searchVector({
+      db: this.db,
+      vectorTable: VECTOR_TABLE,
+      providerModel: this.provider.model,
+      queryVec,
+      limit,
+      snippetMaxChars: SNIPPET_MAX_CHARS,
+      queryText,
+      ensureVectorReady: async (dimensions) => await this.ensureVectorReady(dimensions),
+      sourceFilterVec: this.buildSourceFilter("c"),
+      sourceFilterChunks: this.buildSourceFilter(),
+    });
+    return results.map(
+      (entry) => entry as MemorySearchResult & { id: string; importanceScore: number },
+    );
+  }
+
+  private buildFtsQuery(raw: string): string | null {
+    return buildFtsQuery(raw);
+  }
+
+  private async searchKeyword(
+    query: string,
+    limit: number,
+  ): Promise<
+    Array<MemorySearchResult & { id: string; textScore: number; importanceScore: number }>
+  > {
+    if (!this.fts.enabled || !this.fts.available) {
+      return [];
+    }
+    const sourceFilter = this.buildSourceFilter("f");
+    const results = await searchKeyword({
+      db: this.db,
+      ftsTable: FTS_TABLE,
+      providerModel: this.provider.model,
+      query,
+      limit,
+      snippetMaxChars: SNIPPET_MAX_CHARS,
+      sourceFilter,
+      buildFtsQuery: (raw) => this.buildFtsQuery(raw),
+      bm25RankToScore,
+    });
+    return results.map(
+      (entry) =>
+        entry as MemorySearchResult & { id: string; textScore: number; importanceScore: number },
+    );
+  }
+
+  private mergeHybridResults(params: {
+    vector: Array<MemorySearchResult & { id: string; importanceScore: number }>;
+    keyword: Array<MemorySearchResult & { id: string; textScore: number; importanceScore: number }>;
+    vectorWeight: number;
+    textWeight: number;
+  }): Array<MemorySearchResult & { importanceScore?: number }> {
+    const merged = mergeHybridResults({
+      vector: params.vector.map((r) => ({
+        id: r.id,
+        path: r.path,
+        startLine: r.startLine,
+        endLine: r.endLine,
+        source: r.source,
+        snippet: r.snippet,
+        vectorScore: r.score,
+        importanceScore: r.importanceScore,
+      })),
+      keyword: params.keyword.map((r) => ({
+        id: r.id,
+        path: r.path,
+        startLine: r.startLine,
+        endLine: r.endLine,
+        source: r.source,
+        snippet: r.snippet,
+        textScore: r.textScore,
+        importanceScore: r.importanceScore,
+      })),
+      vectorWeight: params.vectorWeight,
+      textWeight: params.textWeight,
+    });
+    return merged.map((entry) => entry as MemorySearchResult & { importanceScore?: number });
+  }
+
+  async sync(params?: {
+    reason?: string;
+    force?: boolean;
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void> {
+    if (this.syncing) {
+      return this.syncing;
+    }
+    this.syncing = this.runSync(params).finally(() => {
+      this.syncing = null;
+    });
+    return this.syncing ?? Promise.resolve();
+  }
+
+  async readFile(params: {
+    relPath: string;
+    from?: number;
+    lines?: number;
+  }): Promise<{ text: string; path: string }> {
+    const rawPath = params.relPath.trim();
+    if (!rawPath) {
+      throw new Error("path required");
+    }
+    const absPath = path.isAbsolute(rawPath)
+      ? path.resolve(rawPath)
+      : path.resolve(this.workspaceDir, rawPath);
+    const relPath = path.relative(this.workspaceDir, absPath).replace(/\\/g, "/");
+    const inWorkspace =
+      relPath.length > 0 && !relPath.startsWith("..") && !path.isAbsolute(relPath);
+    const allowedWorkspace = inWorkspace && isMemoryPath(relPath);
+    let allowedAdditional = false;
+    if (!allowedWorkspace && this.settings.extraPaths.length > 0) {
+      const additionalPaths = normalizeExtraMemoryPaths(
+        this.workspaceDir,
+        this.settings.extraPaths,
+      );
+      for (const additionalPath of additionalPaths) {
+        try {
+          const stat = await fs.lstat(additionalPath);
+          if (stat.isSymbolicLink()) {
+            continue;
+          }
+          if (stat.isDirectory()) {
+            if (absPath === additionalPath || absPath.startsWith(`${additionalPath}${path.sep}`)) {
+              allowedAdditional = true;
+              break;
+            }
+            continue;
+          }
+          if (stat.isFile()) {
+            if (absPath === additionalPath && absPath.endsWith(".md")) {
+              allowedAdditional = true;
+              break;
+            }
+          }
+        } catch {}
+      }
+    }
+    if (!allowedWorkspace && !allowedAdditional) {
+      throw new Error("path required");
+    }
+    if (!absPath.endsWith(".md")) {
+      throw new Error("path required");
+    }
+    const stat = await fs.lstat(absPath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error("path required");
+    }
+    const content = await fs.readFile(absPath, "utf-8");
+    if (!params.from && !params.lines) {
+      return { text: content, path: relPath };
+    }
+    const lines = content.split("\n");
+    const start = Math.max(1, params.from ?? 1);
+    const count = Math.max(1, params.lines ?? lines.length);
+    const slice = lines.slice(start - 1, start - 1 + count);
+    return { text: slice.join("\n"), path: relPath };
+  }
+
+  status(): MemoryProviderStatus {
+    const sourceFilter = this.buildSourceFilter();
+    const files = this.db
+      .prepare(`SELECT COUNT(*) as c FROM files WHERE 1=1${sourceFilter.sql}`)
+      .get(...sourceFilter.params) as {
+      c: number;
+    };
+    const chunks = this.db
+      .prepare(`SELECT COUNT(*) as c FROM chunks WHERE 1=1${sourceFilter.sql}`)
+      .get(...sourceFilter.params) as {
+      c: number;
+    };
+    const sourceCounts = (() => {
+      const sources = Array.from(this.sources);
+      if (sources.length === 0) {
+        return [];
+      }
+      const bySource = new Map<MemorySource, { files: number; chunks: number }>();
+      for (const source of sources) {
+        bySource.set(source, { files: 0, chunks: 0 });
+      }
+      const fileRows = this.db
+        .prepare(
+          `SELECT source, COUNT(*) as c FROM files WHERE 1=1${sourceFilter.sql} GROUP BY source`,
+        )
+        .all(...sourceFilter.params) as Array<{ source: MemorySource; c: number }>;
+      for (const row of fileRows) {
+        const entry = bySource.get(row.source) ?? { files: 0, chunks: 0 };
+        entry.files = row.c ?? 0;
+        bySource.set(row.source, entry);
+      }
+      const chunkRows = this.db
+        .prepare(
+          `SELECT source, COUNT(*) as c FROM chunks WHERE 1=1${sourceFilter.sql} GROUP BY source`,
+        )
+        .all(...sourceFilter.params) as Array<{ source: MemorySource; c: number }>;
+      for (const row of chunkRows) {
+        const entry = bySource.get(row.source) ?? { files: 0, chunks: 0 };
+        entry.chunks = row.c ?? 0;
+        bySource.set(row.source, entry);
+      }
+      return sources.map((source) => Object.assign({ source }, bySource.get(source)!));
+    })();
+    return {
+      backend: "builtin",
+      files: files?.c ?? 0,
+      chunks: chunks?.c ?? 0,
+      dirty: this.dirty || this.sessionsDirty || this.skillsDirty,
+      lastSyncedAt: this.lastSyncedAt ?? null,
+      ...(this.dirty || this.sessionsDirty || this.skillsDirty
+        ? { warning: "Unindexed changes detected — run sync for up-to-date results" }
+        : {}),
+      workspaceDir: this.workspaceDir,
+      dbPath: this.settings.store.path,
+      provider: this.provider.id,
+      model: this.provider.model,
+      requestedProvider: this.requestedProvider,
+      ...(() => {
+        const profile = this.currentEmbeddingProfile();
+        return profile
+          ? {
+              embeddingProfile: {
+                key: embeddingProfileKey(profile),
+                modelDigest: profile.modelDigest,
+                dimensions: profile.dimensions,
+                normalise: profile.normalise,
+              },
+            }
+          : {};
+      })(),
+      ...(this.embeddingProfileHold
+        ? { embeddingHold: { conflicts: this.embeddingProfileHold.conflicts } }
+        : {}),
+      computeRouting: isPoolEmbeddingProvider(this.provider) ? "pool" : "local",
+      sources: Array.from(this.sources),
+      extraPaths: this.settings.extraPaths,
+      sourceCounts,
+      cache: this.cache.enabled
+        ? {
+            enabled: true,
+            entries:
+              (
+                this.db.prepare(`SELECT COUNT(*) as c FROM ${EMBEDDING_CACHE_TABLE}`).get() as
+                  | { c: number }
+                  | undefined
+              )?.c ?? 0,
+            maxEntries: this.cache.maxEntries,
+          }
+        : { enabled: false, maxEntries: this.cache.maxEntries },
+      fts: {
+        enabled: this.fts.enabled,
+        available: this.fts.available,
+        error: this.fts.loadError,
+      },
+      fallback: this.fallbackReason
+        ? { from: this.fallbackFrom ?? "local", reason: this.fallbackReason }
+        : undefined,
+      vector: {
+        enabled: this.vector.enabled,
+        available: this.vector.available ?? undefined,
+        extensionPath: this.vector.extensionPath,
+        loadError: this.vector.loadError,
+        dims: this.vector.dims,
+      },
+      batch: {
+        enabled: this.batch.enabled,
+        failures: this.batchFailureCount,
+        limit: BATCH_FAILURE_LIMIT,
+        wait: this.batch.wait,
+        concurrency: this.batch.concurrency,
+        pollIntervalMs: this.batch.pollIntervalMs,
+        timeoutMs: this.batch.timeoutMs,
+        lastError: this.batchFailureLastError,
+        lastProvider: this.batchFailureLastProvider,
+      },
+      // ── Knowledge Crystal extended status ──
+      crystals: this.getCrystalStatus(),
+      // PLAN-58: which channels a search can draw on right now.
+      search: {
+        fusion: !this.settings.query.hybrid.enabled
+          ? "vector-only"
+          : this.settings.query.hybrid.mergeStrategy,
+        channels: {
+          vector: this.vector.enabled && this.vector.available !== false,
+          keyword: this.settings.query.hybrid.enabled && this.fts.enabled && this.fts.available,
+          graph: this.settings.query.hybrid.enabled && this.knowledgeGraph != null,
+        },
+      },
+    };
+  }
+
+  private getCrystalStatus(): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+
+    // Lifecycle counts — account for importance-based generated→activated promotion
+    try {
+      const lifecycleRows = this.db
+        .prepare(
+          `SELECT
+             CASE
+               WHEN COALESCE(lifecycle, 'generated') = 'generated'
+                    AND COALESCE(importance_score, 1.0) >= 0.8
+                 THEN 'activated'
+               ELSE COALESCE(lifecycle, 'generated')
+             END as lc,
+             COUNT(*) as c
+           FROM chunks GROUP BY lc`,
+        )
+        .all() as Array<{ lc: string; c: number }>;
+      const lifecycleCounts: Record<string, number> = {};
+      for (const row of lifecycleRows) {
+        lifecycleCounts[row.lc] = row.c;
+      }
+      result.lifecycleCounts = lifecycleCounts;
+    } catch {}
+
+    // Semantic type counts
+    try {
+      const semanticRows = this.db
+        .prepare(
+          `SELECT COALESCE(semantic_type, 'general') as st, COUNT(*) as c FROM chunks GROUP BY st`,
+        )
+        .all() as Array<{ st: string; c: number }>;
+      const semanticCounts: Record<string, number> = {};
+      for (const row of semanticRows) {
+        semanticCounts[row.st] = row.c;
+      }
+      result.semanticTypeCounts = semanticCounts;
+    } catch {}
+
+    // Hormonal state with mood + emotional briefing + response modulation + trajectory
+    const hormones = this.hormonalState();
+    if (hormones) {
+      const mood = describeHormonalMood(hormones);
+      const emotionalBriefing = this.hormonalManager?.emotionalBriefing() ?? "";
+      const modulation = this.hormonalManager?.responseModulation() ?? null;
+      const trajectory = this.hormonalManager?.emotionalTrajectory() ?? null;
+      result.hormonalState = {
+        ...hormones,
+        mood,
+        emotionalBriefing,
+        ...(trajectory ? { trajectory } : {}),
+        ...(modulation
+          ? {
+              responseGuidance: modulation.briefing,
+              tone: {
+                warmth: modulation.warmth,
+                energy: modulation.energy,
+                focus: modulation.focus,
+                playfulness: modulation.playfulness,
+                verbosity: modulation.verbosity,
+                curiosityExpression: modulation.curiosityExpression,
+                assertiveness: modulation.assertiveness,
+                empathyExpression: modulation.empathyExpression,
+              },
+            }
+          : {}),
+      };
+      // Emotional anchors
+      const anchors = this.hormonalManager?.getAnchors() ?? [];
+      if (anchors.length > 0) {
+        result.emotionalAnchors = anchors.slice(0, 5).map((a) => ({
+          id: a.id,
+          label: a.label,
+          mood: describeHormonalMood(a.state),
+          recallCount: a.recallCount,
+          age: Math.round((Date.now() - a.createdAt) / 60000) + "m ago",
+        }));
+      }
+    }
+
+    // Active goals
+    try {
+      const goals = this.getActiveGoals();
+      result.activeGoals = goals.map((g) => ({
+        id: g.id,
+        description: g.description.slice(0, 80),
+        progress: g.progress,
+        status: g.status,
+      }));
+    } catch {}
+
+    // Curiosity summary with top targets
+    try {
+      const curiosity = this.curiosityState();
+      if (curiosity) {
+        const openTargets = curiosity.targets.filter((t) => t.resolvedAt === null);
+        result.curiosity = {
+          regions: curiosity.regions.length,
+          openTargets: openTargets.length,
+          resolvedTargets: curiosity.targets.filter((t) => t.resolvedAt !== null).length,
+          topTargets: openTargets
+            .toSorted((a, b) => b.priority - a.priority)
+            .slice(0, 5)
+            .map((t) => ({
+              type: t.type,
+              description: t.description.slice(0, 120),
+              priority: t.priority,
+            })),
+          recentEmergence: curiosity.recentEmergence?.slice(0, 3).map((e) => ({
+            type: e.type,
+            description: e.description.slice(0, 120),
+            strength: e.strength,
+          })),
+        };
+      }
+    } catch {}
+
+    // Dream summary
+    try {
+      result.dream = this.dreamStatus();
+    } catch {}
+
+    // User preferences
+    try {
+      const profile = this.userProfile();
+      if (profile) {
+        result.userProfile = {
+          preferenceCount: profile.preferences.length,
+          patternCount: profile.patterns.length,
+          topPreferences: profile.preferences.slice(0, 5).map((p) => `${p.key}: ${p.value}`),
+        };
+      }
+    } catch {}
+
+    // Governance stats
+    try {
+      result.governance = this.governanceStats();
+    } catch {}
+
+    // Scheduler budget
+    try {
+      result.scheduler = this.schedulerStatus();
+    } catch {}
+
+    return result;
+  }
+
+  async probeVectorAvailability(): Promise<boolean> {
+    if (!this.vector.enabled) {
+      return false;
+    }
+    return this.ensureVectorReady();
+  }
+
+  async probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult> {
+    try {
+      await this.embedBatchWithRetry(["ping"], USAGE_FEATURES.memoryProbe);
+      return { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: message };
+    }
+  }
+
+  async consolidate(): Promise<ConsolidationStats | null> {
+    const consolidationCfg = this.cfg.memory?.consolidation;
+    if (consolidationCfg?.enabled === false) {
+      return null;
+    }
+    const emotionalCfg = this.cfg.memory?.emotional;
+    // Scale forget threshold inversely with maturity: young agents (maturity=0)
+    // use the default threshold; mature agents (maturity=1) use half the threshold,
+    // becoming more retentive as they accumulate personality-defining memories.
+    const baseForgetThreshold = consolidationCfg?.forgetThreshold ?? 0.02;
+    const maturity = this.curiosityEngine?.getMaturity() ?? 0;
+    const scaledForgetThreshold = baseForgetThreshold * (1 - maturity * 0.5);
+    // Wire real-time hormonal state into consolidation: cortisol → decay resistance,
+    // dopamine → reward memory protection, oxytocin → relational memory protection
+    const hormonalMod = this.hormonalManager?.getConsolidationModulation();
+    const engine = new ConsolidationEngine(this.db, {
+      decayRate: consolidationCfg?.decayRate,
+      promoteThreshold: consolidationCfg?.promoteThreshold,
+      forgetThreshold: scaledForgetThreshold,
+      mergeOverlapThreshold: hormonalMod?.mergeThreshold ?? consolidationCfg?.mergeOverlapThreshold,
+      emotionDecayResistance: resolveEmotionDecayResistance({
+        enabled: emotionalCfg?.enabled,
+        configured: emotionalCfg?.decayResistance,
+        hormonal: hormonalMod?.decayResistance,
+      }),
+    });
+    return engine.run();
+  }
+
+  private ensureConsolidationInterval(): void {
+    const consolidationCfg = this.cfg.memory?.consolidation;
+    if (consolidationCfg?.enabled === false) {
+      return;
+    }
+    const minutes = consolidationCfg?.intervalMinutes ?? 30;
+    if (minutes <= 0 || this.consolidationTimer) {
+      return;
+    }
+    const ms = minutes * 60 * 1000;
+    this.consolidationTimer = setInterval(async () => {
+      try {
+        // 0. First Breath: trigger immediate RLM synthesis for new agents with no Phenotype
+        this.shouldTriggerFirstBreath()
+          .then(async (should) => {
+            if (should) {
+              log.info(
+                "First Breath triggered — running immediate RLM micro-cycle for nascent agent",
+              );
+              const stats: DreamStats = {
+                cycle: {
+                  cycleId: `first-breath-${Date.now()}`,
+                  startedAt: Date.now(),
+                  completedAt: Date.now(),
+                  durationMs: 0,
+                  state: "AWAKENING" as const,
+                  clustersProcessed: 0,
+                  insightsGenerated: 0,
+                  chunksAnalyzed: 0,
+                  llmCallsUsed: 0,
+                  error: null,
+                },
+                newInsights: [],
+              };
+              await this.rewriteWorkingMemory(stats);
+              log.info("First Breath complete — Phenotype and Bond sections created");
+            }
+          })
+          .catch((err) => {
+            log.debug(`First Breath check failed: ${String(err)}`);
+          });
+        // 1. Hormonal decay
+        this.hormonalManager?.decay();
+        // 2. Consolidation (Ebbinghaus decay + merge). The engine yields to the
+        //    event loop across its O(n^2) similarity sweeps; awaiting it lets the
+        //    gateway keepalive flush instead of freezing for the whole pass.
+        await this.maintenanceMutex.run("consolidation", () => this.consolidate(), 60_000);
+        // 2b. GC: physically delete forgotten/expired tombstones past the
+        //     retention window. `purgeExpired` was implemented but never called,
+        //     so forgotten chunks (and their dead vec/fts rows) accumulated
+        //     indefinitely — bloating the DB and leaving thousands of blank-
+        //     embedding rows. Draining them here keeps the store clean and small.
+        try {
+          const retentionDays = this.cfg.memory?.consolidation?.forgottenRetentionDays ?? 14;
+          if (retentionDays >= 0) {
+            const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
+            const purged = new ConsolidationEngine(this.db).purgeExpired(retentionMs);
+            if (purged > 0) {
+              log.info(
+                `memory GC: purged ${purged} forgotten/expired chunk(s) (retention ${retentionDays}d)`,
+              );
+            }
+          }
+        } catch (err) {
+          log.warn(`memory GC purge failed: ${String(err)}`);
+        }
+        // Yield between heavy steps so the maintenance cycle never monopolizes
+        // the loop long enough to trip the Control UI's tick-timeout watchdog.
+        await yieldToEventLoop();
+        // 3. Curiosity engine (rebuild regions, detect gaps) — also yields internally.
+        const curiosityResult = await this.curiosityEngine?.run();
+        await yieldToEventLoop();
+        // 3b. Emit top exploration targets as network queries
+        if (curiosityResult && curiosityResult.targets > 0 && this.skillNetworkBridge) {
+          this.emitTopTargetsAsQueries();
+        }
+        // 3c. PLAN-11 Gap 1: convert repeated user queries into knowledge_gap targets
+        void this.runRequestFrequencyAnalyzer();
+        // 3d. PLAN-54: one target per weak search query, then go and learn.
+        //     Network + model work, OUTSIDE the maintenance mutex (a slow
+        //     provider must never stall dreams or Memory-page edits); one
+        //     pass at a time, never blocks this tick.
+        void this.curiosityResearchTick().catch((err) =>
+          log.debug(`curiosity research tick failed: ${String(err)}`),
+        );
+        // 4. Governance: enforce TTL lifespan policies
+        this.governance?.enforceLifespan();
+        // 5. Task memory: mark stalled goals
+        this.taskMemory?.markStalledGoals();
+        // 6. Auto-scratch from hormonal spikes (belt AND suspenders)
+        this.autoScratchFromHormonalSpike();
+        // 7. EigenTrust + anomaly detection (Task 6)
+        await yieldToEventLoop();
+        if (this.peerReputationManager) {
+          this.peerReputationManager
+            .refreshEigenTrustScores(this.skillNetworkBridge ? undefined : null)
+            .catch((err) => {
+              log.warn(`EigenTrust refresh failed: ${String(err)}`);
+            });
+          this.peerReputationManager.detectAnomalies();
+          // 7b. Update peer quality scores from execution outcomes
+          try {
+            // Column is peer_pubkey, not pubkey — the wrong name threw
+            // "no such column", was swallowed by the catch below, and
+            // updatePeerQuality never ran (audit 2026-08-09, F6 sub-bug).
+            const peers = this.db
+              .prepare(`SELECT DISTINCT peer_pubkey FROM peer_reputation WHERE skills_accepted > 0`)
+              .all() as Array<{ peer_pubkey: string }>;
+            for (const peer of peers) {
+              this.peerReputationManager.updatePeerQuality(peer.peer_pubkey);
+            }
+          } catch (err) {
+            log.debug(`peer quality update failed: ${String(err)}`);
+          }
+          // 7c. PLAN-13 Phase C: Ebbinghaus decay on inactive peers.
+          // Erodes accumulated reputation when a peer goes silent for
+          // >14d so a long-dormant compromised key can't ride past
+          // baselines into auto-accept.
+          try {
+            this.peerReputationManager.decayInactivePeers();
+          } catch (err) {
+            log.debug(`peer decay failed: ${String(err)}`);
+          }
+          // 7d. PLAN-13 Phase C: quarantine TTL sweep. Lazy-imported so
+          // the memory subsystem doesn't pull the skill ingest layer at
+          // startup; fire-and-forget because the sweep is best-effort.
+          const cfgAtTick = this.cfg;
+          void import("../agents/skills/quarantine-sweeper.js")
+            .then(({ sweepQuarantine }) => sweepQuarantine({ config: cfgAtTick }))
+            .catch((err) => {
+              log.debug(`quarantine sweep failed: ${String(err)}`);
+            });
+        }
+        // 8. (retired, PLAN-45 Phase 0) The SkillCrystallizer used to mint a
+        // "skill" chunk here from any tool name with >=3 non-erroring calls.
+        // Tool-level success is not skill competence, its dedup never matched
+        // (frozen vs generated), and it kept minting from execution rows whose
+        // crystal was deleted. Skills now come only from the evolution pass
+        // (src/memory/skill-evolution/), which gates on held-out task outcomes.
+        await yieldToEventLoop();
+        // 8b. PLAN-45 Phase 1.1: ground the tool-level execution rows in their
+        // run's outcome HERE, on every consolidation, so competence consumers
+        // (pricing, bridge gate, distillation, tiers, metrics) see stamped rows
+        // on keyless nodes and between evolution passes too. Needs no LLM.
+        try {
+          const [{ backfillExecutionOutcomes }, { getActiveEventJournal }] = await Promise.all([
+            import("./skill-evolution/execution-outcomes.js"),
+            import("../infra/event-journal.js"),
+          ]);
+          const r = await backfillExecutionOutcomes({
+            journal: getActiveEventJournal(),
+            db: this.db,
+          });
+          if (r.stamped > 0) {
+            log.debug(`execution outcomes stamped: ${r.stamped} row(s) over ${r.runs} run(s)`);
+          }
+        } catch (err) {
+          log.debug(`execution outcome back-fill skipped: ${String(err)}`);
+        }
+        // 9. (removed, memory audit 2026-09-07 C2) Steering-reward decay ran
+        // HERE and again inside consolidate() -> ConsolidationEngine.run(), so
+        // the reward decayed ~0.9025 instead of the configured 0.95 per tick.
+        // run() is the single decay site now.
+        // 10. GCCRF: batch-score pending chunks and persist state (via unified CuriosityEngine)
+        await this.curiosityEngine?.scorePendingChunks();
+        // 10b. PLAN-43 Phase 4: recompute contributor standings from verified signals.
+        try {
+          this.contributorStatus?.recompute({
+            trustedAttesters: new Set(this.cfg.a2a?.attestation?.trustedAttesters ?? []),
+          });
+        } catch (err) {
+          log.debug(`contributor status recompute skipped: ${String(err)}`);
+        }
+        // 11. Marketplace: refresh listings and prices
+        if (this.marketplaceEconomics) {
+          const repScore = this.getOwnReputationScore();
+          const listedCount = this.marketplaceEconomics.refreshListings(repScore);
+          if (listedCount > 0) {
+            log.debug(`Marketplace: ${listedCount} skills listed`);
+          }
+
+          // 11b. Check for new sales and emit earnings notification
+          const recentSales = this.marketplaceEconomics.getRecentSales(Date.now() - ms);
+          if (recentSales.count > 0) {
+            const summary = this.marketplaceEconomics.getEconomicSummary();
+            this.emitEvent?.("marketplace:earnings", {
+              newSales: recentSales.count,
+              totalEarningsUsdc: summary.totalEarningsUsdc,
+              sessionEarningsUsdc: recentSales.totalUsdc,
+              timestamp: Date.now(),
+            });
+
+            // Stimulate hormones — earning money is a dopamine event.
+            // Log-scale the dopamine hit to prevent "manic state" from viral sales.
+            // 50 sales overnight would peg dopamine to 1.0 without capping.
+            // Cap at 3 stimulations per consolidation cycle. (Gemini peer review fix)
+            const stimCount = Math.min(3, Math.ceil(Math.log10(recentSales.count + 1)));
+            for (let i = 0; i < stimCount; i++) {
+              this.hormonalManager?.stimulate("marketplace_sale");
+            }
+
+            this.appendDreamJournalLine(
+              `**Marketplace:** ${recentSales.count} skill sale(s) — earned $${recentSales.totalUsdc.toFixed(4)} USDC`,
+            );
+          }
+
+          // 11c. Plan 8, Phase 1: Process revenue payment queue (release held + dispatch)
+          try {
+            const released = this.marketplaceEconomics.releaseHeldPayments();
+            if (released > 0) {
+              log.info(`revenue queue: ${released} payments released from 48h hold`);
+            }
+
+            // Dispatch released payments onchain. Fire-and-forget: USDC sends
+            // are slow network calls and must not block the consolidation tick.
+            void this.dispatchReleasedPayments();
+
+            // Observability: log revenue queue stats
+            const queueStats = this.marketplaceEconomics.getRevenueQueueStats();
+            if (queueStats.held + queueStats.released + queueStats.disputed > 0) {
+              log.debug("revenue queue status", queueStats);
+            }
+          } catch {
+            // Revenue queue processing non-critical
+          }
+
+          // 11d. PLAN-29 Phase 1.1: validate funding on ingested Forage
+          // bounties (unverified -> open/rejected). Fire-and-forget for the
+          // same reason as payment dispatch: balance reads are network calls.
+          try {
+            const bountyDb = this.marketplaceEconomics.getDb?.();
+            if (bountyDb) {
+              const network =
+                (this.cfg.tools?.wallet?.network as "base" | "base-sepolia" | undefined) ?? "base";
+              void import("./bounty-funding.js")
+                .then((m) =>
+                  m.validatePendingBounties({
+                    db: bountyDb,
+                    readBalance: m.createUsdcBalanceReader(network),
+                  }),
+                )
+                .catch((err) => log.debug(`bounty funding sweep failed: ${String(err)}`));
+
+              // 11e. PLAN-29 Phase 1.3: oracle settlement sweep — delivered
+              // claims on locally-posted bounties get verified and, on pass,
+              // paid through the same revenue queue dispatched above. Judge
+              // oracles use the registered task-judge LLM when available.
+              const economics = this.marketplaceEconomics;
+              void Promise.all([import("./bounty-oracle.js"), import("../tasks/judge.js")])
+                .then(([oracle, judge]) =>
+                  oracle.settleDeliveredClaims({
+                    db: bountyDb,
+                    economics,
+                    judgeLlm: judge.getJudgeLlmCall(),
+                  }),
+                )
+                .catch((err) => log.debug(`bounty settlement sweep failed: ${String(err)}`));
+
+              // 11f. PLAN-29 Phase 2.1: heartbeat stream payouts — unpaid
+              // check-ins on locally-posted streams become batched payments
+              // on the same rail (role 'stream_check'). PLAN-30 G0.4: the
+              // genesis config caps per-hunter daily take from
+              // treasury-posted streams.
+              const genesisCfg = this.cfg.forage?.genesis;
+              void import("./bounty-streams.js")
+                .then((m) =>
+                  m.sweepStreamPayouts({
+                    db: bountyDb,
+                    economics,
+                    genesis: genesisCfg?.treasuryWallets?.length
+                      ? {
+                          treasuryWallets: genesisCfg.treasuryWallets,
+                          maxDailyTreasuryUsdcPerHunter: genesisCfg.maxDailyTreasuryUsdcPerHunter,
+                        }
+                      : undefined,
+                  }),
+                )
+                .catch((err) => log.debug(`stream payout sweep failed: ${String(err)}`));
+
+              // 11g. PLAN-30 G0.5: deadline/expiry enforcement — overdue
+              // one-shot claims fail, expired open bounties retire. Pure
+              // db work; runs inline on the tick.
+              void import("./bounty-oracle.js")
+                .then((m) => m.sweepOverdueClaims(bountyDb))
+                .catch((err) => log.debug(`overdue claim sweep failed: ${String(err)}`));
+
+              // 11h. PLAN-29 Phase 4 (LEGAL-GATED, default off): strike pool
+              // bounties whose oracle passed and whose pledges reached
+              // quorum. Captures move funder->hunter directly; this node
+              // only pays gas. Stays dark until forage.pools.enabled.
+              if (this.cfg.forage?.pools?.enabled === true) {
+                const poolNetwork =
+                  (this.cfg.tools?.wallet?.network as "base" | "base-sepolia" | undefined) ??
+                  "base";
+                void Promise.all([
+                  import("../commerce/bounty-pools.js"),
+                  import("../commerce/cdp-adapters.js"),
+                ])
+                  .then(async ([pools, adapters]) => {
+                    const account = await adapters.resolveCdpAccount(poolNetwork);
+                    const executor = adapters.createCaptureExecutor(
+                      {
+                        sendTransaction: async (tx) => {
+                          const { CdpEvmWalletProvider } = await import("@coinbase/agentkit");
+                          const provider = await CdpEvmWalletProvider.configureWithWallet({
+                            apiKeyId: process.env.CDP_API_KEY_ID,
+                            apiKeySecret: process.env.CDP_API_KEY_SECRET,
+                            networkId: poolNetwork === "base" ? "base-mainnet" : poolNetwork,
+                            address: account.address as `0x${string}`,
+                          });
+                          return provider.sendTransaction(tx);
+                        },
+                      },
+                      poolNetwork,
+                    );
+                    return pools.strikeReadyPools({ db: bountyDb, executor });
+                  })
+                  .catch((err) => log.debug(`pool strike sweep failed: ${String(err)}`));
+              }
+
+              // 11g. PLAN-29 Phase 5: Night Shift — hunt mesh bounties this
+              // node can complete mechanically (heartbeat monitoring only,
+              // receive-only money flow, capped). Identity: the wallet
+              // address doubles as the hunter pubkey until forage adopts
+              // the node's Ed25519 identity end-to-end.
+              void Promise.all([
+                import("./forage-client.js"),
+                import("../infra/wallet-discovery.js"),
+              ])
+                .then(([forage, discovery]) => {
+                  const wallet = discovery.getLocalWalletCapability();
+                  if (!wallet?.address) return; // no wallet, nothing to earn into
+                  return forage.nightShiftSweep({
+                    db: bountyDb,
+                    hunterPubkey: wallet.address,
+                    hunterWallet: wallet.address,
+                    fetchImpl: fetch,
+                    config: this.cfg.forage?.nightShift,
+                  });
+                })
+                .catch((err) => log.debug(`night shift sweep failed: ${String(err)}`));
+            }
+          } catch {
+            // Bounty sweeps non-critical
+          }
+        }
+        // 11h. PLAN-31 C1 / PLAN-36 Phase 0: circles SLOW sweep — only the
+        // non-latency-sensitive work. Presence heartbeat and mailbox drain
+        // moved to the fast circles scheduler (server-maintenance.ts, ~15s);
+        // what stays here is the default-posture ask answering, the practice
+        // partner, the weekly briefing, and the hosted-mailbox TTL sweep — all
+        // fine at the 30-min cadence. Runs on `this.db` INDEPENDENT of the
+        // marketplace block above (disabling a2a.marketplace must not kill
+        // circles, PLAN-36 §1/§7 Phase 0). Kill switch circles.enabled (ON by
+        // default since 2026-07-09). Best-effort, never blocks the tick.
+        if (this.cfg.circles?.enabled === true) {
+          const circlesDb = this.db;
+          void import("../circles/service.js")
+            .then(async ({ CirclesService }) => {
+              const service = new CirclesService({ db: circlesDb, config: this.cfg });
+              // §3.5 default posture for ungranted asks; granted asks wait for
+              // the human (autonomy ends at the grant line).
+              await service.answerPendingAsks();
+              // §4.3 practice partner (replies + retirement) and the weekly
+              // briefing (compiles only when due).
+              await service.practiceSweep();
+              service.briefingSweep();
+              if (this.cfg.circles?.mailbox?.serve === true) {
+                const { sweepExpiredMailboxBlobs } = await import("../gateway/a2a/mailbox.js");
+                sweepExpiredMailboxBlobs(circlesDb);
+              }
+            })
+            .catch((err) => log.debug(`circles slow sweep failed: ${String(err)}`));
+        }
+        // ── PLAN-9 Memory Supremacy: consolidation-phase integrations ──
+        // 12. Reconsolidation: restabilize expired labile chunks
+        if (this.reconsolidationEngine) {
+          this.reconsolidationEngine.restabilizeExpired();
+        }
+        // 13. Knowledge Graph: prune stale relationships
+        if (this.knowledgeGraph) {
+          this.knowledgeGraph.pruneStaleRelationships();
+        }
+        // 14. Epistemic Directives: detect contradictions and expire old directives
+        if (this.epistemicDirectiveEngine) {
+          this.epistemicDirectiveEngine.detectContradictions();
+          this.epistemicDirectiveEngine.expireOld();
+        }
+        // 15. Prospective Memory: clean expired
+        if (this.prospectiveMemoryEngine) {
+          this.prospectiveMemoryEngine.cleanExpired();
+        }
+        // 16. PLAN-28 B3: dead-wire detector — warn on any retrieval layer that
+        //     has contributed 0 across a full rolling window while others fired.
+        //     Cheap in-memory counters; the warn is the whole point.
+        this.retrievalObs.warnDeadWires();
+        // 17. PLAN-33 Phase 3: canonical ledger decay — retire facts whose
+        //     promotion score has faded after 90+ unconfirmed days. Derived,
+        //     idempotent, and interval-independent (safe at any cadence).
+        if (this.canonicalFactsStore) {
+          this.canonicalFactsStore.decayTick();
+        }
+      } catch (err) {
+        log.warn(`memory consolidation failed: ${String(err)}`);
+      }
+    }, ms);
+  }
+
+  // --- Dream Engine ---
+
+  private ensureDreamEngine(): void {
+    const dreamCfg = this.cfg.memory?.dream;
+    if (!dreamEngineEnabled(dreamCfg)) {
+      return;
+    }
+
+    // Build a real llmCall function if one isn't already provided.
+    // IMPORTANT: llmCall functions must NOT be placed on the config object
+    // because the agent framework may structuredClone the config, and
+    // functions are not cloneable. We keep them as local variables and
+    // pass a sanitized config (without functions) to the DreamEngine.
+    const builtLlmCall =
+      dreamCfg?.llmCall ?? this.buildLlmCallFn(dreamCfg?.model ?? this.resolveCheapLlmSpec());
+    // PLAN-40 Phase 0 (adversarial F17, documented activation): the merged
+    // synthesisModel default now applies. NOTE: the default names the same
+    // model as the generator default, so this restores a separate CALL lane,
+    // not true model independence — configure a different
+    // memory.dream.synthesisModel for that.
+    const synthesisModelSpec = dreamCfg?.synthesisModel ?? this.resolveCheapLlmSpec();
+    // Token-efficiency pass (2026-09-19): the synthesis prompt asks for up to
+    // ~4.5k output tokens across 7 sections; the lane default (2048) ended
+    // every call at stop_reason=length, failed section validation, and fell
+    // back to the heuristic builder on every cycle.
+    const builtSynthesisLlmCall =
+      dreamCfg?.synthesisLlmCall ??
+      (synthesisModelSpec
+        ? this.buildLlmCallFn(synthesisModelSpec, {
+            maxTokens: dreamCfg?.synthesisMaxTokens ?? DEFAULT_DREAM_CONFIG.synthesisMaxTokens,
+          })
+        : null);
+    // PLAN-34 Phase 2c: the local-tier call was previously destructured out
+    // and DISCARDED (wired-but-dead). It now powers local-tier modes and —
+    // critically — the depersonalization rewrite that gates all autonomous
+    // research egress: no local model configured means zero egress.
+    const builtLocalLlmCall =
+      dreamCfg?.localLlmCall ??
+      (dreamCfg?.modelTiers?.localModel
+        ? this.buildLlmCallFn(dreamCfg.modelTiers.localModel)
+        : null);
+    // PLAN-34 Phase 2 adversarial fix: only a GENUINELY local model may
+    // receive the verbatim private note for depersonalization. A directly
+    // injected localLlmCall (embedded local runtime) is trusted; a model
+    // built from modelTiers.localModel must name a local provider, else
+    // depersonalization egress fails closed.
+    const localModelIsLocal = dreamCfg?.localLlmCall
+      ? true
+      : isLocalModelSpec(dreamCfg?.modelTiers?.localModel);
+
+    // Build a config WITHOUT function properties (safe for structuredClone)
+    const {
+      llmCall: _lc,
+      synthesisLlmCall: _slc,
+      localLlmCall: _llc,
+      ...safeDreamCfg
+    } = dreamCfg ?? {};
+
+    // Reassemble a config with functions for the DreamEngine constructor only
+    const engineCfg = {
+      ...safeDreamCfg,
+      ...(builtLlmCall ? { llmCall: builtLlmCall } : {}),
+      ...(builtSynthesisLlmCall ? { synthesisLlmCall: builtSynthesisLlmCall } : {}),
+      ...(builtLocalLlmCall ? { localLlmCall: builtLocalLlmCall } : {}),
+      localModelIsLocal,
+      // PLAN-34 Phase 2c: the only new config knobs of the whole plan.
+      ...(this.cfg.memory?.curiosity?.autoResearch
+        ? { autoResearch: this.cfg.memory.curiosity.autoResearch }
+        : {}),
+      // PLAN-34 Phase 4: dream-insight promotion kill switch.
+      ...(dreamCfg?.insightPromotion ? { insightPromotion: dreamCfg.insightPromotion } : {}),
+      // PLAN-42: WikiSkill evolution pass rides skills.evolution (default
+      // ON; plain data, structuredClone-safe).
+      ...(this.cfg.skills?.evolution ? { skillEvolution: this.cfg.skills.evolution } : {}),
+      // PLAN-45 4.1: reputation orders peer-skill evaluation, nothing more.
+      attesterPriority: (pubkey: string) =>
+        this.peerReputationManager?.getTrustScore(pubkey) ?? 0.5,
+      // PLAN-45 Phase 3.5: the substrate evolved skills are measured on.
+      ...(() => {
+        const spec = this.resolvePrimaryLlmSpec();
+        return spec ? { runtimeModelTag: spec } : {};
+      })(),
+      ...(this.cfg.a2a?.attestation ? { a2aAttestation: this.cfg.a2a.attestation } : {}),
+      // PLAN-42 live fix: the maintainer/proposer emit large JSON (full
+      // index + pattern pages / full SKILL.md); the default 2048-token cap
+      // truncated them mid-object on the first live iteration. Dedicated
+      // call lane with an 8k output budget, honoring judgeModel.
+      ...(() => {
+        const spec =
+          this.cfg.skills?.evolution?.judgeModel ?? dreamCfg?.model ?? this.resolveCheapLlmSpec();
+        const call = spec
+          ? this.buildLlmCallFn(spec, { maxTokens: 8192, feature: USAGE_FEATURES.skillsEvolution })
+          : null;
+        return call ? { evolutionLlmCall: call } : {};
+      })(),
+      // PLAN-42: dedicated proposer lane — a stronger model holds the strict
+      // ReAct JSON protocol better than the cheap maintainer lane.
+      // PLAN-44 Phase 0 (D-1): when neither proposerModel nor judgeModel is
+      // configured, the proposer runs on the agent's PRIMARY model (the model
+      // that will execute the skill also proposes it — the paper's
+      // self-evolution reading). Live finding: on the cheap lane the proposer
+      // failed its own JSON protocol in 3 of 5 iterations.
+      // Token-efficiency pass (2026-09-19): the primary-model default spent
+      // ~$0.40 of Opus per iteration even when the only trace was a clean
+      // PASS. The proposer now defaults to the cheap lane; set
+      // skills.evolution.proposerModel explicitly for a stronger model.
+      ...(() => {
+        const evo = this.cfg.skills?.evolution;
+        const spec =
+          evo?.proposerModel ?? evo?.judgeModel ?? dreamCfg?.model ?? this.resolveCheapLlmSpec();
+        // The proposer's ReAct loop is many dependent round-trips: never the Batches API.
+        const call = spec
+          ? this.buildLlmCallFn(spec, {
+              maxTokens: 8192,
+              feature: USAGE_FEATURES.skillsEvolution,
+              batch: false,
+            })
+          : null;
+        // PLAN-44 Phase 5c: expose the lanes to on-demand gateway RPCs — the
+        // same 8k evolution lane housekeeping uses, plus the proposer lane.
+        const evoSpec =
+          this.cfg.skills?.evolution?.judgeModel ?? dreamCfg?.model ?? this.resolveCheapLlmSpec();
+        // On-demand RPC lanes: an operator is waiting, so no batch queue here either.
+        setActiveEvolutionLlm({
+          evolution: evoSpec
+            ? this.buildLlmCallFn(evoSpec, {
+                maxTokens: 8192,
+                feature: USAGE_FEATURES.skillsEvolution,
+                batch: false,
+              })
+            : null,
+          proposer: call,
+        });
+        // PLAN-45 4.6 (I8): the evolver model rides every published skill.
+        return call
+          ? { evolutionProposerLlmCall: call, ...(spec ? { evolutionProposerModelTag: spec } : {}) }
+          : {};
+      })(),
+    };
+
+    // PLAN-33: the canonical_promotion dream mode writes into the ledger, so
+    // the ledger kill switch must also silence the promoter.
+    engineCfg.modes = applyDreamModeKillSwitches(engineCfg.modes, this.cfg);
+
+    let synthesizeFn: SynthesizeFn;
+    if (builtLlmCall) {
+      synthesizeFn = createDefaultSynthesizeFn(builtLlmCall);
+    } else if (safeDreamCfg.synthesisMode === "llm" || safeDreamCfg.synthesisMode === "both") {
+      log.warn("dream engine: no llmCall available; forcing heuristic mode");
+      engineCfg.synthesisMode = "heuristic";
+      synthesizeFn = createDefaultSynthesizeFn(async () => "[]");
+    } else {
+      synthesizeFn = createDefaultSynthesizeFn(async () => "[]");
+    }
+
+    const embedBatchFn = async (texts: string[]) => {
+      return await this.embedBatchWithRetry(texts, USAGE_FEATURES.memoryDream);
+    };
+
+    this.dreamLlmCall = builtLlmCall;
+    this.dreamSynthesisLlmCall = builtSynthesisLlmCall;
+    // PLAN-50: session fact extraction gets its own lane so its spend is attributed separately
+    // from dreaming (same model, different feature). An injected llmCall is reused as-is.
+    this.extractionLlmCall = dreamCfg?.llmCall
+      ? builtLlmCall
+      : this.buildLlmCallFn(dreamCfg?.model ?? this.resolveCheapLlmSpec(), {
+          feature: USAGE_FEATURES.memoryExtraction,
+          // Token-efficiency pass (2026-09-19): 20 cited facts + a handover
+          // brief do not fit the 2048 lane default; truncated JSON never parsed.
+          maxTokens: this.cfg.memory?.extraction?.maxTokens ?? 6144,
+        });
+    // PLAN-55 Phase 1: the per-turn correction capture reuses the extraction
+    // model choice (memory.extraction.model, else the dream model, else the
+    // cheap default) on its own ledger lane, `memory/correction`, and never
+    // through the Batches API: the owner's reply is waiting on it.
+    this.correctionLlmCallFn = dreamCfg?.llmCall
+      ? builtLlmCall
+      : this.buildLlmCallFn(
+          this.cfg.memory?.extraction?.model ?? dreamCfg?.model ?? this.resolveCheapLlmSpec(),
+          CORRECTION_LLM_LANE,
+        );
+    this.dreamEngine = new DreamEngine(this.db, engineCfg, synthesizeFn, embedBatchFn);
+    this.dreamEngine.setFailureLearningHost({
+      service: () => this.proceduralLearning(),
+      canDispatch: () => this.canRunFailureLearning(),
+    });
+
+    if (this.hormonalManager) {
+      this.dreamEngine.setHormonalStateGetter(() => this.hormonalManager?.getState() ?? null);
+      this.dreamEngine.setHormonalManager(this.hormonalManager);
+    }
+
+    // PLAN-34 Phase 4: the searchable-chunk writer for promoted dream
+    // insights. The manager owns the live embedding model and vec/fts state,
+    // so it performs the actual write; the engine owns the gate.
+    this.dreamEngine.setInsightChunkWriter((row) => this.writePromotedInsightChunk(row));
+
+    // PLAN-40 Lane 1: distillation ops — workflow notes as searchable
+    // task_pattern chunks with execution-id evidence.
+    this.dreamEngine.setDistillationOps({
+      writeWorkflowNote: (p) => this.writeWorkflowNoteChunk(p),
+    });
+
+    // PLAN-40 Lane 2: hygiene ops — the existing pending-embedding drainer
+    // (cursorless, self-consuming predicate).
+    this.dreamEngine.setHygieneOps({
+      // Mixin method (manager-embedding-ops) — not on the class type, same
+      // cast the CLI uses.
+      backfillEmbeddings: (limit) =>
+        (
+          this as unknown as {
+            backfillPendingEmbeddings(opts?: {
+              limit?: number;
+            }): Promise<{ embedded: number; remaining: number }>;
+          }
+        ).backfillPendingEmbeddings({ limit }),
+    });
+
+    // PLAN-34 Phase 4 (§6.3): promoted extrapolation predictions route into
+    // prospective memory as "[dream prediction]" rows. The manager wires
+    // the writer because it owns the prospective engine and the embedding
+    // model. Dream rows match ONLY semantically (checkTriggers skips the
+    // keyword strategy for them — the substring fallback was a false-fire
+    // vector), so a trigger that cannot be embedded creates no prediction:
+    // a row that could never fire semantically would be dead weight. The
+    // prospective engine is resolved at call time (constructed later in
+    // init, and only when the curiosity subsystem is enabled).
+    this.dreamEngine.setDreamPredictionWriter(async (p) => {
+      if (!this.prospectiveMemoryEngine) {
+        if (!this.dreamPredictionEngineWarned) {
+          this.dreamPredictionEngineWarned = true;
+          log.warn(
+            "dream prediction writer: prospective memory engine unavailable " +
+              "(memory.curiosity.enabled=false?) — promoted extrapolation " +
+              "predictions are dropped",
+          );
+        }
+        return "failed";
+      }
+      let triggerEmbedding: number[] | undefined;
+      try {
+        const vecs = await this.embedBatchWithRetry([p.trigger], USAGE_FEATURES.memoryDream);
+        if (vecs[0] && vecs[0].length > 0) {
+          triggerEmbedding = vecs[0];
+        }
+      } catch {
+        // handled below — no embedding, no prediction
+      }
+      if (!triggerEmbedding) {
+        log.debug("dream prediction skipped: trigger embedding unavailable");
+        return "failed";
+      }
+      const result = this.prospectiveMemoryEngine.createDreamPrediction({
+        triggerCondition: p.trigger,
+        triggerEmbedding,
+        action: truncateAtSentence(p.content, 300),
+        insightId: p.insightId,
+        confidence: p.confidence,
+      });
+      return result.status === "refused" ? "failed" : result.status;
+    });
+
+    // Plan 7, Phase 10: Wire GCCRF reward function for FSHO alpha coupling
+    // (CuriosityEngine now exposes updateFshoR/getFshoRAvg/getFshoCoupledAlpha)
+    if (this.curiosityEngine) {
+      this.dreamEngine.setGccrfRewardFunction(this.curiosityEngine);
+    }
+    // PLAN-59 Phase 0: shadow decision traces (no-op outside shadow mode).
+    if (this.evidenceTelemetry) {
+      this.dreamEngine.setEvidenceTelemetry(this.evidenceTelemetry);
+    }
+
+    // Plan 8, Phase 7: Wire marketplace intelligence for demand-driven dreams
+    const marketplaceIntelligence = new MarketplaceIntelligence(this.db);
+    this.dreamEngine.setMarketplaceIntelligence(marketplaceIntelligence);
+    this.marketplaceIntelligence = marketplaceIntelligence;
+
+    // PLAN-25: wire the harness-evolution context. V1 default flip (PLAN-41
+    // D-D): opt-in via agents.defaults.harnessEvolve.enabled. The baseline
+    // resolves the config-derived HarnessPolicy floor that evolved policies
+    // overlay.
+    this.dreamEngine.setHarnessEvolveContext({
+      enabled: harnessEvolveEnabled(this.cfg.agents?.defaults?.harnessEvolve),
+      baseline: () => resolveHarnessPolicy(this.cfg),
+    });
+
+    // PLAN-10: Skill Seekers adapter is wired via the async .then() callback
+    // in ensureSkillNetworkBridge() — no need to wire here (adapter may not exist yet).
+
+    const minutes = dreamCfg?.intervalMinutes ?? 120;
+    if (minutes > 0) {
+      // Trigger-on-start: run the first dream cycle after a short initial delay
+      // instead of waiting the full interval. This ensures dreams actually fire
+      // even when hot reloads reset the timer every 30-60 minutes.
+      const initialDelayMs = (dreamCfg?.initialDelayMinutes ?? 5) * 60 * 1000;
+      this.dreamInitialTimer = setTimeout(() => {
+        this.dreamInitialTimer = null;
+        log.info("initial dream cycle starting (trigger-on-start)");
+        void this.dream({ scheduled: true }).catch((err) => {
+          log.warn(`initial dream cycle failed: ${String(err)}`);
+        });
+      }, initialDelayMs);
+      // Don't let the initial timer prevent Node from exiting
+      if (this.dreamInitialTimer.unref) {
+        this.dreamInitialTimer.unref();
+      }
+
+      // PLAN-11 Gap 5: adaptive interval. When adaptiveInterval.enabled, we
+      // self-reschedule after each cycle using the smoothed marketplace signal
+      // + hysteresis + cooldown. Otherwise behave as a fixed setInterval.
+      // PLAN-40 Phase 0 (evaluation E6): read the MERGED config — the raw
+      // user-config read left the reviewed-and-shipped adaptive default
+      // (enabled: true) wired-but-dead in production for every node without
+      // an explicit memory.dream key. Documented activation: cadence now
+      // ranges 30-240 min; synthesisModel's default similarly activates in
+      // the engine, restoring the claim-verifier's model independence.
+      const adaptiveCfg = dreamCfg?.adaptiveInterval ?? DEFAULT_DREAM_CONFIG.adaptiveInterval;
+      if (adaptiveCfg?.enabled) {
+        void import("./dream-adaptive-interval.js").then(({ AdaptiveIntervalController }) => {
+          this.adaptiveIntervalController = new AdaptiveIntervalController({
+            baseMinutes: minutes,
+            minMinutes: adaptiveCfg.minMinutes,
+            maxMinutes: adaptiveCfg.maxMinutes,
+            windowHours: adaptiveCfg.windowHours,
+            cooldownMinutes: adaptiveCfg.cooldownMinutes,
+            highThreshold: adaptiveCfg.highThreshold,
+            lowThreshold: adaptiveCfg.lowThreshold,
+          });
+          this.scheduleAdaptiveDreamFire();
+        });
+      } else {
+        const ms = minutes * 60 * 1000;
+        this.dreamTimer = setInterval(() => {
+          void this.dream({ scheduled: true }).catch((err) => {
+            log.warn(`dream cycle failed: ${String(err)}`);
+          });
+        }, ms);
+      }
+    }
+  }
+
+  /**
+   * PLAN-11 Gap 5: one cycle of the adaptive scheduler. Runs the dream, then
+   * asks the controller for the next interval based on current marketplace
+   * activity and reschedules.
+   */
+  private scheduleAdaptiveDreamFire(): void {
+    if (!this.adaptiveIntervalController || !this.marketplaceIntelligence) {
+      return;
+    }
+    // PLAN-40 Phase 0 (adversarial F15): evaluate() ran bare inside a
+    // self-rescheduling chain — one thrown exception (e.g. transient
+    // SQLITE_BUSY in the activity query) permanently killed dream scheduling
+    // until process restart. A failed evaluation now falls back to the base
+    // interval and the chain ALWAYS reschedules.
+    let minutes: number;
+    try {
+      minutes = this.adaptiveIntervalController.evaluate(this.marketplaceIntelligence);
+    } catch (err) {
+      log.warn(`adaptive dream interval evaluate failed; using base interval: ${String(err)}`);
+      minutes = this.cfg.memory?.dream?.intervalMinutes ?? DEFAULT_DREAM_CONFIG.intervalMinutes;
+    }
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+      minutes = DEFAULT_DREAM_CONFIG.intervalMinutes;
+    }
+    // Expose the actual next-fire time so status surfaces (dream.status ETA)
+    // report the adaptive truth instead of a hardcoded interval.
+    this.nextDreamFireAt = Date.now() + minutes * 60 * 1000;
+    this.dreamTimer = setTimeout(
+      () => {
+        this.dreamTimer = null;
+        void this.dream({ scheduled: true })
+          .catch((err) => {
+            log.warn(`dream cycle failed: ${String(err)}`);
+          })
+          .finally(() => {
+            // Re-evaluate and reschedule after each cycle completes. The
+            // try/catch above guarantees this chain survives any single
+            // failure.
+            try {
+              this.scheduleAdaptiveDreamFire();
+            } catch (err) {
+              log.warn(`adaptive dream reschedule failed: ${String(err)}`);
+            }
+          });
+      },
+      minutes * 60 * 1000,
+    );
+    if ((this.dreamTimer as NodeJS.Timeout).unref) {
+      (this.dreamTimer as NodeJS.Timeout).unref();
+    }
+  }
+
+  /**
+   * PLAN-11 Gap 6: schedule the daily digest.
+   *
+   * Uses a self-rescheduling setTimeout rather than setInterval because the
+   * trigger time is wall-clock (09:00 local by default), not a fixed
+   * millisecond cadence. Missed fires (laptop closed overnight) are
+   * backfilled on next wake because the SQL window is always "last N hours".
+   */
+  private ensureDigestInterval(): void {
+    const digestCfg = this.cfg.memory?.digest;
+    if (digestCfg?.enabled === false || this.digestTimer) {
+      return;
+    }
+    const time = digestCfg?.time ?? "09:00";
+    void import("./skill-pipeline-digest.js").then(({ msUntilLocalTime }) => {
+      const msUntilNext = msUntilLocalTime(time);
+      this.scheduleDigestFire(msUntilNext);
+    });
+  }
+
+  // ── PLAN-54: the curiosity loop ─────────────────────────────────────────
+
+  private curiosityEmbed(): (text: string) => Promise<number[] | null> {
+    return async (text) => {
+      try {
+        return (await this.embedQueryWithTimeout(text, USAGE_FEATURES.memoryCuriosity)) as number[];
+      } catch {
+        return null;
+      }
+    };
+  }
+
+  private curiosityResearchConfig() {
+    return resolveCuriosityResearchConfig(
+      this.cfg.memory?.curiosity?.research,
+      this.cfg.memory?.curiosity?.autoResearch?.enabled,
+    );
+  }
+
+  /** Queue the `## Curiosity Gaps` bullets of a fresh MEMORY.md as questions. */
+  async ingestCuriosityGaps(memoryMd: string): Promise<number> {
+    if (!curiosityEnabled(this.cfg.memory?.curiosity)) {
+      return 0;
+    }
+    const questions = parseCuriosityGaps(memoryMd);
+    if (questions.length === 0) {
+      return 0;
+    }
+    const ids = await insertNovelTargets(this.db, {
+      targets: questions.map((q) => ({
+        type: "question" as const,
+        description: q,
+        priority: 0.75,
+        metadata: { source: "working_memory" },
+      })),
+      embed: this.curiosityEmbed(),
+    });
+    if (ids.length > 0) {
+      log.info(`curiosity: ${ids.length} new question(s) from working memory`);
+    }
+    return ids.length;
+  }
+
+  /** One target per search query that kept scoring poorly (the owner asked; memory had nothing). */
+  private async ingestKnowledgeGapTargets(): Promise<number> {
+    const threshold = this.cfg.memory?.curiosity?.gapScoreThreshold ?? 0.5;
+    let rows: Array<{ query: string; region_id: string | null; n: number }> = [];
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT query, region_id, COUNT(*) AS n FROM curiosity_queries
+            WHERE top_score < ? AND length(query) >= 12
+              AND NOT EXISTS (SELECT 1 FROM curiosity_targets t
+                               WHERE t.description = curiosity_queries.query
+                                 AND (t.resolved_at IS NULL OR t.resolved_at >= ?))
+            GROUP BY query ORDER BY n DESC, MAX(timestamp) DESC LIMIT 5`,
+        )
+        .all(threshold, Date.now() - 30 * 24 * 60 * 60 * 1000) as unknown as typeof rows;
+    } catch {
+      return 0;
+    }
+    // curiosity_queries records EVERY search, including the dream engine's and
+    // the working-memory synthesis's own probes ("recent goals tasks
+    // projects"). Only something shaped like a question a person asked is a
+    // gap worth researching.
+    rows = rows.filter((r) => looksLikeOwnerQuestion(r.query));
+    if (rows.length === 0) {
+      return 0;
+    }
+    const ids = await insertNovelTargets(this.db, {
+      targets: rows.map((r) => ({
+        type: "knowledge_gap" as const,
+        description: r.query,
+        priority: Math.min(0.9, 0.55 + 0.1 * Math.log1p(r.n)),
+        regionId: r.region_id,
+        metadata: { source: "weak_search", queryCount: r.n },
+      })),
+      embed: this.curiosityEmbed(),
+    });
+    return ids.length;
+  }
+
+  /** One pass at a time: a tick or a click while a pass runs joins it instead of queueing another. */
+  private curiosityPassInFlight: Promise<
+    import("./curiosity-researcher.js").CuriosityRunSummary
+  > | null = null;
+
+  private curiosityResearchTick(
+    opts: { force?: boolean } = {},
+  ): Promise<import("./curiosity-researcher.js").CuriosityRunSummary> {
+    if (this.curiosityPassInFlight) {
+      return this.curiosityPassInFlight;
+    }
+    const run = this.curiosityResearchPass(opts).finally(() => {
+      this.curiosityPassInFlight = null;
+    });
+    this.curiosityPassInFlight = run;
+    return run;
+  }
+
+  private async curiosityResearchPass(
+    opts: { force?: boolean } = {},
+  ): Promise<import("./curiosity-researcher.js").CuriosityRunSummary> {
+    const idle = { ran: false, attempted: 0, learned: 0, outcomes: {}, costUsd: 0 };
+    if (!curiosityEnabled(this.cfg.memory?.curiosity)) {
+      return { ...idle, reason: "memory.curiosity.enabled is false" };
+    }
+    const { runCuriosityResearch } = await import("./curiosity-researcher.js");
+    const { runConfiguredWebSearch, isWebSearchConfigured } =
+      await import("../agents/tools/web-search.js");
+    const { fetchReadablePage } = await import("./curiosity-fetch.js");
+    await this.ingestKnowledgeGapTargets();
+    const cfg = this.curiosityResearchConfig();
+    const modelSpec = this.cfg.memory?.dream?.model ?? this.resolveCheapLlmSpec();
+    const llm = modelSpec ? this.buildCostedLlmCall(modelSpec) : null;
+    if (!llm) {
+      return { ...idle, reason: "no model" };
+    }
+    const localSpec = this.cfg.memory?.dream?.modelTiers?.localModel;
+    const llmLocal =
+      localSpec && isLocalModelSpec(localSpec) ? this.buildCostedLlmCall(localSpec) : null;
+    const searchConfigured = isWebSearchConfigured(this.cfg);
+    const summary = await runCuriosityResearch(
+      {
+        db: this.db,
+        config: cfg,
+        search: searchConfigured ? (q, n) => runConfiguredWebSearch(this.cfg, q, n) : null,
+        fetchPage: fetchReadablePage,
+        llm,
+        llmLocal,
+        embed: this.curiosityEmbed(),
+        hormonal: () => this.hormonalManager?.getState() ?? null,
+        onEvent: (event) => this.hormonalManager?.stimulate(event),
+        ownerNames: this.curiosityOwnerNames(),
+        searchProvider: String(this.cfg.tools?.web?.search?.provider ?? "web-search"),
+      },
+      opts,
+    );
+    if (summary.ran) {
+      log.info(
+        `curiosity research: attempted ${summary.attempted}, learned ${summary.learned}` +
+          (summary.costUsd > 0 ? ` ($${summary.costUsd.toFixed(4)})` : ""),
+      );
+      if (summary.learned > 0) {
+        // Make what it just learned retrievable now, not at the next index
+        // sync: the new chunk is stored with a pending embedding.
+        void this.backfillPendingEmbeddings({ limit: 5 }).catch(() => {});
+      }
+    }
+    return summary;
+  }
+
+  /**
+   * Names that must never appear in an outgoing search phrase: the owner, and
+   * every person the knowledge graph knows (owners type their friends' names
+   * in lowercase, which the entity-case check cannot see).
+   */
+  private curiosityOwnerNames(): string[] {
+    const names = new Set<string>();
+    const me = this.resolveUserName();
+    if (me) {
+      names.add(me);
+    }
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT name FROM entities
+            WHERE lower(entity_type) IN ('person', 'people', 'human', 'contact', 'friend', 'family', 'organization', 'project')
+            LIMIT 500`,
+        )
+        .all() as unknown as Array<{ name: string }>;
+      for (const r of rows) {
+        if (typeof r.name === "string" && r.name.trim().length >= 2) {
+          names.add(r.name.trim());
+        }
+      }
+    } catch {
+      // no knowledge graph on this node
+    }
+    return [...names];
+  }
+
+  /** Like buildLlmCallFn, but the ledger cost rides back so a finding can carry it. */
+  private buildCostedLlmCall(
+    modelSpec: string,
+  ): ((prompt: string) => Promise<{ text: string; costUsd: number }>) | null {
+    const parts = modelSpec.split("/");
+    if (parts.length < 2) {
+      return null;
+    }
+    const provider = parts[0]!;
+    const modelId = parts.slice(1).join("/");
+    const agentDir = resolveAgentDir(this.cfg, this.agentId);
+    return async (prompt) => {
+      const { completeAttributed } = await import("../agents/complete-attributed.js");
+      const { text, costUsd } = await completeAttributed({
+        provider,
+        modelId,
+        cfg: this.cfg,
+        agentDir,
+        prompt,
+        maxTokens: 1024,
+        feature: USAGE_FEATURES.memoryCuriosity,
+        agentId: this.agentId,
+        errorPrefix: `curiosity llm error (${modelSpec})`,
+        batch: false,
+        // A hung provider must not hold a pass open.
+        signal: AbortSignal.timeout(90_000),
+      });
+      return { text, costUsd };
+    };
+  }
+
+  async curiosityStatus() {
+    const { curiosityStatus } = await import("./curiosity-researcher.js");
+    const { isWebSearchConfigured } = await import("../agents/tools/web-search.js");
+    const c = this.cfg.memory?.curiosity;
+    const disabledBy =
+      c?.enabled === false
+        ? "memory.curiosity.enabled"
+        : c?.research?.enabled === false
+          ? "memory.curiosity.research.enabled"
+          : c?.autoResearch?.enabled === false && c?.research?.enabled !== true
+            ? "memory.curiosity.autoResearch.enabled"
+            : null;
+    const status = curiosityStatus(this.db, this.curiosityResearchConfig(), {
+      searchConfigured: isWebSearchConfigured(this.cfg),
+      hormonal: this.hormonalManager?.getState() ?? null,
+      disabledBy,
+    });
+    // PLAN-59 Phase 0: row counts of the evidence tables. Phase 2: the
+    // shadow surfacing trial's assignment counts and balance.
+    const evidence = this.evidenceTelemetry?.stats() ?? null;
+    return {
+      ...status,
+      evidence: evidence
+        ? { ...evidence, surfacingTrial: this.surfacingTrial?.stats() ?? null }
+        : null,
+    };
+  }
+
+  async curiosityList(limit?: number) {
+    const { listCuriosity } = await import("./curiosity-researcher.js");
+    return listCuriosity(this.db, { limit });
+  }
+
+  async curiosityResearchPaused(): Promise<boolean> {
+    const { isCuriosityPaused } = await import("./curiosity-researcher.js");
+    return isCuriosityPaused(this.db);
+  }
+
+  async curiosityPause(paused: boolean): Promise<void> {
+    const { setCuriosityPaused } = await import("./curiosity-researcher.js");
+    setCuriosityPaused(this.db, paused);
+    log.info(`curiosity research ${paused ? "paused" : "resumed"} by the owner`);
+  }
+
+  async curiosityDismiss(id: string): Promise<boolean> {
+    const { dismissCuriosityTarget } = await import("./curiosity-researcher.js");
+    const dismissed = dismissCuriosityTarget(this.db, id);
+    // PLAN-59 Phase 0: an explicit owner label. Matches the finding delivered
+    // for this target (opportunity id) or records the response on its own.
+    this.evidenceTelemetry?.recordSurfacingOutcome({
+      refId: id,
+      outcome: "dismissed",
+      provenance: "explicit",
+      kind: "curiosity_target",
+    });
+    return dismissed;
+  }
+
+  async curiosityAsk(question: string): Promise<string | null> {
+    const { askCuriosity } = await import("./curiosity-researcher.js");
+    return askCuriosity(this.db, question, this.curiosityEmbed());
+  }
+
+  /**
+   * Owner-triggered pass: ignores the interval, honors pause and the daily
+   * budget. Returns at once (a pass can take minutes; the Control UI request
+   * times out at 30 s); the page polls status to watch it.
+   */
+  curiosityRunNow(): { started: boolean } {
+    const started = this.curiosityPassInFlight === null;
+    void this.curiosityResearchTick({ force: true }).catch((err) =>
+      log.debug(`curiosity run-now failed: ${String(err)}`),
+    );
+    return { started };
+  }
+
+  /** PLAN-53 G4: tell the owner what the agent dreamed and learned today. */
+  async sendDreamBrief(opts: { force?: boolean } = {}): Promise<string | null> {
+    if (!dreamBriefEnabled(this.cfg.memory?.dreamBrief) && !opts.force) {
+      return null;
+    }
+    try {
+      const { buildDreamBrief, briefIsWorthSending, renderDreamBrief } =
+        await import("./dream-brief.js");
+      const brief = buildDreamBrief(this.db, Date.now() - 24 * 60 * 60 * 1000);
+      if (!briefIsWorthSending(brief) && !opts.force) {
+        return null;
+      }
+      const text = renderDreamBrief(brief);
+      const { notifyOwner } = await import("../infra/owner-notify.js");
+      const dedupeKey = `dream-brief:${this.agentId}:${new Date().toISOString().slice(0, 10)}`;
+      // PLAN-59 Phase 2: the digest is an opportunity before it is sent;
+      // eligible and assigned are logged first, delivered once it went out.
+      // Shadow: the arm changes nothing about the send.
+      const opportunity = {
+        eventId: `dd:${dedupeKey}`,
+        kind: "dream_digest",
+        refId: dedupeKey,
+      };
+      const assignment = this.surfacingTrial?.assign(opportunity);
+      await notifyOwner({
+        kind: "dream-brief",
+        dedupeKey,
+        text,
+      });
+      // PLAN-59 Phase 0: the daily dream digest went out to the owner.
+      if (this.surfacingTrial && assignment) {
+        this.surfacingTrial.deliver(opportunity, assignment);
+      }
+      return text;
+    } catch (err) {
+      log.warn(`dream brief failed: ${String(err)}`);
+      return null;
+    }
+  }
+
+  private scheduleDigestFire(msUntilNext: number): void {
+    this.digestTimer = setTimeout(() => {
+      this.digestTimer = null;
+      void this.maintenanceMutex
+        .run("digest", () => this.runDigest({ deliver: true }))
+        .catch((err) => {
+          log.warn(`digest delivery failed: ${String(err)}`);
+        })
+        .then(() => this.sendDreamBrief())
+        .finally(() => {
+          // Reschedule for the same time next day.
+          this.ensureDigestInterval();
+        });
+    }, msUntilNext);
+    if (this.digestTimer.unref) {
+      this.digestTimer.unref();
+    }
+  }
+
+  /**
+   * Daily health sweep — runs doctor's READ-ONLY inspectors on a schedule and
+   * warns about anything NEW since the last run.
+   *
+   * The checks that would have caught this session's three silent failures
+   * (dead vector index, unconsumed dream lanes, never-scheduled modes) all
+   * already existed and were correct; they simply never ran. Same wall-clock
+   * self-rescheduling shape as the digest. Free by construction: no model
+   * calls, no agent turns — only SQL against the memory DB.
+   */
+  private ensureHealthSweepInterval(): void {
+    const sweepCfg = this.cfg.memory?.healthSweep;
+    if (sweepCfg?.enabled === false || this.healthSweepTimer) {
+      return;
+    }
+    const time = sweepCfg?.time ?? "08:00";
+    void import("./skill-pipeline-digest.js")
+      .then(({ msUntilLocalTime }) => {
+        this.scheduleHealthSweepFire(msUntilLocalTime(time));
+      })
+      .catch((err) => {
+        log.debug(`health sweep schedule failed: ${String(err)}`);
+      });
+    this.catchUpMissedHealthSweep();
+  }
+
+  /**
+   * Catch up a missed window. The timer only ever schedules the NEXT wall-clock
+   * time from process start, so a node that is down at 08:00 — a reboot, a
+   * Windows update, a redeploy — silently skips that day entirely and nothing
+   * says so. The first real-world week of this feature produced zero sweeps for
+   * exactly that reason.
+   *
+   * Runs once shortly after boot if the last recorded sweep is older than the
+   * interval (or none exists), deliberately delayed so it never competes with
+   * the boot path it is meant to inspect.
+   */
+  private catchUpMissedHealthSweep(): void {
+    if (this.healthSweepCatchUpDone) {
+      return;
+    }
+    this.healthSweepCatchUpDone = true;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const last = this.db.prepare(`SELECT MAX(swept_at) AS at FROM health_sweeps`).get() as
+            | { at: number | null }
+            | undefined;
+          const lastAt = last?.at ?? 0;
+          if (Date.now() - lastAt < HEALTH_SWEEP_STALE_MS) {
+            return;
+          }
+          log.info(
+            lastAt === 0
+              ? "health sweep: no sweep on record — running a catch-up now"
+              : `health sweep: last sweep was ${Math.round(
+                  (Date.now() - lastAt) / 3_600_000,
+                )}h ago — running a catch-up now`,
+          );
+          await this.maintenanceMutex.run("health-sweep", () => this.runHealthSweep(), 60_000);
+        } catch (err) {
+          log.debug(`health sweep catch-up failed: ${String(err)}`);
+        }
+      })();
+    }, HEALTH_SWEEP_CATCHUP_DELAY_MS);
+    if (timer.unref) {
+      timer.unref();
+    }
+  }
+
+  private scheduleHealthSweepFire(msUntilNext: number): void {
+    this.healthSweepTimer = setTimeout(() => {
+      this.healthSweepTimer = null;
+      void this.runHealthSweep()
+        .catch((err) => {
+          log.warn(`health sweep failed: ${String(err)}`);
+        })
+        .finally(() => {
+          // Always reschedule — a sweep that dies must not take the alarm
+          // with it (the adaptive-dream-scheduler lesson).
+          try {
+            this.ensureHealthSweepInterval();
+          } catch (err) {
+            log.debug(`health sweep reschedule failed: ${String(err)}`);
+          }
+        });
+    }, msUntilNext);
+    if (this.healthSweepTimer.unref) {
+      this.healthSweepTimer.unref();
+    }
+  }
+
+  /** Run the health sweep now. Exposed for the doctor/RPC surfaces. */
+  async runHealthSweep(): Promise<import("./health-sweep.js").SweepResult> {
+    const { runHealthSweep } = await import("./health-sweep.js");
+    return runHealthSweep({ db: this.db, cfg: this.cfg });
+  }
+
+  /**
+   * Build and optionally deliver the daily digest. Exposed publicly so the
+   * skill_pipeline_digest agent tool can render on demand without waiting
+   * for the scheduled fire.
+   */
+  async runDigest(opts: { deliver?: boolean; lookbackHours?: number } = {}): Promise<{
+    markdown: string;
+    report: import("./skill-pipeline-digest.js").DigestReport;
+  }> {
+    const { buildDigest, renderMarkdown, deliverDigest } =
+      await import("./skill-pipeline-digest.js");
+    const digestCfg = this.cfg.memory?.digest ?? {};
+    const lookbackHours = opts.lookbackHours ?? digestCfg.lookbackHours ?? 24;
+    const now = Date.now();
+    const report = buildDigest(this.db, {
+      sinceMs: now - lookbackHours * 60 * 60 * 1000,
+      untilMs: now,
+    });
+    const markdown = renderMarkdown(report);
+    if (opts.deliver !== false) {
+      const channels = digestCfg.channels?.length
+        ? digestCfg.channels
+            .map((c) => {
+              if (c.kind === "file") {
+                return {
+                  kind: "file" as const,
+                  dir:
+                    c.dir ?? path.join(resolveAgentDir(this.cfg, this.agentId), "memory", "digest"),
+                };
+              }
+              if (c.kind === "log") {
+                return { kind: "log" as const };
+              }
+              // "message" channels are resolved by the caller wiring — the
+              // manager doesn't itself know how to reach channel plugins. The
+              // gateway wires this up separately via setDigestMessageSender().
+              return null;
+            })
+            .filter((c): c is { kind: "file"; dir: string } | { kind: "log" } => c !== null)
+        : [
+            {
+              kind: "file" as const,
+              dir: path.join(resolveAgentDir(this.cfg, this.agentId), "memory", "digest"),
+            },
+          ];
+      await deliverDigest(report, channels);
+    }
+    return { markdown, report };
+  }
+
+  /**
+   * PLAN-11 Gap 4: lazy-init the marketability predictor.
+   *
+   * Returns the predictor instance when enabled+ready, null otherwise. The
+   * predictor is intentionally lazy because it's opt-in and needs the dream
+   * model's LLM call function which is resolved later in init.
+   */
+  async getMarketabilityPredictor(): Promise<
+    import("./skill-marketability-predictor.js").SkillMarketabilityPredictor | null
+  > {
+    const predictorCfg = this.cfg.skills?.marketability?.predictor;
+    // V1 default flip (PLAN-41 D-D): opt-in via skills.marketability.predictor.
+    if (!marketabilityPredictorEnabled(predictorCfg)) {
+      return null;
+    }
+    if (this.marketabilityPredictor) {
+      return this.marketabilityPredictor;
+    }
+    const { SkillMarketabilityPredictor } = await import("./skill-marketability-predictor.js");
+    const modelSpec =
+      predictorCfg?.model ?? this.cfg.memory?.dream?.model ?? this.resolveCheapLlmSpec();
+    const llmCall = this.buildLlmCallFn(modelSpec, { feature: USAGE_FEATURES.memoryMarketability });
+    this.marketabilityPredictor = new SkillMarketabilityPredictor(
+      this.db,
+      {
+        enabled: true,
+        maxPerCycle: predictorCfg?.maxPerCycle,
+        predictionTtlDays: predictorCfg?.predictionTtlDays,
+        pricingInfluence: predictorCfg?.pricingInfluence,
+        refinerBlendWeight: predictorCfg?.refinerBlendWeight,
+        model: modelSpec,
+      },
+      llmCall,
+    );
+    return this.marketabilityPredictor;
+  }
+
+  /**
+   * PLAN-11 Gap 2: proactive trending sweep.
+   *
+   * Scheduled independently of dream cycles. Pulls "what's trending" from
+   * configured sources (github / hackernews / curated feeds), dedups against
+   * already-scraped URLs, and hands the top N to the Skill Seekers adapter
+   * for batch ingestion.
+   *
+   * Disabled by default — opt in via skills.skillSeekers.trending.enabled.
+   */
+  private ensureTrendingSweepInterval(): void {
+    const trendingCfg = this.cfg.skills?.skillSeekers?.trending;
+    // V1 default flip (PLAN-41 D-D): opt-in — this sweep dials api.github.com
+    // on a schedule, which an unconfigured node must not do undisclosed.
+    if (trendingCfg?.enabled !== true || this.trendingSweepTimer) {
+      return;
+    }
+    const intervalHours = trendingCfg?.intervalHours ?? 24;
+    if (intervalHours <= 0) {
+      return;
+    }
+    const ms = intervalHours * 60 * 60 * 1000;
+    this.trendingSweepTimer = setInterval(() => {
+      void this.maintenanceMutex
+        .run("trending", () => this.runTrendingSweep())
+        .catch((err) => {
+          log.warn(`trending sweep failed: ${String(err)}`);
+        });
+    }, ms);
+    if (this.trendingSweepTimer.unref) {
+      this.trendingSweepTimer.unref();
+    }
+    // First sweep after the initial delay so node startup isn't immediately
+    // pulling from external APIs.
+    const initialDelayMs = Math.min(ms, 10 * 60 * 1000); // 10 min or 1 interval
+    setTimeout(() => {
+      void this.maintenanceMutex
+        .run("trending", () => this.runTrendingSweep())
+        .catch((err) => {
+          log.warn(`trending sweep failed: ${String(err)}`);
+        });
+    }, initialDelayMs).unref?.();
+  }
+
+  /**
+   * Execute one trending sweep. Public so an agent tool / CLI command can
+   * trigger it on demand without waiting for the interval.
+   */
+  async runTrendingSweep(): Promise<{ scraped: number; skipped: number; elapsedMs: number }> {
+    const trendingCfg = this.cfg.skills?.skillSeekers?.trending;
+    if (trendingCfg?.enabled === false || !this.skillSeekersAdapter) {
+      return { scraped: 0, skipped: 0, elapsedMs: 0 };
+    }
+    const { runTrendingSweep } = await import("./skill-seekers-trending.js");
+    const sources = trendingCfg?.sources ?? [{ kind: "github" as const }];
+    const result = await runTrendingSweep(this.skillSeekersAdapter, sources, {
+      maxPerSweep: trendingCfg?.maxPerSweep ?? 5,
+    });
+    return {
+      scraped: result.scraped,
+      skipped: result.skipped,
+      elapsedMs: result.elapsedMs,
+    };
+  }
+
+  /**
+   * PLAN-11 Gap 1: request-frequency analyzer. Converts repeated user queries
+   * (captured in curiosity_queries) into knowledge_gap targets that the dream
+   * engine's exploration mode can pick up. Runs on the consolidation interval;
+   * errors are swallowed because this is an observability/enhancement pass,
+   * not load-bearing.
+   */
+  private async runRequestFrequencyAnalyzer(): Promise<void> {
+    const rfCfg = this.cfg.memory?.curiosity?.requestFrequency;
+    if (rfCfg?.enabled === false) {
+      return;
+    }
+    try {
+      const { analyzeRequestFrequency, injectFrequencyTargets } =
+        await import("./request-frequency-analyzer.js");
+      const signals = analyzeRequestFrequency(this.db, {
+        lookbackDays: rfCfg?.lookbackDays,
+        minFrequency: rfCfg?.minFrequency,
+        maxSignals: rfCfg?.maxSignals,
+      });
+      if (signals.length === 0) {
+        return;
+      }
+      injectFrequencyTargets(this.db, signals, { ttlDays: rfCfg?.ttlDays });
+    } catch (err) {
+      log.debug(`request-frequency analyzer failed: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Build a standalone LLM call function from a "provider/model" string.
+   * Returns null if the model can't be resolved or auth is unavailable.
+   */
+  /**
+   * PLAN-41 Phase 1 (p0-22): key-aware cheap-model default for the dream /
+   * discovery / predictor background lanes. The historical hardcoded
+   * "openai/gpt-4o-mini" default was a guaranteed failure on Anthropic-only
+   * installs — the most common key setup. Same cheap env gate as the SAGE
+   * planner above: deterministic, no auth-resolver walk.
+   */
+  private resolveCheapLlmSpec(): string {
+    return resolveCheapLlmSpec(process.env);
+  }
+
+  /**
+   * PLAN-44 Phase 0 (D-1): the agent's primary model as a "provider/model"
+   * spec, for lanes that must match the runtime agent's capability (the
+   * skill proposer). Null when config resolution throws, so callers fall
+   * back to their previous default.
+   */
+  private resolvePrimaryLlmSpec(): string | null {
+    try {
+      const ref = resolveDefaultModelForAgent({ cfg: this.cfg, agentId: this.agentId });
+      return ref.provider && ref.model ? `${ref.provider}/${ref.model}` : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private buildLlmCallFn(
+    modelSpec: string,
+    opts?: {
+      maxTokens?: number;
+      feature?: string;
+      /**
+       * Route through the Anthropic Message Batches API (50% price, up to
+       * `memory.batch.maxWaitMinutes` of latency, live fallback). Default: the
+       * lane decision from `memory.batch.lanes`; pass `false` for anything a
+       * user is waiting on (the proposer ReAct loop, on-demand RPC lanes).
+       */
+      batch?: boolean;
+    },
+  ): ((prompt: string, callOpts?: { signal?: AbortSignal }) => Promise<string>) | null {
+    const parts = modelSpec.split("/");
+    if (parts.length < 2) {
+      return null;
+    }
+    const provider = parts[0]!;
+    const modelId = parts.slice(1).join("/");
+    // PLAN-50: every hidden lane records to the usage ledger under its feature and honors the
+    // background budget gate (dream, extraction, evolution pause when `usage.budgets.mode` is
+    // "enforce" and a covering budget is exceeded).
+    const feature = opts?.feature ?? USAGE_FEATURES.memoryDream;
+    const agentDir = resolveAgentDir(this.cfg, this.agentId);
+
+    return async (prompt: string, callOpts?: { signal?: AbortSignal }): Promise<string> => {
+      // Lazy import to avoid circular deps and keep cold path fast.
+      const { completeAttributed } = await import("../agents/complete-attributed.js");
+      const { text } = await completeAttributed({
+        provider,
+        modelId,
+        cfg: this.cfg,
+        agentDir,
+        prompt,
+        maxTokens: opts?.maxTokens ?? 2048,
+        feature,
+        agentId: this.agentId,
+        errorPrefix: `llm error (${modelSpec})`,
+        // PLAN-55 Phase 1 review (item 12): a caller on the reply path can
+        // cancel the call instead of abandoning it to bill and write later.
+        ...(callOpts?.signal ? { signal: callOpts.signal } : {}),
+        // Token-efficiency item 3: latency-tolerant lanes (dream, extraction, discovery,
+        // evolution judge/maintainer) go through the Batches API; completeAttributed falls
+        // back to the live call on timeout or error and records batch rows at 50%.
+        ...(opts?.batch !== undefined ? { batch: opts.batch } : {}),
+      });
+      return text;
+    };
+  }
+
+  /**
+   * Run a full dream cycle. `scheduled: true` (timers) applies the triple
+   * gate — new user turns since the last full cycle, user idle, and hours
+   * since the last full cycle (memory.dream.minNewSessions / minIdleMinutes /
+   * minHoursBetween). Explicit triggers (`dream.trigger` RPC, CLI, tests)
+   * omit it and always run.
+   */
+  private canRunFailureLearning(): boolean {
+    // Evolution's wiki and gateway executor are node-wide and use the default
+    // agent. Other managers must not race it or learn into the wrong identity.
+    if (
+      this.closed ||
+      this.syncing ||
+      this.agentId !== resolveDefaultAgentId(this.cfg) ||
+      !dreamEngineEnabled(this.cfg.memory?.dream) ||
+      !skillEvolutionEnabled(this.cfg.skills?.evolution)
+    )
+      return false;
+    if (
+      !isDreamLearningIdle(
+        this.getDreamGateState().snapshot(),
+        this.cfg.memory?.dream?.minIdleMinutes ?? DEFAULT_DREAM_CONFIG.minIdleMinutes,
+      )
+    )
+      return false;
+    return !isBackgroundUsagePaused({
+      ledger: getUsageLedger(),
+      cfg: this.cfg,
+      feature: USAGE_FEATURES.skillsEvolution,
+    });
+  }
+
+  async dream(opts?: { scheduled?: boolean }): Promise<DreamStats | null> {
+    if (!this.dreamEngine) {
+      return null;
+    }
+    const gateState = this.getDreamGateState();
+    if (opts?.scheduled) {
+      // Even a creative-cycle skip can make learning progress. Serialize with
+      // memory maintenance just like the existing full-cycle evolution hook.
+      // Dispatch also pauses during index sync; the engine detects DB swaps.
+      if (this.canRunFailureLearning() && !this.failureLearningPending) {
+        const pending = this.maintenanceMutex
+          .run(
+            "failure-learning",
+            async () => {
+              if (this.canRunFailureLearning())
+                await this.dreamEngine?.runLearningLane(`idle-${Date.now()}`, true);
+            },
+            60_000,
+          )
+          .catch((error) => {
+            log.warn(`automatic failure learning failed: ${String(error)}`);
+          });
+        this.failureLearningPending = pending;
+        void pending.finally(() => {
+          if (this.failureLearningPending === pending) this.failureLearningPending = null;
+        });
+      }
+      const dreamCfg = this.cfg.memory?.dream;
+      const decision = evaluateDreamGate(
+        {
+          minNewSessions: dreamCfg?.minNewSessions ?? DEFAULT_DREAM_CONFIG.minNewSessions,
+          minIdleMinutes: dreamCfg?.minIdleMinutes ?? DEFAULT_DREAM_CONFIG.minIdleMinutes,
+          minHoursBetween: dreamCfg?.minHoursBetween ?? DEFAULT_DREAM_CONFIG.minHoursBetween,
+        },
+        gateState.snapshot(),
+      );
+      if (!decision.pass) {
+        log.debug(`scheduled dream cycle skipped: ${decision.reason}`);
+        return null;
+      }
+      log.info(`scheduled dream cycle: ${decision.reason}`);
+    }
+    const stats = await this.maintenanceMutex.run(
+      "dream",
+      () => withSpan("memory.dream", () => this.dreamEngine!.run(), { "dream.engine": "default" }),
+      120_000,
+    );
+    // Only a cycle that actually ran resets the gate counters; an engine-side
+    // readiness skip leaves the new-turn count intact for the next attempt.
+    if (stats) {
+      gateState.recordFullCycle();
+    }
+
+    if (stats && stats.newInsights.length > 0) {
+      // Post-dream curiosity assessment
+      if (this.curiosityEngine) {
+        for (const insight of stats.newInsights) {
+          try {
+            this.curiosityEngine.assessDreamInsight(insight);
+          } catch {}
+        }
+      }
+
+      // Dream journal: write a narrative entry for the dream cycle
+      if (stats.cycle.state !== "DORMANT" || stats.newInsights.length > 0) {
+        try {
+          this.writeDreamJournal(stats);
+        } catch (err) {
+          log.debug(`dream journal write failed: ${String(err)}`);
+        }
+      }
+
+      // Persist GCCRF state after each dream cycle (dream cycles drive maturity)
+      this.curiosityEngine?.saveGCCRFState();
+    }
+
+    // Post-dream: run discovery agent to find skill relationships.
+    // Token-efficiency pass (2026-09-19): pair selection is deterministic
+    // (first 3 unconnected pairs), so a run without new skill chunks since
+    // the previous run repeats the same LLM calls for the same answer.
+    const newSkillChunks = stats ? gateState.newSkillChunksSinceDiscovery() : 0;
+    if (stats && stats.newInsights.length > 0 && newSkillChunks === 0) {
+      log.debug("discovery skipped: no new skill chunks since last run");
+    }
+    if (stats && stats.newInsights.length > 0 && newSkillChunks > 0) {
+      try {
+        gateState.recordDiscoveryRun();
+        if (!this.discoveryAgent) {
+          // An injected memory.dream.llmCall (tests, programmatic) wins; otherwise a dedicated
+          // discovery lane so its spend is attributed separately from dreaming.
+          const llmCall =
+            this.cfg.memory?.dream?.llmCall ??
+            this.buildLlmCallFn(this.cfg.memory?.dream?.model ?? this.resolveCheapLlmSpec(), {
+              feature: USAGE_FEATURES.memoryDiscovery,
+            }) ??
+            this.dreamLlmCall;
+          this.discoveryAgent = new DiscoveryAgent(this.db, llmCall);
+        }
+        const discovery = await this.discoveryAgent.runCycle();
+        if (discovery.edgesDiscovered > 0) {
+          log.info("discovery: found skill relationships", {
+            edges: discovery.edgesDiscovered,
+            prerequisites: discovery.prerequisitesFound,
+            composites: discovery.compositesFound,
+            contradictions: discovery.contradictionsFound,
+          });
+        }
+      } catch (err) {
+        log.debug(`discovery cycle failed: ${String(err)}`);
+      }
+    }
+
+    // PLAN-24 HORMA Phase 3: evolve the memory-architect rule library from
+    // accumulated construction_feedback BEFORE extraction, so freshly-promoted
+    // rules apply to this cycle. Gated + validated; runs off the critical path.
+    if (stats) {
+      try {
+        await this.maybeRunArchitectCycle();
+      } catch (err) {
+        log.debug(`memory-architect cycle failed: ${String(err)}`);
+      }
+      try {
+        await this.maybeRunGraphAbstraction();
+      } catch (err) {
+        log.debug(`graph abstraction failed: ${String(err)}`);
+      }
+    }
+
+    // Session fact extraction: extract structured facts + handover briefs from sessions.
+    // Runs before working memory rewrite so fresh directive facts flow into user_preferences
+    // and are available for The Bond synthesis.
+    if (stats) {
+      try {
+        await this.runSessionExtraction();
+      } catch (err) {
+        log.debug(`session extraction failed: ${String(err)}`);
+      }
+    }
+
+    // RLM Working Memory rewrite: runs every dream cycle regardless of insight count.
+    // Scratch notes must be consumed even when the dream produces zero insights,
+    // otherwise the WAL grows unbounded and agent observations are lost.
+    if (stats) {
+      try {
+        await this.rewriteWorkingMemory(stats);
+      } catch (err) {
+        log.debug(`working memory rewrite failed: ${String(err)}`);
+      }
+    }
+
+    // PLAN-54: the "deepen emerging skill" frontier generator was deleted.
+    // It mistook handover briefs and READMEs for skills and produced 16 of
+    // the 18 open targets on the reference node, none researchable.
+
+    // Experience signal collection: package dream cycle data into training signals
+    if (stats && this.experienceCollector) {
+      try {
+        this.experienceCollector.collectFromDreamCycle(stats);
+      } catch (err) {
+        log.debug(`experience signal collection failed: ${String(err)}`);
+      }
+    }
+
+    return stats;
+  }
+
+  /** PLAN-24 HORMA Phase 3: last memory-architect cycle timestamp (cooldown). */
+  private lastArchitectRunAt = 0;
+
+  /** PLAN-24 HORMA Phase 5: last graph-abstraction pass timestamp (cooldown). */
+  private lastGraphAbstractionAt = 0;
+
+  /**
+   * PLAN-24 HORMA Phase 5: build summary nodes over the entity graph so the
+   * reader has a coarse-to-fine entry point. Gated (flag default on, 6h
+   * cooldown, LLM + populated graph). Off the critical path.
+   */
+  private async maybeRunGraphAbstraction(): Promise<void> {
+    if (this.cfg.memory?.graphAbstraction?.enabled === false || !this.knowledgeGraph) {
+      return;
+    }
+    const llmCall = this.dreamLlmCall;
+    if (!llmCall) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastGraphAbstractionAt < 6 * 60 * 60 * 1000) {
+      return;
+    }
+    // Need a populated relationship layer for communities to exist.
+    let relCount = 0;
+    try {
+      relCount = (
+        this.db
+          .prepare(`SELECT COUNT(*) AS c FROM relationships WHERE valid_until IS NULL`)
+          .get() as { c: number }
+      ).c;
+    } catch {
+      return;
+    }
+    if (relCount < 6) {
+      return;
+    }
+    this.lastGraphAbstractionAt = now;
+    const { buildGraphAbstractions } = await import("./graph-abstraction.js");
+    const result = await buildGraphAbstractions({
+      db: this.db,
+      kg: this.knowledgeGraph,
+      llmCall,
+    });
+    if (result.created > 0) {
+      log.info("graph abstraction built summary nodes", { created: result.created });
+    }
+  }
+
+  /**
+   * PLAN-24 HORMA Phase 3: evolve the construction-rule library from accumulated
+   * construction_feedback. Gated (flag default on, 6h cooldown, LLM available)
+   * and validated (a candidate rule only lands if it does not regress faithful
+   * extraction on held-out sessions). Off the critical path.
+   */
+  private async maybeRunArchitectCycle(): Promise<void> {
+    if (!architectCycleEnabled(this.cfg.memory?.architectEvolution)) {
+      return;
+    }
+    const llmCall = this.dreamLlmCall;
+    if (!llmCall) {
+      return;
+    }
+    const now = Date.now();
+    const cooldownMs = 6 * 60 * 60 * 1000;
+    if (now - this.lastArchitectRunAt < cooldownMs) {
+      return;
+    }
+
+    const files = (await listSessionFilesForAgent(this.agentId)).slice(-3);
+    const { buildSessionEntry } = await import("./session-files.js");
+    const heldOut: Array<{ id: string; content: string }> = [];
+    for (const f of files) {
+      const entry = await buildSessionEntry(f);
+      if (entry && entry.content.length >= 200) {
+        heldOut.push({ id: f, content: entry.content });
+      }
+    }
+    if (heldOut.length === 0) {
+      return;
+    }
+
+    const hormones = this.hormonalManager?.getState();
+    const hormonalBias = hormones
+      ? { dopamine: hormones.dopamine, cortisol: hormones.cortisol, oxytocin: hormones.oxytocin }
+      : undefined;
+
+    const sinceTs = this.lastArchitectRunAt;
+    this.lastArchitectRunAt = now;
+    const result = await runArchitectCycle({
+      db: this.db,
+      llmCall,
+      heldOut,
+      hormones: hormonalBias,
+      sinceTs,
+    });
+    if (result.promoted > 0) {
+      log.info("memory-architect promoted construction rules", {
+        promoted: result.promoted,
+        harvested: result.harvested,
+      });
+    }
+  }
+
+  /**
+   * Run LLM-powered session fact extraction during dream cycle.
+   * Extracts structured facts (epistemic layers) and handover briefs from
+   * sessions that have changed since last extraction.
+   */
+  private async runSessionExtraction(): Promise<void> {
+    const extractionCfg = this.cfg.memory?.extraction;
+    if (extractionCfg?.enabled === false) {
+      return;
+    }
+    // PLAN-55 Phase 1: incognito. Nothing is learned from transcripts.
+    if (!conversationMemoryEnabled(this.cfg.session)) {
+      log.debug("session extraction skipped: session.memory is off");
+      return;
+    }
+
+    const llmCall = this.extractionLlmCall ?? this.dreamLlmCall;
+    if (!llmCall) {
+      log.debug("session extraction skipped: no LLM call available");
+      return;
+    }
+
+    const minDelta = extractionCfg?.minSessionDelta ?? 2000;
+    const maxFacts = extractionCfg?.maxFactsPerSession ?? 20;
+    // PLAN-24 HORMA Phase 0: persist provenance pointers unless explicitly off.
+    const provenanceEnabled = this.cfg.memory?.provenance?.enabled !== false;
+
+    // Gather current hormonal state for extraction bias
+    const hormones = this.hormonalManager?.getState();
+    const hormonalBias: HormonalBias | undefined = hormones
+      ? { dopamine: hormones.dopamine, cortisol: hormones.cortisol, oxytocin: hormones.oxytocin }
+      : undefined;
+
+    const sessionFiles = await listSessionFilesForAgent(this.agentId);
+    if (sessionFiles.length === 0) {
+      return;
+    }
+
+    // PLAN-24 HORMA Phase 3/4: inject the evolving memory-architect rule library
+    // into every extraction unless explicitly disabled. Phase 4: rule selection
+    // is conditioned on the current hormonal state (state-nearest rules, count
+    // modulated by cortisol/dopamine) rather than dumping every rule.
+    // V1 default flip (PLAN-41 D-D): opt-in.
+    const architectEnabled = architectRulesEnabled(this.cfg.memory?.architectEvolution);
+    const learnedRules = architectEnabled ? selectRulesForState(this.db, hormonalBias) : [];
+
+    // PLAN-34 M2 hotfix: structured ground-truth writes (canonical pins,
+    // directive preferences) only from first-party sessions. Third-party
+    // authored transcripts (A2A, groups, circles, subagents) still yield
+    // ordinary crystals, never always-injected truth.
+    const { buildSessionTrustResolver } = await import("./session-trust.js");
+    const sessionTrust = await buildSessionTrustResolver(this.agentId);
+
+    // PLAN-34 §6.2: stamp session_trust onto PRE-MIGRATION session chunks
+    // (NULL rows only) so the dream-promotion gate's first-party leg — and
+    // the insight backfill behind it — can ground against history instead
+    // of rejecting 100% of it. Naturally idempotent; cheap once complete.
+    try {
+      await this.backfillSessionTrust();
+    } catch (err) {
+      log.debug(`session_trust backfill failed (non-critical): ${String(err)}`);
+    }
+
+    // PLAN-34 Phase 1: the open-question loop rides the extraction cycle.
+    // Sweep canonical-ledger conflicts into user-answerable questions, then
+    // offer the top open questions to the extractor (first-party sessions
+    // only). runStartTs is the survival cutoff for two-tier resolution:
+    // answers found in THIS run finalize on the NEXT run if uncontradicted.
+    const directiveEngine = this.epistemicDirectiveEngine;
+    const runStartTs = Date.now();
+    let openQuestions: Array<{ id: string; question: string }> = [];
+    if (directiveEngine) {
+      try {
+        directiveEngine.sweepCanonicalConflicts();
+        openQuestions = directiveEngine
+          .listOpenDirectives(5)
+          .map((d) => ({ id: d.id, question: d.question }));
+      } catch (err) {
+        log.debug(`open-question sweep failed: ${String(err)}`);
+      }
+    }
+
+    let extractedCount = 0;
+
+    for (const absPath of sessionFiles) {
+      try {
+        // Read session content
+        const { buildSessionEntry } = await import("./session-files.js");
+        const entry = await buildSessionEntry(absPath);
+        if (!entry) {
+          continue;
+        }
+        // Token-efficiency pass (2026-09-19): heartbeat prompt/ack pairs are
+        // protocol scaffolding. The size floor applies to what is left; a
+        // heartbeat-only transcript makes no extraction call at all.
+        const prepared = stripHeartbeatTurns(entry.content);
+        if (prepared.content.trim().length === 0 || prepared.content.length < minDelta) {
+          continue;
+        }
+
+        // Check if already extracted with same content hash
+        const contentHash = crypto.createHash("sha256").update(entry.content).digest("hex");
+        const existing = this.db
+          .prepare(`SELECT last_extracted_hash FROM session_extractions WHERE session_path = ?`)
+          .get(absPath) as { last_extracted_hash: string } | undefined;
+
+        if (existing?.last_extracted_hash === contentHash) {
+          continue;
+        }
+        // Failure ledger: a transcript that failed maxAttempts times at this
+        // content hash is parked instead of retried every cycle.
+        if (
+          shouldSkipExtraction(this.db, absPath, contentHash, {
+            maxAttempts: extractionCfg?.maxAttempts,
+            retryAfterMs:
+              extractionCfg?.retryAfterDays !== undefined
+                ? extractionCfg.retryAfterDays * 24 * 60 * 60 * 1000
+                : undefined,
+          })
+        ) {
+          log.debug(`session extraction parked (attempts exhausted): ${path.basename(absPath)}`);
+          continue;
+        }
+
+        // PLAN-34 Phase 1: open questions are offered (and answers applied)
+        // for first-party sessions only — a third party must never resolve
+        // a question we asked the owner. Re-filtered per file: a question
+        // answered by an earlier session in THIS run must not be offered to
+        // (and re-answered by) a later one.
+        const firstParty = sessionTrust(absPath) === "first_party";
+        const openQuestionsForFile =
+          firstParty && openQuestions.length > 0 && directiveEngine
+            ? openQuestions.filter((q) => directiveEngine.getDirective(q.id)?.status === "open")
+            : [];
+
+        // Run LLM extraction
+        const result = await extractSessionFacts(
+          entry.content,
+          absPath,
+          llmCall,
+          maxFacts,
+          hormonalBias,
+          learnedRules,
+          openQuestionsForFile.length > 0 ? openQuestionsForFile : undefined,
+          { maxTranscriptChars: extractionCfg?.maxTranscriptChars },
+        );
+        if (!result) {
+          const failure = recordExtractionFailure(
+            this.db,
+            absPath,
+            contentHash,
+            "llm call failed or response unparseable",
+          );
+          log.warn(
+            `session extraction failed for ${path.basename(absPath)} (attempt ${failure.attempts})`,
+          );
+          continue;
+        }
+        clearExtractionFailure(this.db, absPath);
+
+        const now = Date.now();
+
+        // PLAN-24 HORMA Phase 0: validate that each fact's citation actually
+        // supports it (anti-confabulation). We already hold the flattened
+        // transcript, so this is a cheap in-process token-overlap check — no
+        // re-read. Weak citations are flagged to memory_audit_log for review.
+        const provenanceLines = provenanceEnabled ? entry.content.split("\n") : null;
+        // B7 (2026-09-05 harness review W6): session trust is per session
+        // key, but a fetched web page, email or circle message inside the
+        // owner's own session is wrapped in the external-content envelope.
+        // A fact whose evidence sits inside such a span keeps the taint
+        // through the paraphrase; otherwise the canonical-pin and directive
+        // gates would launder third-party text into first-party memory.
+        const untrustedRanges = findExternalUntrustedLineRanges(entry.content);
+
+        // Store extracted facts as crystals with epistemic layers
+        for (const fact of result.facts) {
+          try {
+            // PLAN-55 Phase 0: the owner forgot this memory; do not grow it
+            // back under a new id (nor route it to preferences or the ledger).
+            const suppressed = isSuppressed(this.db, "chunk_hash", chunkTextHash(fact.text));
+            if (suppressed) {
+              log.debug(
+                `session extraction skipped a forgotten memory (suppression ${suppressed.id})`,
+              );
+              continue;
+            }
+            const id = `fact_${crypto.randomUUID()}`;
+            const evidenceLines = fact.evidence
+              .filter((e): e is Extract<typeof e, { kind: "session" }> => e.kind === "session")
+              .map((e) => e.line);
+            const factTrust = evidenceTouchesUntrusted(evidenceLines, untrustedRanges)
+              ? "untrusted"
+              : sessionTrust(absPath);
+            const hash = crypto.createHash("sha256").update(fact.text).digest("hex");
+            const evidenceJson =
+              provenanceEnabled && fact.evidence.length > 0 ? JSON.stringify(fact.evidence) : null;
+            // PLAN-34 Phase 4: stamp session trust at WRITE time (v34
+            // chunks.session_trust) so the dream-promotion gate's
+            // first-party-source leg never has to re-resolve prunable
+            // sessions.json history for a chunk.
+            this.db
+              .prepare(
+                `INSERT OR IGNORE INTO chunks (id, path, source, start_line, end_line, text, hash,
+                 model, embedding,
+                 importance_score, lifecycle, semantic_type, epistemic_layer, evidence_refs,
+                 session_trust,
+                 access_count, last_accessed_at, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              )
+              .run(
+                id,
+                absPath,
+                "sessions",
+                0,
+                0,
+                fact.text,
+                hash,
+                "pending",
+                "[]",
+                fact.confidence,
+                "generated",
+                fact.semanticType,
+                fact.epistemicLayer,
+                evidenceJson,
+                factTrust,
+                0,
+                null,
+                now,
+                now,
+              );
+
+            // PLAN-24 HORMA Phase 0: anti-confabulation — verify the cited lines
+            // actually support the fact. A weak score means the LLM hallucinated
+            // the fact or mis-cited; flag it for review (we keep the fact but
+            // record the concern so the architect loop can learn from it).
+            if (provenanceLines && fact.evidence.length > 0) {
+              const support = scoreCitationSupport(fact.text, fact.evidence, provenanceLines);
+              if (support !== null && support < 0.5) {
+                try {
+                  this.db
+                    .prepare(
+                      `INSERT INTO memory_audit_log (id, chunk_id, event, timestamp, actor, metadata)
+                       VALUES (?, ?, 'provenance_citation_weak', ?, 'session_extraction', ?)`,
+                    )
+                    .run(
+                      crypto.randomUUID(),
+                      id,
+                      now,
+                      JSON.stringify({ support: Number(support.toFixed(3)) }),
+                    );
+                } catch {
+                  // audit logging is non-critical
+                }
+              }
+            }
+
+            // Route directive facts to user preferences — first-party
+            // sessions only (a third party's "always do X" must never become
+            // a standing preference).
+            if (
+              fact.epistemicLayer === "directive" &&
+              this.userModelManager &&
+              sessionTrust(absPath) === "first_party"
+            ) {
+              this.userModelManager.upsertFromDirective({
+                text: fact.text,
+                confidence: fact.confidence,
+                sessionId: absPath,
+              });
+            }
+
+            // PLAN-33 Phase 2: automatic canonical pinning. When the extractor
+            // judged a fact to be stable key-value ground truth (and is
+            // reasonably confident), reconcile it into the ledger: same value
+            // strengthens (the daily-confirmation signal), a new value
+            // supersedes (user corrections propagate without being asked).
+            // Extraction pins cap below explicit user pins (0.95) so an
+            // extraction mistake never outranks a deliberate correction.
+            // First-party sessions only: canonical ground truth must never
+            // derive from third-party authored transcripts (A2A/group/circle).
+            if (
+              this.canonicalFactsStore &&
+              fact.canonical &&
+              fact.confidence >= 0.65 &&
+              sessionTrust(absPath) === "first_party"
+            ) {
+              const pinResult = this.canonicalFactsStore.pin({
+                key: fact.canonical.key,
+                value: fact.canonical.value,
+                statement: fact.text,
+                category: fact.canonical.key.split(".")[0],
+                confidence: Math.min(fact.confidence, 0.85),
+                source: "extraction",
+                evidenceChunkIds: [id],
+              });
+              if (pinResult.op !== "rejected") {
+                log.debug(
+                  `canonical auto-pin (${pinResult.op}): [${fact.canonical.key}] from session extraction`,
+                );
+              }
+            }
+          } catch {
+            // Individual fact insertion failure is non-critical
+          }
+        }
+
+        // PLAN-34 Phase 1: apply validated open-question answers — mark
+        // answered (stops injecting immediately), store the answer as a
+        // world_fact crystal, route canonical-shaped answers through the
+        // reconciler at extraction tier.
+        if (firstParty && directiveEngine && result.resolutions.length > 0) {
+          try {
+            applyDirectiveResolutions({
+              db: this.db,
+              engine: directiveEngine,
+              canonicalStore: this.canonicalFactsStore,
+              resolutions: result.resolutions,
+              sessionPath: absPath,
+              now,
+            });
+          } catch (err) {
+            log.debug(`applyDirectiveResolutions failed: ${String(err)}`);
+          }
+        }
+
+        // Write handover brief to disk and store as chunk
+        const brief = result.handoverBrief;
+        try {
+          const briefPath = handoverPath(this.workspaceDir, brief.timestamp);
+          const briefDir = path.dirname(briefPath);
+          if (!existsSync(briefDir)) {
+            mkdirSync(briefDir, { recursive: true });
+          }
+          const { writeFile } = await import("node:fs/promises");
+
+          // Plan 7, Phase 6: Handover brief quality gate
+          try {
+            const { scoreHandoverBrief, HANDOVER_QUALITY_THRESHOLD } =
+              await import("./session-handover.js");
+            const quality = scoreHandoverBrief(brief, result.facts);
+            if (quality.overall < HANDOVER_QUALITY_THRESHOLD && quality.missingFacts.length > 0) {
+              log.warn("handover brief below quality threshold", {
+                score: quality.overall.toFixed(2),
+                coverage: quality.coverage.toFixed(2),
+                missing: quality.missingFacts.length,
+              });
+              // Enrich brief with missing facts
+              for (const missingFact of quality.missingFacts.slice(0, 5)) {
+                if (missingFact.length < 80) {
+                  brief.milestones.push(`[recovered] ${missingFact}`);
+                }
+              }
+            }
+          } catch {
+            // Quality gate module not available — non-critical
+          }
+
+          await writeFile(briefPath, formatHandoverBrief(brief), "utf-8");
+
+          // Store handover as searchable chunk
+          const briefId = `handover_${crypto.randomUUID()}`;
+          const briefText = briefToChunkText(brief);
+          const briefHash = crypto.createHash("sha256").update(briefText).digest("hex");
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO chunks (id, path, source, start_line, end_line, text, hash,
+               model, embedding,
+               importance_score, lifecycle, semantic_type, epistemic_layer,
+               access_count, last_accessed_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              briefId,
+              briefPath,
+              "memory",
+              0,
+              0,
+              briefText,
+              briefHash,
+              "pending",
+              "[]",
+              0.8,
+              "generated",
+              "episode",
+              "experience",
+              0,
+              null,
+              now,
+              now,
+            );
+        } catch (err) {
+          log.debug(`handover brief write failed: ${String(err)}`);
+        }
+
+        // ── PLAN-9: Post-extraction integration ──
+
+        // Knowledge Graph population: extract entities and relationships from facts
+        if (this.knowledgeGraph && result.facts.length > 0) {
+          try {
+            const kgEntities: Array<{
+              name: string;
+              type: import("./knowledge-graph.js").EntityType;
+            }> = [];
+            const kgRelationships: Array<import("./knowledge-graph.js").ExtractedRelationship> = [];
+
+            // PLAN-23 SABM: deterministic relationship extraction is on by
+            // default; set BITTERBOT_KG_RELATIONSHIPS=0 to disable (mirrors the
+            // BITTERBOT_DREAM_TASK_BIAS opt-out convention). Pure helpers in
+            // kg-relationship-extract.ts (no LLM, no embeddings).
+            const populateRelationships = process.env.BITTERBOT_KG_RELATIONSHIPS !== "0";
+            const userName = this.resolveUserName();
+
+            for (const fact of result.facts) {
+              // Extract entities from fact text via simple NER heuristics
+              // Person names (capitalized words in relationship/preference facts)
+              if (fact.semanticType === "relationship" || fact.semanticType === "preference") {
+                for (const name of kgExtract.extractPersonNames(fact.text)) {
+                  kgEntities.push({ name, type: "person" });
+                }
+                // Pair the leading two distinct persons in a relationship fact
+                // into a deterministic edge (conservative: never a fan-out).
+                if (populateRelationships && fact.semanticType === "relationship") {
+                  const edge = kgExtract.extractRelationshipFromFact(fact.text);
+                  if (edge) {
+                    kgRelationships.push(edge);
+                  }
+                }
+              }
+              // PLAN-27: family/identity edges live in world_fact/relationship facts
+              // ("User's wife is named Donna"), which the pair-extractor above never
+              // sees. Resolve them to typed family edges linked to the user entity.
+              if (populateRelationships && userName) {
+                const idEdge = kgExtract.extractIdentityRelationship(fact.text, { userName });
+                if (idEdge) {
+                  kgEntities.push({ name: idEdge.sourceName, type: "person" });
+                  kgEntities.push({ name: idEdge.targetName, type: "person" });
+                  kgRelationships.push(idEdge);
+                }
+              }
+              // Tool/project names from world_fact and task_pattern facts
+              if (fact.epistemicLayer === "world_fact" || fact.semanticType === "task_pattern") {
+                const tools = fact.text.match(
+                  /\b(?:Docker|Postgres|MySQL|Redis|React|Node|Python|Git|AWS|GCP|Azure|Kubernetes|MongoDB|GraphQL|REST|API|CI|CD)\b/gi,
+                );
+                for (const tool of tools ?? []) {
+                  kgEntities.push({ name: tool, type: "tool" });
+                }
+              }
+              // PLAN-28 A1: general typed edges from ANY fact-like layer, not just
+              // relationship-typed facts — this is where the thousands of
+              // "X works on Y" / "service hosted on AWS" facts finally become
+              // edges. Conservative: the extractor requires a typed relation verb
+              // and two distinct dictionary-typed entities, and refuses the
+              // related_to fan-out, so a wrong edge stays rarer than no edge.
+              // Never learn the social graph from the agent's OWN output
+              // (dream reports, handover briefs, working-memory dumps). That
+              // is how "cognitive processes and analysis" became an entity
+              // that "summarizes" the word "explore" — the graph training on
+              // its own noise (2026-08-11 trace).
+              if (populateRelationships && !kgAdmission.looksMachineGenerated(fact.text)) {
+                const typedEdge = kgExtract.extractTypedRelationshipFromFact(fact.text);
+                if (typedEdge) {
+                  kgEntities.push({ name: typedEdge.sourceName, type: typedEdge.sourceType });
+                  kgEntities.push({ name: typedEdge.targetName, type: typedEdge.targetType });
+                  kgRelationships.push(typedEdge);
+                }
+              }
+            }
+
+            if (kgEntities.length > 0 || kgRelationships.length > 0) {
+              // Source real persisted chunk ids for this session as evidence,
+              // reusing the same query shape the Zeigarnik block uses below so
+              // the relationship.evidenceChunkIds -> chunks.labile_until join the
+              // reconsolidation dream mode relies on is grounded in real rows.
+              let evidenceIds: string[] = [];
+              try {
+                evidenceIds = (
+                  this.db
+                    .prepare(
+                      `SELECT id FROM chunks WHERE path = ? AND source = 'sessions' AND created_at >= ? LIMIT 50`,
+                    )
+                    .all(absPath, now - 60000) as Array<{ id: string }>
+                ).map((r) => r.id);
+              } catch {
+                evidenceIds = [];
+              }
+              this.knowledgeGraph.ingestExtraction(kgEntities, kgRelationships, evidenceIds);
+            }
+          } catch (err) {
+            log.debug(`KG extraction from session failed: ${String(err)}`);
+          }
+        }
+
+        // Zeigarnik: scan extracted fact chunks for open loop patterns
+        try {
+          const factIds: string[] = [];
+          const factRows = this.db
+            .prepare(
+              `SELECT id FROM chunks WHERE path = ? AND source = 'sessions' AND created_at >= ? LIMIT 50`,
+            )
+            .all(absPath, now - 60000) as Array<{ id: string }>;
+          for (const r of factRows) {
+            factIds.push(r.id);
+          }
+          if (factIds.length > 0) {
+            scanForOpenLoops(this.db, factIds);
+          }
+        } catch {
+          // Non-critical
+        }
+
+        // Synaptic Tagging: check if any newly created facts are strong enough to capture nearby chunks
+        try {
+          const strongFacts = this.db
+            .prepare(
+              `SELECT id, importance_score FROM chunks
+               WHERE path = ? AND source = 'sessions' AND created_at >= ? AND importance_score >= 0.7
+               LIMIT 10`,
+            )
+            .all(absPath, now - 60000) as Array<{ id: string; importance_score: number }>;
+          for (const sf of strongFacts) {
+            if (shouldTriggerCapture(sf.importance_score)) {
+              captureNearbyWeakChunks(this.db, sf.id);
+            }
+          }
+        } catch {
+          // Non-critical
+        }
+
+        // Update extraction tracking
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO session_extractions (session_path, last_extracted_at, last_extracted_hash, fact_count)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(absPath, now, contentHash, result.facts.length);
+
+        extractedCount += result.facts.length;
+        log.debug(
+          `session extraction: ${result.facts.length} facts from ${path.basename(absPath)}`,
+          {
+            handover: brief.purpose.slice(0, 80),
+            processingTimeMs: result.processingTimeMs,
+          },
+        );
+      } catch (err) {
+        log.debug(`session extraction failed for ${path.basename(absPath)}: ${String(err)}`);
+      }
+    }
+
+    // PLAN-34 Phase 1 tier-2 resolution: answers recorded in EARLIER runs
+    // that survived this run uncontradicted become resolved for good.
+    if (directiveEngine) {
+      try {
+        const resolved = finalizeAnsweredDirectives({
+          engine: directiveEngine,
+          canonicalStore: this.canonicalFactsStore,
+          cutoffTs: runStartTs,
+        });
+        if (resolved > 0) {
+          log.info(`directive resolution: ${resolved} answered question(s) finalized`);
+        }
+      } catch (err) {
+        log.debug(`finalizeAnsweredDirectives failed: ${String(err)}`);
+      }
+    }
+
+    if (extractedCount > 0) {
+      log.info(
+        `session extraction complete: ${extractedCount} facts from ${sessionFiles.length} sessions`,
+      );
+
+      // Plan 7, Phase 8: Invalidate RLM cache — new facts make cached results stale
+      try {
+        const { RLMExecutor: _RLMExecutor } = await import("../agents/rlm/executor.js");
+        // The executor is typically a singleton per agent session; if we can reach it, invalidate.
+        // This is a best-effort invalidation — the tool-level cache will also TTL-expire.
+        (globalThis as Record<string, unknown>).__rlmCacheInvalidation = Date.now();
+      } catch {
+        // Non-critical
+      }
+    }
+  }
+
+  private writeDreamJournal(stats: DreamStats): void {
+    const cycle = stats.cycle;
+    const date = new Date(cycle.startedAt);
+    const dateStr = date.toLocaleString("en-US", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    });
+
+    const modes = cycle.modesUsed?.join(", ") || "none";
+    const hormones = this.hormonalManager?.getState();
+    const mood = hormones ? describeHormonalMood(hormones) : "unknown";
+    const hormonalStr = hormones
+      ? `dopamine: ${hormones.dopamine.toFixed(2)}, cortisol: ${hormones.cortisol.toFixed(2)}, oxytocin: ${hormones.oxytocin.toFixed(2)}`
+      : "unavailable";
+
+    const insightSummaries = stats.newInsights
+      .slice(0, 5)
+      .map((i) => `- [${i.mode}] ${i.content.slice(0, 100)}`)
+      .join("\n");
+
+    const entry =
+      `\n## Dream Cycle — ${dateStr}\n` +
+      `**Modes:** ${modes}\n` +
+      `**Mood:** ${mood} (${hormonalStr})\n` +
+      `Processed ${cycle.chunksAnalyzed} memory chunks across ${cycle.modesUsed?.length ?? 0} modes. ` +
+      `Generated ${cycle.insightsGenerated} new insights. ` +
+      `Used ${cycle.llmCallsUsed} LLM calls.\n` +
+      (insightSummaries ? `\n**Insights:**\n${insightSummaries}\n` : "") +
+      `\n---\n`;
+
+    const journalDir = path.join(this.workspaceDir, "memory");
+    if (!existsSync(journalDir)) {
+      mkdirSync(journalDir, { recursive: true });
+    }
+    const journalPath = path.join(journalDir, "dream-journal.md");
+    if (!existsSync(journalPath)) {
+      appendFileSync(
+        journalPath,
+        "# Dream Journal\n\nAutomatically generated dream cycle narratives.\n",
+      );
+    }
+    appendFileSync(journalPath, entry);
+  }
+
+  private appendDreamJournalLine(line: string): void {
+    try {
+      const journalPath = path.join(this.workspaceDir, "memory", "dream-journal.md");
+      if (existsSync(journalPath)) {
+        appendFileSync(journalPath, `${line}\n`);
+      }
+    } catch {
+      // Non-critical
+    }
+  }
+
+  // --- RLM Working Memory Rewriter ---
+
+  /**
+   * Rewrite MEMORY.md as an RLM state update after a dream cycle.
+   * First cycle is conservative (appends a dream-generated section).
+   * Subsequent cycles perform full state updates.
+   */
+  /** Serializes rewrites: dream cycles and event flushes must not interleave. */
+  private workingMemoryRewriteLock: Promise<void> = Promise.resolve();
+
+  private rewriteWorkingMemory(stats: DreamStats): Promise<void> {
+    const run = this.workingMemoryRewriteLock.then(() => this.rewriteWorkingMemoryInner(stats));
+    // The lock chain must survive a failed rewrite
+    this.workingMemoryRewriteLock = run.catch(() => {});
+    return run;
+  }
+
+  private async rewriteWorkingMemoryInner(stats: DreamStats): Promise<void> {
+    const memoryMdPath = path.join(this.workspaceDir, "MEMORY.md");
+    const scratchPath = path.join(this.workspaceDir, "memory", "scratch.md");
+
+    // Read current state
+    let oldState = "";
+    try {
+      oldState = await fs.readFile(memoryMdPath, "utf-8");
+    } catch {
+      // No MEMORY.md yet — first synthesis will create it
+    }
+
+    // Read scratch buffer
+    let scratchNotes = "";
+    try {
+      scratchNotes = await fs.readFile(scratchPath, "utf-8");
+    } catch {
+      // No scratch file — that's fine
+    }
+
+    // Determine if this is the first dream-generated rewrite
+    const isFirstSynthesis = !oldState.includes("# Working Memory State");
+    const hasUserContent = oldState.trim().length > 0 && isFirstSynthesis;
+
+    // Query recent high-importance crystals with type diversity
+    const recentCrystals = this.getRecentHighImportanceCrystals(50);
+
+    // Query dream insights from this cycle
+    const dreamInsights = stats.newInsights.map((i) => ({
+      content: i.content,
+      mode: String(i.mode),
+      confidence: i.confidence,
+    }));
+
+    // Query curiosity targets
+    const curiosityTargets = this.getCuriosityTargetsForSynthesis();
+
+    // Query emerging skill patterns
+    const emergingSkills = this.getEmergingSkillsForSynthesis();
+
+    // Get hormonal state
+    const hormones = this.hormonalManager?.getState() ?? null;
+    const trajectory = this.hormonalManager?.emotionalTrajectory();
+    const hormonalState = hormones
+      ? {
+          dopamine: hormones.dopamine,
+          cortisol: hormones.cortisol,
+          oxytocin: hormones.oxytocin,
+          mood: describeHormonalMood(hormones),
+          trends: trajectory
+            ? {
+                dopamine: trajectory.trend === "stable" ? undefined : trajectory.trend,
+                cortisol: trajectory.trend === "stable" ? undefined : trajectory.trend,
+                oxytocin: trajectory.trend === "stable" ? undefined : trajectory.trend,
+              }
+            : undefined,
+        }
+      : null;
+
+    const timestamp = new Date().toISOString();
+
+    // Parse phenotype constraints from GENOME.md
+    let phenotypeConstraints: string[] | undefined;
+    let temperament: WorkingMemoryContext["temperament"];
+    try {
+      const genomePath = path.join(this.workspaceDir, "GENOME.md");
+      const genomeContent = await fs.readFile(genomePath, "utf-8");
+      const { parsePhenotypeConstraints, parseGenomeTemperament } =
+        await import("./genome-parser.js");
+      phenotypeConstraints = parsePhenotypeConstraints(genomeContent);
+      temperament = parseGenomeTemperament(genomeContent) ?? undefined;
+    } catch {
+      // No GENOME.md — no constraints
+    }
+
+    const networkIdentity = this.getNetworkIdentityForSynthesis();
+
+    // Enrich network identity with economic data from marketplace
+    if (networkIdentity && this.marketplaceEconomics) {
+      try {
+        const economics = this.marketplaceEconomics.getEconomicSummary();
+        networkIdentity.economics = economics;
+      } catch (err) {
+        log.debug(`Failed to get economic summary: ${String(err)}`);
+      }
+    }
+
+    // Collect emotional anchors for dream context
+    const emotionalAnchors =
+      this.hormonalManager
+        ?.getAnchors()
+        .slice(0, 5)
+        .map((a) => ({
+          label: a.label,
+          description: a.description,
+          state: a.state,
+          createdAt: a.createdAt,
+          recallCount: a.recallCount,
+        })) ?? [];
+
+    // Gather user preferences for The Bond enrichment
+    const userPreferences = this.userModelManager
+      ? this.userModelManager
+          .getUserProfile()
+          .preferences.slice(0, 15)
+          .map((p) => ({
+            category: p.category,
+            key: p.key,
+            value: p.value,
+            confidence: p.confidence,
+          }))
+      : undefined;
+
+    const ctx: WorkingMemoryContext = {
+      oldState: isFirstSynthesis ? "" : oldState,
+      scratchNotes,
+      recentCrystals,
+      dreamInsights,
+      curiosityTargets,
+      emergingSkills,
+      hormonalState,
+      timestamp,
+      maturity: this.curiosityEngine?.getMaturity() ?? 0,
+      alpha: this.curiosityEngine?.getCurrentAlpha() ?? -3.0,
+      phenotypeConstraints,
+      temperament,
+      networkIdentity,
+      compute: this.computeFactsForSynthesis(),
+      emotionalAnchors,
+      userPreferences,
+      ...loadCanonicalSynthesisContext(this.db, this.canonicalFactsStore),
+    };
+
+    let newState: string;
+    let usedHeuristicFallback = false;
+    let validationSummary: WorkingMemoryProvenance["validation"] = null;
+
+    // Try LLM synthesis first — prefer synthesisLlmCall (stronger model) over llmCall
+    const dreamCfg = this.cfg.memory?.dream;
+    const synthesisCall = this.dreamSynthesisLlmCall ?? this.dreamLlmCall;
+    if (synthesisCall) {
+      try {
+        const { raw, validation, attempts } = await synthesizeValidatedWorkingMemory(
+          ctx,
+          synthesisCall,
+        );
+        if (attempts > 1) {
+          log.info("RLM synthesis required a validation repair attempt");
+        }
+        validationSummary = {
+          collapsed: validation.collapsed,
+          valid: validation.valid,
+          warnings: validation.warnings.length,
+          bondDriftRatio: validation.bondDriftRatio,
+        };
+        if (validation.collapsed) {
+          log.warn(
+            `RLM synthesis collapsed: ${validation.collapseReason}; using heuristic fallback`,
+          );
+          newState = buildHeuristicWorkingMemory(ctx);
+          usedHeuristicFallback = true;
+        } else if (validation.valid) {
+          newState = raw;
+          if (validation.warnings.length > 0) {
+            log.debug(`RLM synthesis warnings: ${validation.warnings.join("; ")}`);
+          }
+          if (validation.bondDriftRatio !== undefined && validation.bondDriftRatio < 0.5) {
+            log.warn(
+              `Bond drift detected: ${Math.round(validation.bondDriftRatio * 100)}% term retention`,
+            );
+          }
+        } else {
+          log.warn(
+            `RLM synthesis missing sections: ${validation.missing.join(", ")}; using heuristic fallback`,
+          );
+          newState = buildHeuristicWorkingMemory(ctx);
+          usedHeuristicFallback = true;
+        }
+      } catch (err) {
+        log.warn(`RLM LLM synthesis failed: ${String(err)}; using heuristic fallback`);
+        newState = buildHeuristicWorkingMemory(ctx);
+        usedHeuristicFallback = true;
+      }
+    } else {
+      newState = buildHeuristicWorkingMemory(ctx);
+      usedHeuristicFallback = true;
+    }
+
+    // PLAN-55 Phase 2: owner-marked MEMORY.md blocks survive the rewrite
+    // verbatim, and the model can never add one: on the first synthesis the
+    // previous content (owner blocks included) is kept above the new state.
+    newState = isFirstSynthesis
+      ? stripOwnerSections(newState)
+      : preserveOwnerSections(oldState, newState);
+
+    // Conservative first cycle: append below existing user content
+    const finalContent = hasUserContent
+      ? oldState.trimEnd() +
+        "\n\n---\n\n" +
+        "<!-- Dream-generated working memory follows. Subsequent dream cycles will gradually integrate the above content. -->\n\n" +
+        newState
+      : newState;
+
+    // Snapshot the previous state + record provenance before overwriting, so
+    // every state-vector update is evidence-backed and reversible.
+    await snapshotWorkingMemory(this.workspaceDir, oldState, {
+      event: "rewrite",
+      trigger: stats.cycle.cycleId,
+      synthesisModel: dreamCfg?.synthesisModel || dreamCfg?.model || "heuristic",
+      wasHeuristicFallback: usedHeuristicFallback,
+      validation: validationSummary,
+      lengthBefore: oldState.length,
+      lengthAfter: finalContent.length,
+    });
+
+    await fs.writeFile(memoryMdPath, finalContent, "utf-8");
+    // PLAN-54: the Curiosity Gaps the rewrite just wrote are the best
+    // questions the agent has; queue the new ones for research.
+    void this.ingestCuriosityGaps(finalContent).catch((err) =>
+      log.debug(`curiosity gap ingest failed: ${String(err)}`),
+    );
+    if (hasUserContent) {
+      log.info(
+        "RLM: first synthesis — appended dream-generated section below existing MEMORY.md content",
+      );
+    } else {
+      log.info("RLM: wrote updated working memory state to MEMORY.md");
+    }
+
+    // Quality metrics for monitoring synthesis degradation over time
+    const qualityMetrics = {
+      timestamp: Date.now(),
+      sectionsPresent: WORKING_MEMORY_SECTIONS.filter((s) => newState.includes(s)).length,
+      totalSections: WORKING_MEMORY_SECTIONS.length,
+      totalLength: newState.length,
+      tokenEstimate: Math.ceil(newState.length / 4),
+      crystalPointerCount: (newState.match(/→ search:/g) || []).length,
+      diffFromPrevious: oldState
+        ? Math.abs(newState.length - oldState.length) / Math.max(oldState.length, 1)
+        : 1,
+      synthesisModel: dreamCfg?.synthesisModel || dreamCfg?.model || "heuristic",
+      wasHeuristicFallback: usedHeuristicFallback,
+    };
+    log.info("RLM quality metrics", qualityMetrics);
+
+    // Append quality summary to dream journal
+    const qualitySummary = `**Working Memory:** ${qualityMetrics.totalLength} chars, ${qualityMetrics.sectionsPresent}/${qualityMetrics.totalSections} sections, ${qualityMetrics.crystalPointerCount} crystal pointers, ${Math.round(qualityMetrics.diffFromPrevious * 100)}% diff from previous${usedHeuristicFallback ? " (heuristic fallback)" : ""}`;
+    this.appendDreamJournalLine(qualitySummary);
+
+    // Phenotype diff detection — notify user of significant identity evolution
+    const oldPhenotype = extractWorkingMemorySection(oldState, "The Phenotype");
+    const newPhenotype = extractWorkingMemorySection(newState, "The Phenotype");
+    if (oldPhenotype && newPhenotype) {
+      const diffRatio = bigramDiffRatio(oldPhenotype, newPhenotype);
+      if (diffRatio > 0.3) {
+        // >30% structural change — significant identity evolution
+        log.info("Phenotype evolution detected", { diffRatio: Math.round(diffRatio * 100) });
+        this.appendDreamJournalLine(
+          `**Phenotype evolved** (${Math.round(diffRatio * 100)}% change): ${newPhenotype.split("\n")[0]?.slice(0, 100) ?? ""}`,
+        );
+        this.emitEvent?.("phenotype:evolved", {
+          diffRatio,
+          summary: newPhenotype.split("\n")[0]?.slice(0, 200) ?? "",
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    // Index scratch content as crystals before clearing (lossless backup)
+    if (scratchNotes.trim()) {
+      this.indexScratchAsCrystals(scratchNotes);
+      // Clear the scratch buffer — it has been consumed
+      try {
+        await fs.writeFile(
+          scratchPath,
+          "# Scratch Buffer (Working Memory WAL)\n\nUnsynthesized notes — will be consumed by next dream cycle.\n",
+          "utf-8",
+        );
+      } catch {
+        // Non-critical
+      }
+    }
+  }
+
+  /** Minimum gap between event-triggered working-memory syntheses. */
+  private static readonly EVENT_SYNTHESIS_DEBOUNCE_MS = 10 * 60 * 1000;
+  private lastEventSynthesisAt = 0;
+
+  /**
+   * Event-triggered working-memory synthesis: preserve state at the moment of
+   * context pressure (compaction, session end) instead of waiting for the
+   * next dream tick. Only fires when the scratch WAL has unsynthesized notes,
+   * and is debounced so hook storms can't thrash MEMORY.md.
+   * Returns true when a synthesis ran.
+   */
+  async flushWorkingMemory(reason: string): Promise<boolean> {
+    const now = Date.now();
+    if (now - this.lastEventSynthesisAt < MemoryIndexManager.EVENT_SYNTHESIS_DEBOUNCE_MS) {
+      return false;
+    }
+    let scratch = "";
+    try {
+      scratch = await fs.readFile(path.join(this.workspaceDir, "memory", "scratch.md"), "utf-8");
+    } catch {
+      return false;
+    }
+    // Only note lines count as pending state (the file keeps a header)
+    const pendingNotes = scratch.split("\n").filter((l) => l.trim().startsWith("- [")).length;
+    if (pendingNotes === 0) {
+      return false;
+    }
+    this.lastEventSynthesisAt = now;
+    const stats: DreamStats = {
+      cycle: {
+        cycleId: `event-${reason}-${now}`,
+        startedAt: now,
+        completedAt: now,
+        durationMs: 0,
+        state: "AWAKENING" as const,
+        clustersProcessed: 0,
+        insightsGenerated: 0,
+        chunksAnalyzed: 0,
+        llmCallsUsed: 0,
+        error: null,
+      },
+      newInsights: [],
+    };
+    log.info(`Event-triggered working-memory synthesis (${reason}, ${pendingNotes} notes)`);
+    await this.rewriteWorkingMemory(stats);
+    return true;
+  }
+
+  /** Restore MEMORY.md from a snapshot (latest when no file given). */
+  async restoreWorkingMemory(fileName?: string): Promise<{ restored: string } | { error: string }> {
+    return restoreWorkingMemorySnapshot(this.workspaceDir, fileName);
+  }
+
+  /** List working-memory snapshots, newest first. */
+  async listWorkingMemorySnapshots(): Promise<
+    Array<{ file: string; savedAt: string; bytes: number }>
+  > {
+    return listWorkingMemorySnapshots(this.workspaceDir);
+  }
+
+  /** Read working-memory rewrite provenance records, newest last. */
+  async getWorkingMemoryProvenance(limit = 50): Promise<WorkingMemoryProvenance[]> {
+    return readWorkingMemoryProvenance(this.workspaceDir, limit);
+  }
+
+  /**
+   * PLAN-57 §4.7: the week's compute facts for The Niche, from the local
+   * compute ledger. Undefined when no compute runtime is registered or
+   * nothing happened, so the prompt carries no compute block on such nodes.
+   */
+  private computeFactsForSynthesis(): WorkingMemoryContext["compute"] {
+    try {
+      const runtime = getComputeRuntime();
+      if (!runtime) {
+        return undefined;
+      }
+      const facts = computeNicheFacts({ store: runtime.store, snapshot: getComputeSnapshot() });
+      return hasComputeActivity(facts) ? facts : undefined;
+    } catch (err) {
+      log.debug(`Failed to gather compute facts: ${String(err)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * PLAN-57 §4.7: a finished compute job the agent or owner started, written
+   * as a searchable `episode` chunk. One per (job, status); re-delivery of
+   * the same transition is a no-op.
+   */
+  /**
+   * PLAN-57 §4.7 / Phase 6: register this manager as the compute episode and
+   * nudge sink unless a live manager already holds them. Runs on every
+   * `get()`, whatever the caller's purpose: the cached instance is shared
+   * across purposes and the first build on a gateway is usually a status
+   * probe (health refresh, hormonal accessor). Gating on the builder's
+   * purpose left the sinks unregistered for the whole process, so finished
+   * jobs never became memory on a live node.
+   */
+  ensureComputeSinks(cfg: Pick<BitterbotConfig, "compute">): void {
+    if (this.closed || cfg.compute?.enabled === false) {
+      return;
+    }
+    if (!getComputeEpisodeSink()) {
+      this.episodeSink = (episode) => this.writeComputeEpisodeChunk(episode);
+      registerComputeEpisodeSink(this.episodeSink);
+    }
+    if (cfg.compute?.awareness?.nudges !== false && !getComputeNudgeSink()) {
+      this.nudgeSink = (nudge) =>
+        this.hormonalManager?.stimulate(
+          nudge.kind === "success" ? "compute_success" : "compute_setback",
+        );
+      registerComputeNudgeSink(this.nudgeSink);
+    }
+  }
+
+  async writeComputeEpisodeChunk(episode: ComputeEpisode): Promise<string | null> {
+    if (this.closed) {
+      return null;
+    }
+    const text = formatComputeEpisode(episode);
+    const id = `compute_${episode.jobId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80)}_${episode.status}`;
+    const existing = this.db.prepare(`SELECT 1 FROM chunks WHERE id = ?`).get(id);
+    if (existing) {
+      return null;
+    }
+    const now = Date.now();
+    const hash = crypto.createHash("sha256").update(text).digest("hex");
+    const source = this.sources.has("memory") ? "memory" : ([...this.sources][0] ?? "memory");
+    let embedding: number[] = [];
+    try {
+      embedding =
+        ((await this.embedQueryWithTimeout(text, USAGE_FEATURES.memoryIndex)) as number[]) ?? [];
+    } catch {
+      /* pending backfill */
+    }
+    const model = embedding.length > 0 ? this.provider.model : "pending";
+    const vectorReady =
+      embedding.length > 0 ? await this.ensureVectorReady(embedding.length) : false;
+    const chunkPath = `compute/episode/${episode.jobId}`;
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO chunks (id, path, source, start_line, end_line, text, hash, model, embedding,
+             importance_score, lifecycle, origin, semantic_type, access_count, created_at, updated_at)
+           VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, 0.5, 'activated', 'compute', 'episode', 0, ?, ?)`,
+        )
+        .run(id, chunkPath, source, text, hash, model, embeddingToBlob(embedding), now, now);
+    } catch (err) {
+      log.debug(`compute episode insert failed: ${String(err)}`);
+      return null;
+    }
+    if (vectorReady && embedding.length > 0) {
+      try {
+        this.db.prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`).run(id);
+        this.db
+          .prepare(`INSERT INTO ${VECTOR_TABLE} (id, embedding) VALUES (?, ?)`)
+          .run(id, Buffer.from(new Float32Array(embedding).buffer));
+      } catch {
+        /* vec absent */
+      }
+    }
+    if (this.fts.enabled && this.fts.available) {
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO ${FTS_TABLE} (text, id, path, source, model, start_line, end_line)
+             VALUES (?, ?, ?, ?, ?, 0, 0)`,
+          )
+          .run(text, id, chunkPath, source, model);
+      } catch {
+        /* fts absent */
+      }
+    }
+    return id;
+  }
+
+  /**
+   * Gather P2P network identity data for The Niche section of working memory.
+   * Queries published skills, imported skills, peer count, and reputation.
+   */
+  private getNetworkIdentityForSynthesis(): WorkingMemoryContext["networkIdentity"] {
+    if (!this.skillNetworkBridge) {
+      return undefined;
+    }
+
+    try {
+      // Published skills with marketplace download counts
+      const published = this.db
+        .prepare(
+          `SELECT c.text, c.id, COALESCE(ml.download_count, 0) as download_count
+           FROM chunks c
+           LEFT JOIN marketplace_listings ml ON ml.skill_crystal_id = c.id
+           WHERE c.publish_visibility = 'shared'
+             AND c.published_at IS NOT NULL
+             AND c.semantic_type IN ('skill', 'task_pattern')
+           ORDER BY c.published_at DESC
+           LIMIT 20`,
+        )
+        .all() as Array<{ text: string; id: string; download_count: number }>;
+
+      const publishedSkills = published.map((row) => {
+        const name = row.text.slice(0, 80).split("\n")[0]!.trim();
+        return { name, consumedBy: row.download_count };
+      });
+
+      // Imported skills: chunks with provenance from peers
+      const imported = this.db
+        .prepare(
+          `SELECT text, provenance_dag FROM chunks
+           WHERE provenance_dag IS NOT NULL
+             AND provenance_dag != '[]'
+             AND semantic_type IN ('skill', 'task_pattern')
+           ORDER BY created_at DESC
+           LIMIT 20`,
+        )
+        .all() as Array<{ text: string; provenance_dag: string }>;
+
+      const importedSkills = imported.map((row) => {
+        const name = row.text.slice(0, 80).split("\n")[0]!.trim();
+        let fromPeer = "unknown";
+        try {
+          const dag = JSON.parse(row.provenance_dag);
+          if (Array.isArray(dag) && dag[0]?.peer) {
+            fromPeer = dag[0].peer.slice(0, 16);
+          }
+        } catch {
+          /* ignore parse errors */
+        }
+        return { name, fromPeer };
+      });
+
+      // Peer count and own reputation score from reputation manager
+      let peerCount = 0;
+      let reputationScore: number | undefined;
+      try {
+        const peers = this.db.prepare(`SELECT COUNT(*) as c FROM peer_reputation`).get() as
+          | { c: number }
+          | undefined;
+        peerCount = peers?.c ?? 0;
+        if (peerCount > 0) {
+          reputationScore = this.getOwnReputationScore();
+        }
+      } catch {
+        /* table may not exist */
+      }
+
+      return {
+        publishedSkills,
+        importedSkills,
+        peerCount,
+        reputationScore,
+      };
+    } catch (err) {
+      log.debug(`Failed to gather network identity: ${String(err)}`);
+      return undefined;
+    }
+  }
+
+  /**
+  /**
+   * Check if a "First Breath" micro-cycle should fire.
+   * Triggers when:
+   *   1. MEMORY.md has no Phenotype section (never synthesized)
+   *   2. Scratch buffer has meaningful content (>=500 chars or >=5 note entries)
+   *   3. No dream cycle is currently running
+   *   4. At least 1 conversational turn has been indexed
+   *
+   * This ensures new users get a real Phenotype in minutes after onboarding,
+   * not after the first 2-hour dream cycle timer fires.
+   */
+  private async shouldTriggerFirstBreath(): Promise<boolean> {
+    // Check if Phenotype already exists in MEMORY.md
+    try {
+      const memoryMd = await fs.readFile(path.join(this.workspaceDir, "MEMORY.md"), "utf-8");
+      if (memoryMd.includes("## The Phenotype")) {
+        return false;
+      }
+    } catch {
+      // No MEMORY.md yet — that's fine, might need first breath
+    }
+
+    // Check scratch buffer density
+    try {
+      const scratch = await fs.readFile(
+        path.join(this.workspaceDir, "memory", "scratch.md"),
+        "utf-8",
+      );
+      const noteCount = (scratch.match(/^- \[/gm) || []).length;
+      if (scratch.length < 500 && noteCount < 5) {
+        return false;
+      }
+    } catch {
+      return false; // No scratch → no content to synthesize
+    }
+
+    // Check that a dream cycle isn't already running
+    const dreamStatus = this.dreamEngine?.status();
+    if (dreamStatus && dreamStatus.state !== "DORMANT") {
+      return false;
+    }
+
+    return true;
+  }
+
+  /** Optional event emitter for phenotype evolution notifications, etc. */
+  private emitEvent?: (event: string, data: Record<string, unknown>) => void;
+
+  /** Set event emitter callback for phenotype evolution and other identity events. */
+  setEventEmitter(fn: (event: string, data: Record<string, unknown>) => void): void {
+    this.emitEvent = fn;
+  }
+
+  /**
+   * Remove skill chunks from the DB whose source SKILL.md files no longer exist on disk.
+   * Called during watch-triggered sync to prevent filesystem→DB drift.
+   * Only affects chunks with semantic_type = 'skill' or 'task_pattern' that were
+   * indexed from a file path (not dream-originated or session-originated).
+   */
+  cleanupOrphanedSkillChunks(): number {
+    try {
+      const skillChunks = this.db
+        .prepare(
+          `SELECT id, path FROM chunks
+         WHERE semantic_type IN ('skill', 'task_pattern')
+           AND path IS NOT NULL
+           AND path != ''
+           AND COALESCE(lifecycle, 'generated') != 'expired'`,
+        )
+        .all() as Array<{ id: string; path: string }>;
+
+      if (skillChunks.length === 0) {
+        return 0;
+      }
+
+      let removed = 0;
+
+      for (const chunk of skillChunks) {
+        if (!existsSync(chunk.path)) {
+          setChunkLifecycle(this.db, chunk.id, {
+            lifecycle: "expired",
+            lifecycleState: "forgotten",
+          });
+          removed++;
+        }
+      }
+
+      if (removed > 0) {
+        log.info(
+          `Cleaned up ${removed} orphaned skill chunk(s) — source files no longer exist on disk`,
+        );
+      }
+
+      return removed;
+    } catch (err) {
+      log.warn(`Failed to clean up orphaned skill chunks: ${String(err)}`);
+      return 0;
+    }
+  }
+
+  /** Get the agent's own reputation score (0-1) for marketplace pricing. */
+  private getOwnReputationScore(): number {
+    // Default 0.5 for agents with no external reputation.
+    // Uses network average as rough proxy for own standing.
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT AVG(reputation_score) as avg_rep FROM peer_reputation WHERE reputation_score > 0`,
+        )
+        .get() as { avg_rep: number | null } | undefined;
+      // Use network average as rough proxy for own standing; default 0.5
+      return row?.avg_rep ?? 0.5;
+    } catch {
+      return 0.5;
+    }
+  }
+
+  /** Public accessor for marketplace economics (used by A2A, dashboard, etc.) */
+  getMarketplaceEconomics(): MarketplaceEconomics | null {
+    return this.marketplaceEconomics;
+  }
+
+  /**
+   * Public accessor for the SQLite handle that holds the circle/mailbox tables
+   * (the memory DB). Deliberately INDEPENDENT of `marketplaceEconomics`:
+   * circle delivery, inbound serve, and mailbox-serve must not silently die
+   * when `a2a.marketplace` is disabled (PLAN-36 §1/§7 Phase 0 — the coupling
+   * used to route through `getMarketplaceEconomics().getDb()`, which is null
+   * with the marketplace off).
+   */
+  getCirclesDb(): DatabaseSync {
+    return this.db;
+  }
+
+  /**
+   * SQLite handle for the payments tables (spend grants, approvals, usage).
+   * Independent of `marketplaceEconomics` for the same reason as
+   * `getCirclesDb()`: `a2a.marketplace.enabled` defaults to false since
+   * PLAN-41 D-D, but spend grants (PLAN-48) gate `a2a.payment`, not the
+   * marketplace, and the agent-side client already writes them to this DB.
+   */
+  getPaymentsDb(): DatabaseSync {
+    return this.db;
+  }
+
+  /** PLAN-43 Phase 4: contributor standings (status, never cash). */
+  getContributorStatus(): ContributorStatusLedger | undefined {
+    return this.contributorStatus;
+  }
+
+  /** PLAN-43 Phase 4: lets the circles side subscribe to bans (R17: memory never touches circle tables). */
+  getPeerReputationManager(): PeerReputationManager | null {
+    return this.peerReputationManager;
+  }
+
+  /** Guards against overlapping dispatch runs across consolidation ticks. */
+  private revenueDispatchInFlight = false;
+
+  /**
+   * Plan 8, Phase 1: dispatch released revenue-share payments onchain.
+   *
+   * Recipients without a known wallet address stay in 'released' status and
+   * retry on later ticks — their address can arrive any time via
+   * wallet_capability gossip. Send failures also return to 'released' (via
+   * markPaymentFailed) so transient RPC errors self-heal. Per-tick dispatch
+   * is capped so a backlog cannot turn one tick into a mass payout run.
+   */
+  private async dispatchReleasedPayments(): Promise<void> {
+    if (!this.marketplaceEconomics || this.revenueDispatchInFlight) {
+      return;
+    }
+    const walletCfg = this.cfg.tools?.wallet;
+    const hasWalletCreds = Boolean(
+      (walletCfg?.cdpApiKeyId ?? process.env.CDP_API_KEY_ID) &&
+      (walletCfg?.cdpApiKeySecret ?? process.env.CDP_API_KEY_SECRET) &&
+      process.env.CDP_WALLET_SECRET,
+    );
+    // A wallet pays only when it was switched on. This used to pay whenever
+    // credentials were present and the wallet was not explicitly switched off.
+    if (walletCfg?.enabled !== true || !hasWalletCreds) {
+      return;
+    }
+    const payments = this.marketplaceEconomics.getReleasedPayments();
+    if (payments.length === 0) {
+      return;
+    }
+    this.revenueDispatchInFlight = true;
+    try {
+      const [{ createWalletService }, { getPeerWalletCapability }] = await Promise.all([
+        import("../services/wallet-service.js"),
+        import("../infra/wallet-discovery.js"),
+      ]);
+      const [{ gatedWallet }, { notifyOwner }] = await Promise.all([
+        import("../review/spend.js"),
+        import("../infra/owner-notify.js"),
+      ]);
+      // PLAN-53 C0: payouts are money already owed, so they do not wait for
+      // approval. They do go through the gate: recorded, limited, and the
+      // owner is told what went out.
+      const wallet = gatedWallet(createWalletService(walletCfg), {
+        origin: "payout",
+        purpose: "revenue share / bounty payout",
+      });
+      const perTxCap = walletCfg.perTransactionCapUsd ?? 25;
+      const paid: Array<{ usd: number; role: string }> = [];
+      const MAX_DISPATCH_PER_TICK = 10;
+      for (const payment of payments.slice(0, MAX_DISPATCH_PER_TICK)) {
+        const address =
+          this.marketplaceEconomics.resolvePeerWalletAddress(payment.recipientPeerId) ??
+          getPeerWalletCapability(payment.recipientPeerId)?.address ??
+          null;
+        if (!address) {
+          log.debug(
+            `revenue dispatch: no wallet address for ${payment.recipientPeerId}; payment ${payment.id} stays queued`,
+          );
+          continue;
+        }
+        if (payment.amountUsdc > perTxCap) {
+          // Sending it would be refused by the per-transaction limit, the
+          // payment marked failed, and the same thing would happen every tick
+          // for ever. Leave it queued and say so once a day.
+          void notifyOwner({
+            kind: "payout-held",
+            dedupeKey: `payout-over-cap:${payment.id}:${new Date().toISOString().slice(0, 10)}`,
+            text:
+              `A payout of $${payment.amountUsdc.toFixed(2)} USDC (${payment.role}) to ${payment.recipientPeerId} is above your per-transaction limit of $${perTxCap} and is waiting. ` +
+              "Raise tools.wallet.perTransactionCapUsd to let it go out.",
+          }).catch(() => {});
+          continue;
+        }
+        try {
+          const result = await wallet.sendUsdc(address, payment.amountUsdc);
+          paid.push({ usd: payment.amountUsdc, role: payment.role });
+          this.marketplaceEconomics.markPaymentProcessed(payment.id, result.txHash);
+          log.info(
+            `revenue dispatch: paid ${payment.amountUsdc.toFixed(4)} USDC (${payment.role}) to ${address} tx=${result.txHash}`,
+          );
+          this.appendDreamJournalLine(
+            `**Revenue share:** paid $${payment.amountUsdc.toFixed(4)} USDC to ${payment.recipientPeerId} (${payment.role})`,
+          );
+        } catch (err) {
+          this.marketplaceEconomics.markPaymentFailed(payment.id, String(err));
+          log.warn(`revenue dispatch failed for payment ${payment.id}: ${String(err)}`);
+        }
+      }
+      if (paid.length > 0) {
+        const total = paid.reduce((sum, p) => sum + p.usd, 0);
+        const roles = [...new Set(paid.map((p) => p.role))].join(", ");
+        void notifyOwner({
+          kind: "payout-sent",
+          text:
+            `Paid out $${total.toFixed(2)} USDC in ${paid.length} payment${paid.length === 1 ? "" : "s"} owed to others (${roles}). ` +
+            "Each one is in the Activity record.",
+        }).catch(() => {});
+      }
+    } catch (err) {
+      log.debug(`revenue dispatch skipped: ${String(err)}`);
+    } finally {
+      this.revenueDispatchInFlight = false;
+    }
+  }
+
+  /** Plan 8, Phase 2: Public accessor for SkillMarketplace. */
+  getSkillMarketplace(): SkillMarketplace | null {
+    return this.skillMarketplace;
+  }
+
+  private getRecentHighImportanceCrystals(limit: number): WorkingMemoryContext["recentCrystals"] {
+    const deriveHormonalTag = (
+      valence: number | null,
+      semanticType: string | null,
+    ): string | undefined => {
+      if (valence !== null && valence > 0.3) {
+        return "dopamine";
+      }
+      if (valence !== null && valence < -0.3) {
+        return "cortisol";
+      }
+      if (semanticType === "relationship") {
+        return "oxytocin";
+      }
+      return undefined;
+    };
+
+    try {
+      // Pull diverse crystals per semantic_type with recency-boosted ordering
+      const typeBudgets: Array<{ type: string; budget: number }> = [
+        { type: "episode", budget: 15 },
+        { type: "preference", budget: 10 },
+        { type: "task_pattern", budget: 10 },
+        { type: "goal", budget: 5 },
+        { type: "relationship", budget: 5 },
+        { type: "fact", budget: 5 },
+      ];
+
+      // Get max updated_at for recency normalization
+      const maxRow = this.db
+        .prepare(`SELECT MAX(updated_at) as m FROM chunks WHERE importance_score >= 0.3`)
+        .get() as { m: number | null } | undefined;
+      const maxUpdated = maxRow?.m ?? Date.now();
+
+      const results: WorkingMemoryContext["recentCrystals"] = [];
+      const seenIds = new Set<string>();
+
+      for (const { type, budget } of typeBudgets) {
+        const rows = this.db
+          .prepare(
+            `SELECT id, text, semantic_type, importance_score, updated_at, emotional_valence FROM chunks
+             WHERE importance_score >= 0.3
+               AND (semantic_type = ? OR (? = 'episode' AND semantic_type IS NULL))
+             ORDER BY (importance_score * 0.6 + (CAST(updated_at AS REAL) / MAX(?, 1)) * 0.4 + ABS(COALESCE(emotional_valence, 0)) * 0.1) DESC
+             LIMIT ?`,
+          )
+          .all(type, type, maxUpdated, budget) as Array<{
+          id: string;
+          text: string;
+          semantic_type: string | null;
+          importance_score: number;
+          updated_at: number;
+          emotional_valence: number | null;
+        }>;
+        for (const r of rows) {
+          if (!seenIds.has(r.id)) {
+            seenIds.add(r.id);
+            results.push({
+              text: r.text,
+              semanticType: r.semantic_type ?? "general",
+              importanceScore: r.importance_score,
+              hormonalTag: deriveHormonalTag(r.emotional_valence, r.semantic_type),
+            });
+          }
+        }
+      }
+
+      // Fill remaining slots with any high-importance crystals not yet included
+      if (results.length < limit) {
+        const remaining = limit - results.length;
+        const fillRows = this.db
+          .prepare(
+            `SELECT id, text, semantic_type, importance_score, emotional_valence FROM chunks
+             WHERE importance_score >= 0.3
+             ORDER BY updated_at DESC LIMIT ?`,
+          )
+          .all(remaining + seenIds.size) as Array<{
+          id: string;
+          text: string;
+          semantic_type: string | null;
+          importance_score: number;
+          emotional_valence: number | null;
+        }>;
+        for (const r of fillRows) {
+          if (results.length >= limit) {
+            break;
+          }
+          if (!seenIds.has(r.id)) {
+            seenIds.add(r.id);
+            results.push({
+              text: r.text,
+              semanticType: r.semantic_type ?? "general",
+              importanceScore: r.importance_score,
+              hormonalTag: deriveHormonalTag(r.emotional_valence, r.semantic_type),
+            });
+          }
+        }
+      }
+
+      return results.slice(0, limit);
+    } catch {
+      return [];
+    }
+  }
+
+  private getCuriosityTargetsForSynthesis(): WorkingMemoryContext["curiosityTargets"] {
+    const state = this.curiosityState();
+    if (!state) {
+      return [];
+    }
+    return state.targets
+      .filter((t) => t.resolvedAt === null)
+      .toSorted((a, b) => b.priority - a.priority)
+      .slice(0, 5)
+      .map((t) => ({ description: t.description, priority: t.priority }));
+  }
+
+  private getEmergingSkillsForSynthesis(): WorkingMemoryContext["emergingSkills"] {
+    // Query skill-type crystals enriched with execution metrics (success rate, exec count)
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT c.text, c.importance_score, c.access_count,
+                  COUNT(se.id) as exec_count,
+                  COALESCE(AVG(CASE WHEN se.run_outcome_label = 'pass' THEN 1.0 ELSE 0.0 END), 0) as success_rate
+           FROM chunks c
+           LEFT JOIN skill_executions se ON se.skill_crystal_id = c.id AND se.completed_at IS NOT NULL
+             AND ${runEvidenceWhere("se")}
+           WHERE c.semantic_type IN ('skill', 'task_pattern')
+           GROUP BY c.id
+           ORDER BY c.access_count DESC, c.importance_score DESC
+           LIMIT 5`,
+        )
+        .all() as Array<{
+        text: string;
+        importance_score: number;
+        access_count: number;
+        exec_count: number;
+        success_rate: number;
+      }>;
+      return rows
+        .filter((r) => r.access_count >= 2)
+        .map((r) => ({
+          pattern: r.text.slice(0, 100),
+          confidence: Math.min(1, r.importance_score * (1 + r.success_rate * 0.3)),
+          occurrences: r.access_count + r.exec_count,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  private indexScratchAsCrystals(scratchContent: string): void {
+    // Parse scratch entries. Format: "- [timestamp] (importance: N) content"
+    // Also accept lines that are just "- [timestamp] content" without importance.
+    // Skip header lines, blank lines, and anything that doesn't look like an entry.
+    const lines = scratchContent.split("\n").filter((l) => {
+      const trimmed = l.trimStart();
+      return trimmed.startsWith("- [") && /^- \[\d{4}-/.test(trimmed);
+    });
+    const now = Date.now();
+    for (const line of lines.slice(0, 20)) {
+      try {
+        // Strip the "- [timestamp] (importance: N) " prefix to get the note content
+        const text = line
+          .replace(/^-\s*\[[^\]]*\]\s*/, "") // remove "- [timestamp] "
+          .replace(/^\(importance:\s*[\d.]+\)\s*/, "") // remove optional "(importance: N) "
+          .trim();
+        if (!text || text.length < 10) {
+          continue;
+        }
+        const id = `scratch_${crypto.randomUUID()}`;
+        const hash = crypto.createHash("sha256").update(text).digest("hex");
+        // Note: chunks table requires model + embedding (NOT NULL). We insert placeholder
+        // values since scratch crystals exist for searchability, not embedding-based retrieval.
+        // They'll get real embeddings on the next sync cycle's backfill pass.
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO chunks (id, path, source, start_line, end_line, text, hash,
+             model, embedding,
+             importance_score, lifecycle, semantic_type, access_count, last_accessed_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            id,
+            "memory/scratch.md",
+            "memory",
+            0,
+            0,
+            text,
+            hash,
+            "pending",
+            "[]",
+            0.7,
+            "generated",
+            "episode",
+            0,
+            null,
+            now,
+            now,
+          );
+      } catch {
+        // Non-critical — scratch content survives in MEMORY.md regardless
+      }
+    }
+  }
+
+  /**
+   * Ingest a single scratch note as a crystal for immediate searchability.
+   * Called by the working_memory_note tool.
+   */
+  ingestScratchNote(
+    text: string,
+    importance: number,
+    semanticType?: string,
+    epistemicLayer?: string,
+  ): void {
+    const now = Date.now();
+    const effectiveSemanticType = semanticType ?? "episode";
+    try {
+      const id = `note_${crypto.randomUUID()}`;
+      const hash = crypto.createHash("sha256").update(text).digest("hex");
+      // Note: chunks table requires model + embedding (NOT NULL). We insert placeholder
+      // values since scratch crystals exist for keyword searchability (BM25), not
+      // embedding-based retrieval. They'll get real embeddings on next sync backfill.
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO chunks (id, path, source, start_line, end_line, text, hash,
+           model, embedding,
+           importance_score, lifecycle, semantic_type, epistemic_layer,
+           access_count, last_accessed_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          "memory/scratch.md",
+          "memory",
+          0,
+          0,
+          text,
+          hash,
+          "pending",
+          "[]",
+          importance,
+          "generated",
+          effectiveSemanticType,
+          epistemicLayer ?? null,
+          0,
+          null,
+          now,
+          now,
+        );
+
+      // Route directive-type notes to user preferences for structured storage
+      if (epistemicLayer === "directive" && this.userModelManager) {
+        this.userModelManager.upsertFromDirective({
+          text,
+          confidence: importance,
+          sessionId: "scratch",
+        });
+      }
+    } catch {
+      // Non-critical — note is safely in scratch.md regardless
+    }
+  }
+
+  /**
+   * Auto-generate a scratch note from a high-valence hormonal spike.
+   * Called by the consolidation pipeline when hormones are elevated.
+   * Belt AND suspenders: even if the agent forgets to call working_memory_note,
+   * the hormonal system captures important moments automatically.
+   */
+  private autoScratchFromHormonalSpike(): void {
+    if (!this.hormonalManager) {
+      return;
+    }
+    const state = this.hormonalManager.getState();
+    const scratchPath = path.join(this.workspaceDir, "memory", "scratch.md");
+
+    // Token-efficiency pass (2026-09-19): trigger on a hormonal RISE since the
+    // previous tick, not an absolute level — a pinned hormone wrote an
+    // identical "[AUTO] Hormonal event" note every 30 minutes.
+    const spikes = this.autoScratchTrigger.check(state);
+    const highDopamine = spikes.includes("dopamine_spike");
+    const highCortisol = spikes.includes("cortisol_spike");
+    const highOxytocin = spikes.includes("oxytocin_spike");
+
+    if (!highDopamine && !highCortisol && !highOxytocin) {
+      return;
+    }
+
+    const parts: string[] = [];
+    if (highDopamine) {
+      parts.push("dopamine spike (achievement/breakthrough detected)");
+    }
+    if (highCortisol) {
+      parts.push("cortisol spike (friction/urgency detected)");
+    }
+    if (highOxytocin) {
+      parts.push("oxytocin spike (bonding moment detected)");
+    }
+
+    const briefing = this.hormonalManager.emotionalBriefing?.() ?? "";
+    const eventText = autoScratchEventText(parts);
+    const note = `${AUTO_SCRATCH_PREFIX}${eventText}. ${briefing}`.trim();
+
+    // Dedupe: never append a note whose event equals the previous auto note.
+    try {
+      if (
+        existsSync(scratchPath) &&
+        lastAutoScratchEvent(readFileSync(scratchPath, "utf-8")) === eventText
+      ) {
+        return;
+      }
+    } catch {
+      // Unreadable scratch — fall through and append.
+    }
+
+    const timestamp = new Date().toISOString();
+    const entry = `\n- [${timestamp}] (importance: 0.8) ${note}\n`;
+
+    try {
+      const memoryDir = path.join(this.workspaceDir, "memory");
+      if (!existsSync(memoryDir)) {
+        mkdirSync(memoryDir, { recursive: true });
+      }
+      if (!existsSync(scratchPath)) {
+        appendFileSync(
+          scratchPath,
+          "# Scratch Buffer (Working Memory WAL)\n\nUnsynthesized notes — will be consumed by next dream cycle.\n",
+        );
+      }
+      appendFileSync(scratchPath, entry);
+    } catch {
+      // Non-critical
+    }
+  }
+
+  async dreamSearch(
+    query: string,
+    opts?: { maxResults?: number; minScore?: number },
+  ): Promise<DreamSearchResult[]> {
+    const queryVec = (await this.embedQueryWithTimeout(
+      query,
+      USAGE_FEATURES.memoryDream,
+    )) as number[];
+    return searchDreamInsights(this.db, queryVec, opts);
+  }
+
+  dreamStatus(): Record<string, unknown> {
+    if (!this.dreamEngine) {
+      return { enabled: false };
+    }
+    return this.dreamEngine.status();
+  }
+
+  // --- Hormonal Manager ---
+
+  private ensureHormonalManager(): void {
+    const emotionalCfg = this.cfg.memory?.emotional;
+    if (emotionalCfg?.hormonal?.enabled === false) {
+      return;
+    }
+
+    // Parse GENOME.md for hormonal baseline (overrides default homeostasis)
+    // The config type doesn't include homeostasis, but HormonalStateManager accepts it
+    let hormonalConfig: import("./hormonal.js").HormonalConfig | undefined = emotionalCfg?.hormonal;
+    if (!hormonalConfig?.homeostasis) {
+      try {
+        const { readFileSync } = require("node:fs") as typeof import("node:fs");
+        const genomePath = path.join(this.workspaceDir, "GENOME.md");
+        const genomeContent = readFileSync(genomePath, "utf-8");
+        const { parseGenomeHomeostasis } =
+          require("./genome-parser.js") as typeof import("./genome-parser.js");
+        const parsed = parseGenomeHomeostasis(genomeContent);
+        if (parsed) {
+          hormonalConfig = {
+            ...hormonalConfig,
+            homeostasis: {
+              dopamine: parsed.dopamine ?? 0.15,
+              cortisol: parsed.cortisol ?? 0.02,
+              oxytocin: parsed.oxytocin ?? 0.1,
+            },
+          };
+          log.debug("Parsed hormonal homeostasis from GENOME.md", parsed);
+        }
+      } catch {
+        // No GENOME.md or parse error — use defaults
+      }
+    }
+
+    this.hormonalManager = new HormonalStateManager(hormonalConfig);
+
+    // Wire anchor persistence callbacks
+    this.hormonalManager.setOnAnchorCreated((anchor, triggerEvent) => {
+      this.persistEmotionalAnchor(anchor, triggerEvent);
+    });
+    this.hormonalManager.setOnAnchorRecalled((anchorId) => {
+      this.updateEmotionalAnchorRecall(anchorId);
+    });
+
+    // Load persisted anchors from SQLite
+    this.loadEmotionalAnchors();
+  }
+
+  private loadEmotionalAnchors(): void {
+    if (!this.hormonalManager) {
+      return;
+    }
+    try {
+      const rows = this.db
+        .prepare("SELECT * FROM emotional_anchors ORDER BY created_at DESC LIMIT 20")
+        .all() as Array<{
+        id: string;
+        label: string;
+        description: string;
+        dopamine: number;
+        cortisol: number;
+        oxytocin: number;
+        created_at: number;
+        recall_count: number;
+        last_recalled_at: number | null;
+        associated_crystal_ids: string | null;
+      }>;
+      const anchors = rows.map((row) => ({
+        id: row.id,
+        label: row.label,
+        description: row.description ?? "",
+        state: { dopamine: row.dopamine, cortisol: row.cortisol, oxytocin: row.oxytocin },
+        createdAt: row.created_at,
+        recallCount: row.recall_count ?? 0,
+        lastRecalledAt: row.last_recalled_at ?? undefined,
+        associatedCrystalIds: row.associated_crystal_ids
+          ? JSON.parse(row.associated_crystal_ids)
+          : undefined,
+      }));
+      this.hormonalManager.importAnchors(anchors);
+      if (anchors.length > 0) {
+        log.debug(`loaded ${anchors.length} emotional anchors from SQLite`);
+      }
+    } catch {
+      // Table may not exist yet if migration hasn't run
+    }
+  }
+
+  private persistEmotionalAnchor(
+    anchor: import("./hormonal.js").EmotionalAnchor,
+    triggerEvent?: string,
+  ): void {
+    try {
+      this.db
+        .prepare(`
+        INSERT OR REPLACE INTO emotional_anchors
+          (id, label, description, dopamine, cortisol, oxytocin, created_at, recall_count, trigger_event, associated_crystal_ids)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+        .run(
+          anchor.id,
+          anchor.label,
+          anchor.description,
+          anchor.state.dopamine,
+          anchor.state.cortisol,
+          anchor.state.oxytocin,
+          anchor.createdAt,
+          anchor.recallCount,
+          triggerEvent ?? null,
+          anchor.associatedCrystalIds?.length ? JSON.stringify(anchor.associatedCrystalIds) : null,
+        );
+    } catch {
+      // Non-critical — anchor still exists in memory
+    }
+  }
+
+  private updateEmotionalAnchorRecall(anchorId: string): void {
+    try {
+      this.db
+        .prepare(`
+        UPDATE emotional_anchors
+        SET recall_count = recall_count + 1, last_recalled_at = ?
+        WHERE id = ?
+      `)
+        .run(Date.now(), anchorId);
+    } catch {
+      // Non-critical
+    }
+  }
+
+  /** Create an emotional anchor (public API for agent tools). */
+  createEmotionalAnchor(
+    label: string,
+    description?: string,
+  ): import("./hormonal.js").EmotionalAnchor | null {
+    if (!this.hormonalManager) {
+      return null;
+    }
+    return this.hormonalManager.createAnchor(label, description ?? "", "manual");
+  }
+
+  /** Recall an emotional anchor (public API for agent tools). */
+  recallEmotionalAnchor(anchorId: string, influence?: number): boolean {
+    if (!this.hormonalManager) {
+      return false;
+    }
+    return this.hormonalManager.recallAnchor(anchorId, influence);
+  }
+
+  /** List emotional anchors (public API for agent tools). */
+  listEmotionalAnchors(): import("./hormonal.js").EmotionalAnchor[] {
+    return this.hormonalManager?.getAnchors() ?? [];
+  }
+
+  hormonalState(): { dopamine: number; cortisol: number; oxytocin: number } | null {
+    if (!this.hormonalManager) {
+      return null;
+    }
+    const state = this.hormonalManager.getState();
+    return { dopamine: state.dopamine, cortisol: state.cortisol, oxytocin: state.oxytocin };
+  }
+
+  // --- User Model Manager ---
+
+  private ensureUserModelManager(): void {
+    const emotionalCfg = this.cfg.memory?.emotional;
+    if (emotionalCfg?.userModel?.enabled === false) {
+      return;
+    }
+    this.userModelManager = new UserModelManager(this.db, emotionalCfg?.userModel);
+  }
+
+  userProfile(): import("./user-model.js").UserProfile | null {
+    if (!this.userModelManager) {
+      return null;
+    }
+    return this.userModelManager.getUserProfile();
+  }
+
+  // --- Canonical Facts Ledger (PLAN-33) ---
+
+  /**
+   * PLAN-33 Phase 1: the semantic ledger — exact key-value facts injected
+   * unconditionally into every system prompt. Seeded once from the user
+   * model's identity preferences so existing installs are not born empty.
+   * Disabled via memory.canonicalLedger.enabled = false.
+   */
+  private ensureCanonicalFacts(): void {
+    const ledgerCfg = this.cfg.memory?.canonicalLedger;
+    if (ledgerCfg?.enabled === false) {
+      return;
+    }
+    try {
+      this.canonicalFactsStore = new CanonicalFactsStore(this.db, {
+        maxFacts: ledgerCfg?.maxFacts,
+        budgetTokens: ledgerCfg?.budgetTokens,
+      });
+      this.wireCanonicalPropagation(this.canonicalFactsStore);
+      const prefs = this.userModelManager?.getUserProfile().preferences ?? [];
+      this.canonicalFactsStore.seedFromIdentityPreferences(prefs);
+    } catch (err) {
+      log.warn(`canonical facts ledger init failed: ${String(err)}`);
+      this.canonicalFactsStore = null;
+    }
+  }
+
+  canonicalFacts(): CanonicalFactsStore | null {
+    return this.canonicalFactsStore;
+  }
+
+  /**
+   * PLAN-55 Phase 2: every ledger change is forwarded on the manager's event
+   * bus as `canonical:changed` and queued for the propagation consumers
+   * (search marks, preferences, graph, briefs/tasks, dream insights), which
+   * run after the write, never inside the chat turn.
+   */
+  private wireCanonicalPropagation(store: CanonicalFactsStore): void {
+    this.canonicalPropagation?.close();
+    const propagation = new CanonicalPropagation({
+      getDb: () => this.db,
+      getFtsTable: () => (this.fts.enabled && this.fts.available ? FTS_TABLE : null),
+      getKnowledgeGraph: () => this.knowledgeGraph,
+      getDirectives: () => this.epistemicDirectiveEngine,
+      getWorkspaceDir: () => this.workspaceDir,
+    });
+    this.canonicalPropagation = propagation;
+    // Replays changes a shutdown or queue overflow left unpropagated.
+    propagation.startReconcile();
+    store.onChanged((event) => {
+      this.emitEvent?.(CANONICAL_CHANGED_EVENT, { ...event });
+      propagation.enqueue(event);
+    });
+  }
+
+  /** PLAN-55 Phase 2: resolves when queued canonical:changed consumers have run. */
+  async canonicalPropagationIdle(): Promise<void> {
+    await this.canonicalPropagation?.idle();
+  }
+
+  // ── PLAN-53 G1: the owner's controls over what the agent remembers ──────
+
+  private ownerIndexTables(): IndexTables {
+    return {
+      ftsTable: this.fts.enabled && this.fts.available ? FTS_TABLE : null,
+      vectorTable: this.vector.available ? VECTOR_TABLE : null,
+    };
+  }
+
+  /**
+   * A change the owner asked for: after any running index sync (a reindex
+   * swaps the database mid-flight), and inside the maintenance lock so it does
+   * not interleave with consolidation or dreaming.
+   */
+  private async ownerChange<T>(label: string, fn: () => T | Promise<T>): Promise<T> {
+    if (this.syncing) {
+      await this.syncing.catch(() => {});
+    }
+    return await this.maintenanceMutex.run(`owner:${label}`, async () => await fn(), 30_000);
+  }
+
+  ownerListMemories(opts: OwnerListOptions = {}) {
+    return ownerListMemories(this.db, opts);
+  }
+
+  ownerGetMemory(id: string) {
+    return ownerGetMemory(this.db, id);
+  }
+
+  /**
+   * PLAN-55 Phase 3: forget with the cascade. `planHash` (from
+   * ownerForgetPreview) makes the forget refuse when the plan changed.
+   */
+  async ownerForgetMemory(id: string, opts: { planHash?: string } = {}) {
+    return await this.ownerChange("forget", () =>
+      ownerForgetMemory(this.db, id, this.ownerIndexTables(), {
+        store: this.canonicalFactsStore,
+        planHash: opts.planHash,
+      }),
+    );
+  }
+
+  async ownerEditMemory(id: string, text: string, opts: { planHash?: string } = {}) {
+    const edited = await this.ownerChange("edit", () =>
+      ownerEditMemory(this.db, id, text, this.ownerIndexTables(), {
+        store: this.canonicalFactsStore,
+        planHash: opts.planHash,
+      }),
+    );
+    // Re-embed now when possible so it is found by meaning again; the regular
+    // backfill catches it otherwise.
+    void this.backfillPendingEmbeddings({ limit: 5 }).catch(() => {});
+    return edited;
+  }
+
+  async ownerExportMemories(outFile: string) {
+    let workingMemory: string | null = null;
+    try {
+      workingMemory = await fs.readFile(path.join(this.workspaceDir, "MEMORY.md"), "utf8");
+    } catch {
+      workingMemory = null;
+    }
+    return await ownerExportMemories(this.db, outFile, {
+      agentId: this.agentId,
+      workingMemory,
+      genome: await this.readWorkspaceText("GENOME.md"),
+      assertCurrent: this.exportHandleGuard(),
+    });
+  }
+
+  ownerListPreferences() {
+    return ownerListPreferences(this.db);
+  }
+
+  ownerAuditLog(opts: { limit?: number; before?: number; event?: string } = {}) {
+    return ownerListAuditLog(this.db, opts);
+  }
+
+  async ownerDeletePreference(category: string, key: string): Promise<boolean> {
+    return await this.ownerChange("forget-preference", () =>
+      ownerDeletePreference(this.db, category, key),
+    );
+  }
+
+  /** PLAN-55 Phase 0: an owner retire is sticky (owner_retired + key/value suppression). */
+  async ownerRetireFact(key: string): Promise<boolean> {
+    const store = this.canonicalFactsStore;
+    if (!store) {
+      throw new Error("the facts ledger is not available");
+    }
+    return await this.ownerChange("retire-fact", () => ownerRetireFact(this.db, store, key));
+  }
+
+  async ownerUnretireFact(key: string): Promise<boolean> {
+    const store = this.canonicalFactsStore;
+    if (!store) {
+      throw new Error("the facts ledger is not available");
+    }
+    return await this.ownerChange("unretire-fact", () => ownerUnretireFact(this.db, store, key));
+  }
+
+  /** PLAN-55 Phase 0: the `owner` tier's writer (Phase 1: scope and evidence ride along). */
+  async ownerPinFact(input: OwnerPinInput) {
+    const store = this.canonicalFactsStore;
+    if (!store) {
+      throw new Error("the facts ledger is not available");
+    }
+    return await this.ownerChange("pin-fact", () => ownerPinFact(this.db, store, input));
+  }
+
+  // ── PLAN-55 Phase 3: cascade preview, session deletion, export v2, import ──
+
+  /** What forgetting this memory would also change (read-only), with the plan hash. */
+  async ownerForgetPreview(id: string) {
+    return await this.ownerPreview(() => ownerPreviewForget(this.db, id));
+  }
+
+  /** What replacing this memory's text would also change (read-only). */
+  async ownerEditPreview(id: string, text: string) {
+    return await this.ownerPreview(() => ownerPreviewEdit(this.db, id, text));
+  }
+
+  /**
+   * PLAN-55 §3.5b: a conversation was deleted (`sessions.delete`). Its
+   * indexed memories go with the cascade; facts resting only on it are
+   * retired below the owner tier, and the survivors are returned.
+   */
+  async ownerForgetSession(
+    sessionFiles: string[],
+    opts: {
+      /**
+       * Runs once the memories are collected (the caller archives the
+       * transcript here). When it returns a list, only those files (the
+       * ones confirmed archived) are forgotten; a transcript whose archive
+       * failed keeps its memories and the facts resting on them.
+       */
+      onCollected?: () => string[] | void;
+      /** `system` for automatic housekeeping (forgetSessionMemories has the difference). */
+      initiator?: "owner" | "system";
+    } = {},
+  ) {
+    // Collected first, outside the maintenance lock, so the caller can
+    // archive the transcript right away; the cascade then waits its turn.
+    const collected = await ownerCollectSessionChunks(this.db, sessionFiles);
+    const confirmed = opts.onCollected?.();
+    const files = Array.isArray(confirmed)
+      ? sessionFiles.filter((f) => confirmed.includes(f))
+      : sessionFiles;
+    const chunks = Array.isArray(confirmed)
+      ? ownerSessionChunksForFiles(collected, files)
+      : collected;
+    return await this.ownerChange("forget-session", () =>
+      ownerForgetSessionMemories(this.db, files, this.ownerIndexTables(), {
+        store: this.canonicalFactsStore,
+        chunks,
+        initiator: opts.initiator,
+      }),
+    );
+  }
+
+  private async readWorkspaceText(name: string): Promise<string | null> {
+    try {
+      return await fs.readFile(path.join(this.workspaceDir, name), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  /** Export version 2 to any sink (the gateway's download streams it to the client). */
+  async ownerExportTo(sink: ExportSink) {
+    const assertCurrent = this.exportHandleGuard();
+    return await writeMemoryExport(this.db, sink, {
+      agentId: this.agentId,
+      workingMemory: await this.readWorkspaceText("MEMORY.md"),
+      genome: await this.readWorkspaceText("GENOME.md"),
+      assertCurrent,
+    });
+  }
+
+  /**
+   * PLAN-55 Phase 3 review: an export reads page by page across yields and a
+   * safe reindex can swap `this.db` in between; the guard throws
+   * MemoryExportInterrupted on the first page after a swap.
+   */
+  private exportHandleGuard(): () => void {
+    const db = this.db;
+    return () => {
+      if (this.db !== db) {
+        throw new MemoryExportInterrupted();
+      }
+    };
+  }
+
+  /** Previews running right now; they scan without the maintenance lock, so they are capped. */
+  private ownerPreviewsInFlight = 0;
+
+  private async ownerPreview<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.ownerPreviewsInFlight >= MAX_OWNER_PREVIEWS_IN_FLIGHT) {
+      throw new OwnerEditRefused(
+        "Another preview of what a forget or edit would change is still running; try again in a moment.",
+      );
+    }
+    this.ownerPreviewsInFlight += 1;
+    try {
+      return await fn();
+    } finally {
+      this.ownerPreviewsInFlight -= 1;
+    }
+  }
+
+  /** The memory database file, for the owner to copy (shown next to the download). */
+  ownerDatabasePath(): string {
+    return this.settings.store.path;
+  }
+
+  /**
+   * Restore a memory export (v1 or v2; memory-import.ts has the rules).
+   * Imported memories are re-embedded in the background afterwards.
+   */
+  async ownerImportMemories(
+    input: unknown,
+    opts: {
+      dryRun?: boolean;
+      actor?: ImportActor;
+      keepOwnerTier?: boolean;
+      confirmOwnerTierGrantsHash?: string;
+    } = {},
+  ) {
+    const result = await this.ownerChange("import", () =>
+      importMemories(this.db, input, {
+        actor: opts.actor ?? "owner",
+        dryRun: opts.dryRun,
+        keepOwnerTier: opts.keepOwnerTier,
+        confirmOwnerTierGrantsHash: opts.confirmOwnerTierGrantsHash,
+        store: this.canonicalFactsStore,
+        tables: this.ownerIndexTables(),
+      }),
+    );
+    if (!result.dryRun && result.importedChunkIds.length > 0) {
+      void (async () => {
+        for (;;) {
+          const { embedded } = await this.backfillPendingEmbeddings({ limit: 50 });
+          if (embedded === 0) {
+            return;
+          }
+          await yieldToEventLoop();
+        }
+      })().catch((err) => log.debug(`import re-embed stopped: ${String(err)}`));
+    }
+    return result;
+  }
+
+  /**
+   * PLAN-55 Phase 1: the cheap-model lane for the per-turn correction
+   * capture, or null when the pass is disabled or no model is configured.
+   */
+  correctionLlmCall():
+    | ((prompt: string, callOpts?: { signal?: AbortSignal }) => Promise<string>)
+    | null {
+    if (!correctionCaptureEnabled(this.cfg.memory?.correction)) {
+      return null;
+    }
+    // Built with the dream engine when that is on (an injected dream llmCall
+    // is reused); otherwise lazily here, so the pass does not depend on
+    // dreaming being enabled.
+    this.correctionLlmCallFn ??= this.buildLlmCallFn(
+      this.cfg.memory?.extraction?.model ??
+        this.cfg.memory?.dream?.model ??
+        this.resolveCheapLlmSpec(),
+      CORRECTION_LLM_LANE,
+    );
+    return this.correctionLlmCallFn;
+  }
+
+  /**
+   * PLAN-34 §6.2: backfill `chunks.session_trust` for session chunks written
+   * before the v34 migration (NULL rows only — the live write path stamps
+   * trust at write time). Resolves each distinct transcript path through the
+   * sessions.json store. Two safety rules:
+   * - the whole run is SKIPPED when the store loads zero mappings, so a
+   *   transiently unreadable store can never permanently stamp everything
+   *   `unknown`;
+   * - genuinely unmapped paths ARE stamped `unknown` (pruned history only
+   *   ever shrinks — leaving them NULL would rescan forever for an answer
+   *   that cannot improve). The promotion gate treats unknown as
+   *   non-first-party either way.
+   * Idempotent by construction (touches only NULL rows) and cheap once
+   * complete (a single COUNT probe); the per-process flag just skips the
+   * probe on subsequent extraction runs.
+   */
+  private async backfillSessionTrust(): Promise<number> {
+    if (this.sessionTrustBackfillDone) {
+      return 0;
+    }
+    // Exclude promoted dream-insight chunks: they are generated artifacts
+    // (and can carry source='sessions' under a sources=['sessions'] config),
+    // never session history, so they are not ours to stamp. Keeping this in
+    // lockstep with the dream engine's backfill guard prevents a deadlock
+    // where one counts a row the other never clears.
+    const NOT_DREAM_INSIGHT = `NOT (COALESCE(origin, 'indexed') = 'dream'
+                                    AND COALESCE(semantic_type, 'general') = 'insight')`;
+    const pending = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM chunks
+           WHERE session_trust IS NULL AND source = 'sessions' AND ${NOT_DREAM_INSIGHT}`,
+        )
+        .get() as { c: number }
+    ).c;
+    if (pending === 0) {
+      this.sessionTrustBackfillDone = true;
+      return 0;
+    }
+    const { buildSessionTrustResolverDetailed } = await import("./session-trust.js");
+    const { resolve, knownSessions } = await buildSessionTrustResolverDetailed(this.agentId);
+    if (knownSessions === 0) {
+      // Store unreadable or empty — do not stamp anything this run.
+      return 0;
+    }
+    const paths = this.db
+      .prepare(
+        `SELECT DISTINCT path FROM chunks
+         WHERE session_trust IS NULL AND source = 'sessions' AND ${NOT_DREAM_INSIGHT}`,
+      )
+      .all() as Array<{ path: string }>;
+    const update = this.db.prepare(
+      `UPDATE chunks SET session_trust = ?
+       WHERE path = ? AND session_trust IS NULL AND source = 'sessions' AND ${NOT_DREAM_INSIGHT}`,
+    );
+    let stamped = 0;
+    let i = 0;
+    for (const { path: transcriptPath } of paths) {
+      update.run(resolve(transcriptPath), transcriptPath);
+      stamped++;
+      // Heavy memory loops must yield (gateway event-loop starvation history).
+      if (++i % 50 === 0) {
+        await yieldToEventLoop();
+      }
+    }
+    this.sessionTrustBackfillDone = true;
+    log.info(
+      `session_trust backfill: stamped ${stamped} session path(s) across ${pending} chunk(s)`,
+    );
+    return stamped;
+  }
+
+  /**
+   * PLAN-34 Phase 4: write a promoted dream insight as an IMMEDIATELY
+   * SEARCHABLE chunk — origin='dream', semantic_type='insight',
+   * epistemic_layer='mental_model', source in the configured MemorySource
+   * set, stamped with the LIVE embedding model and its in-cycle embedding,
+   * with chunks_vec + chunks_fts written in the same call. Best-effort: a
+   * vec/fts hiccup never breaks the dream cycle.
+   */
+  private writePromotedInsightChunk(row: {
+    text: string;
+    embedding: number[];
+    importanceScore: number;
+    evidenceRefs: string;
+  }): boolean {
+    // PLAN-55 Phase 0: the owner forgot this exact insight; do not promote it again.
+    const suppressed = isSuppressed(this.db, "chunk_hash", chunkTextHash(row.text));
+    if (suppressed) {
+      log.debug(`promoted-insight skipped a forgotten memory (suppression ${suppressed.id})`);
+      return false;
+    }
+    const id = `dream_insight_${crypto.randomUUID()}`;
+    const now = Date.now();
+    const hash = crypto.createHash("sha256").update(row.text).digest("hex");
+    // A source in the configured set so memory_search can reach it; 'memory'
+    // is always meaningful. Stamp the live model so the model-equality
+    // filter in search matches (else the chunk is invisible until re-embed).
+    const source = this.sources.has("memory") ? "memory" : ([...this.sources][0] ?? "memory");
+    const model = row.embedding.length > 0 ? this.provider.model : "pending";
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO chunks (id, path, source, start_line, end_line, text, hash, model, embedding,
+             importance_score, lifecycle, origin, memory_type, semantic_type, epistemic_layer,
+             evidence_refs, access_count, last_accessed_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          `dream/insight/${id}`,
+          source,
+          0,
+          0,
+          row.text,
+          hash,
+          model,
+          JSON.stringify(row.embedding),
+          row.importanceScore,
+          "generated",
+          "dream",
+          "plaintext",
+          "insight",
+          "mental_model",
+          row.evidenceRefs,
+          0,
+          null,
+          now,
+          now,
+        );
+    } catch (err) {
+      // The chunk itself failed — report failure so the caller does not
+      // count a non-existent promotion.
+      log.debug(`promoted-insight chunk insert failed: ${String(err)}`);
+      return false;
+    }
+    // chunks_vec (immediate semantic searchability) — best-effort.
+    if (row.embedding.length > 0) {
+      try {
+        this.db.prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`).run(id);
+        this.db
+          .prepare(`INSERT INTO ${VECTOR_TABLE} (id, embedding) VALUES (?, ?)`)
+          .run(id, Buffer.from(new Float32Array(row.embedding).buffer));
+      } catch (err) {
+        log.debug(`promoted-insight vec write skipped: ${String(err)}`);
+      }
+    }
+    if (this.fts.enabled && this.fts.available) {
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO ${FTS_TABLE} (text, id, path, source, model, start_line, end_line)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(row.text, id, `dream/insight/${id}`, source, model, 0, 0);
+      } catch (err) {
+        log.debug(`promoted-insight fts write skipped: ${String(err)}`);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * PLAN-40 Lane 1: write a distilled workflow note as a searchable
+   * task_pattern chunk. Path is deterministic per source skill so the lane's
+   * one-note-per-skill guard can check existence cheaply.
+   */
+  async writeWorkflowNoteChunk(params: {
+    text: string;
+    skillCrystalId: string;
+    evidenceExecutionIds: string[];
+  }): Promise<string | null> {
+    const id = `distill_${crypto.randomUUID()}`;
+    const now = Date.now();
+    const hash = crypto.createHash("sha256").update(params.text).digest("hex");
+    const source = this.sources.has("memory") ? "memory" : ([...this.sources][0] ?? "memory");
+    let embedding: number[] = [];
+    try {
+      embedding =
+        ((await this.embedQueryWithTimeout(params.text, USAGE_FEATURES.memoryIndex)) as number[]) ??
+        [];
+    } catch {
+      /* pending backfill */
+    }
+    const model = embedding.length > 0 ? this.provider.model : "pending";
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO chunks (id, path, source, start_line, end_line, text, hash, model, embedding,
+             importance_score, lifecycle, origin, semantic_type, evidence_refs,
+             access_count, created_at, updated_at)
+           VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, 0.7, 'activated', 'dream', 'task_pattern', ?, 0, ?, ?)`,
+        )
+        .run(
+          id,
+          `distill/workflow/${params.skillCrystalId}`,
+          source,
+          params.text,
+          hash,
+          model,
+          embeddingToBlob(embedding),
+          JSON.stringify(
+            params.evidenceExecutionIds.map((eid) => ({ kind: "execution", id: eid })),
+          ),
+          now,
+          now,
+        );
+    } catch (err) {
+      log.debug(`workflow note insert failed: ${String(err)}`);
+      return null;
+    }
+    if (embedding.length > 0) {
+      try {
+        this.db.prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`).run(id);
+        this.db
+          .prepare(`INSERT INTO ${VECTOR_TABLE} (id, embedding) VALUES (?, ?)`)
+          .run(id, Buffer.from(new Float32Array(embedding).buffer));
+      } catch {
+        /* vec absent */
+      }
+    }
+    if (this.fts.enabled && this.fts.available) {
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO ${FTS_TABLE} (text, id, path, source, model, start_line, end_line)
+             VALUES (?, ?, ?, ?, ?, 0, 0)`,
+          )
+          .run(params.text, id, `distill/workflow/${params.skillCrystalId}`, source, model);
+      } catch {
+        /* fts absent */
+      }
+    }
+    return id;
+  }
+
+  // PLAN-40 Lane 2's near-duplicate merge writer (writeMergedSummaryChunk)
+  // lived here until 2026-08-14, when the merge failed its pre-registered D2
+  // gate (0/23 top-5 changes, −0.1% tokens) and was deleted. The 19 summaries
+  // it produced and their demoted members remain valid live data; the
+  // machinery that keeps demotions holding (reindex carry-over, the FTS drift
+  // fence, compression's hygiene_done skip) is still active and must stay.
+
+  /**
+   * PLAN-34 Phase 2b: drain unsurfaced idle-research findings for prompt
+   * injection. Marks the returned rows surfaced so a finding is voiced in
+   * exactly one session ("while you were away, I looked into X" — then it
+   * lives on only as its world_fact crystal and dashboard history).
+   */
+  /**
+   * PLAN-40 Lane 3: drain at most ONE open anticipatory brief (drain=1 is
+   * the plan's cadence rule). Marks it surfaced + stamps the funnel. The
+   * CALLER enforces the owner gate — a brief synthesizes across the owner's
+   * sessions and must never surface to anyone else.
+   */
+  consumeDreamBrief(): { question: string; answer: string } | null {
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT id, question, answer_sketch FROM dream_briefs
+            WHERE status = 'open' ORDER BY created_at ASC LIMIT 1`,
+        )
+        .get() as { id: string; question: string; answer_sketch: string } | undefined;
+      if (!row) {
+        return null;
+      }
+      const surfacedAt = Date.now();
+      this.db
+        .prepare(`UPDATE dream_briefs SET status = 'surfaced', surfaced_at = ? WHERE id = ?`)
+        .run(surfacedAt, row.id);
+      // PLAN-59 Phase 0: the anticipation brief reached the prompt. Phase 2:
+      // eligible and assigned are logged ahead of the delivered row.
+      this.surfacingTrial?.surface({
+        eventId: `db:${row.id}:${Math.floor(surfacedAt / 3_600_000)}`,
+        kind: "dream_brief",
+        refId: row.id,
+        now: surfacedAt,
+      });
+      void import("./dream-utility.js")
+        .then(({ markDreamConsumption }) => {
+          markDreamConsumption(this.db, row.id, "surfaced");
+        })
+        .catch(() => {});
+      return { question: row.question, answer: row.answer_sketch };
+    } catch {
+      return null;
+    }
+  }
+
+  consumeResearchFindings(limit = 3): Array<{ finding: string; sourceUrl: string | null }> {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT id, target_id, finding, source_url FROM research_findings
+           WHERE surfaced_at IS NULL ORDER BY created_at DESC LIMIT ?`,
+        )
+        .all(limit) as Array<{
+        id: string;
+        target_id: string;
+        finding: string;
+        source_url: string | null;
+      }>;
+      if (rows.length === 0) {
+        return [];
+      }
+      const mark = this.db.prepare(`UPDATE research_findings SET surfaced_at = ? WHERE id = ?`);
+      const now = Date.now();
+      for (const row of rows) {
+        mark.run(now, row.id);
+      }
+      // PLAN-54: voicing a self-learned finding to the owner is a use of it.
+      recordCuriosityUseByTarget(
+        this.db,
+        rows.map((r) => r.target_id),
+        now,
+      );
+      // PLAN-59 Phase 0: the finding was delivered to the owner's prompt.
+      // ref = finding id, opportunity = the target it answered (the dismiss
+      // RPC labels by target id). Phase 2: eligible and assigned precede it.
+      this.surfacingTrial?.surfaceBatch(
+        rows.map((r) => ({
+          eventId: `cf:${r.id}:${Math.floor(now / 3_600_000)}`,
+          kind: "curiosity_finding",
+          refId: r.id,
+          opportunityId: r.target_id,
+          now,
+        })),
+      );
+      return rows.map((r) => ({ finding: r.finding, sourceUrl: r.source_url }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * PLAN-34 Phase 6 (§8): read-only listing of recent idle-research findings
+   * for the dashboard card. Never touches `surfaced_at` —
+   * `consumeResearchFindings` owns the drain; this is history, including
+   * rows still waiting to be voiced.
+   */
+  listResearchFindings(limit = 20): Array<{
+    id: string;
+    targetId: string | null;
+    finding: string;
+    sourceUrl: string | null;
+    relevance: number | null;
+    createdAt: number;
+    surfacedAt: number | null;
+  }> {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT id, target_id, finding, source_url, relevance, created_at, surfaced_at
+           FROM research_findings ORDER BY created_at DESC LIMIT ?`,
+        )
+        .all(Math.max(1, Math.min(limit, 100))) as Array<{
+        id: string;
+        target_id: string | null;
+        finding: string;
+        source_url: string | null;
+        relevance: number | null;
+        created_at: number;
+        surfaced_at: number | null;
+      }>;
+      return rows.map((r) => ({
+        id: r.id,
+        targetId: r.target_id,
+        finding: r.finding,
+        sourceUrl: r.source_url,
+        relevance: r.relevance,
+        createdAt: r.created_at,
+        surfacedAt: r.surfaced_at,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * PLAN-34 Phase 6 (§8): research egress audit view — all-time row counts
+   * per seam plus the most recent rows. The per-seam totals are computed
+   * over the whole table so truncating `recent` can never understate the
+   * real network footprint.
+   */
+  listResearchEgress(limit = 30): {
+    totalsBySeam: Record<string, number>;
+    recent: Array<{
+      seam: string;
+      destination: string;
+      payloadHash: string;
+      payloadLen: number;
+      createdAt: number;
+    }>;
+  } {
+    const totalsBySeam: Record<string, number> = {};
+    let recent: Array<{
+      seam: string;
+      destination: string;
+      payloadHash: string;
+      payloadLen: number;
+      createdAt: number;
+    }> = [];
+    try {
+      const totals = this.db
+        .prepare(`SELECT seam, COUNT(*) AS c FROM research_egress_log GROUP BY seam`)
+        .all() as Array<{ seam: string; c: number }>;
+      for (const t of totals) {
+        totalsBySeam[t.seam] = t.c;
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT seam, destination, payload_hash, payload_len, created_at
+           FROM research_egress_log ORDER BY created_at DESC LIMIT ?`,
+        )
+        .all(Math.max(1, Math.min(limit, 200))) as Array<{
+        seam: string;
+        destination: string;
+        payload_hash: string;
+        payload_len: number;
+        created_at: number;
+      }>;
+      recent = rows.map((r) => ({
+        seam: r.seam,
+        destination: r.destination,
+        payloadHash: r.payload_hash,
+        payloadLen: r.payload_len,
+        createdAt: r.created_at,
+      }));
+    } catch {
+      // pre-migration DB — empty view
+    }
+    return { totalsBySeam, recent };
+  }
+
+  /**
+   * Record a canonical-block injection for observability. Fed to the
+   * dead-wire detector only when the ledger has active facts — an empty
+   * ledger injecting nothing is healthy, not a dead wire; facts existing but
+   * never reaching a prompt is exactly the wired-but-dead defect class.
+   */
+  noteCanonicalInjection(count: number): void {
+    this.lastCanonicalInjection = { at: Date.now(), count };
+    if ((this.canonicalFactsStore?.activeCount() ?? 0) > 0) {
+      this.retrievalObs.record({ canonical: count });
+    }
+  }
+
+  /**
+   * Get a comprehensive user profile for the "what do you know about me?" query.
+   * Combines preferences, patterns, latest handover brief, and aggregate stats.
+   */
+  async fullUserProfile(): Promise<{
+    preferences: import("./user-model.js").UserPreference[];
+    patterns: import("./user-model.js").UserPattern[];
+    latestHandover?: string;
+    stats: { totalPreferences: number; categories: Record<string, number>; avgConfidence: number };
+  } | null> {
+    const profile = this.userProfile();
+    if (!profile) {
+      return null;
+    }
+
+    // Aggregate stats by category
+    const categories: Record<string, number> = {};
+    let totalConfidence = 0;
+    for (const p of profile.preferences) {
+      categories[p.category] = (categories[p.category] ?? 0) + 1;
+      totalConfidence += p.confidence;
+    }
+    const avgConfidence =
+      profile.preferences.length > 0 ? totalConfidence / profile.preferences.length : 0;
+
+    // Load latest handover brief compact summary
+    let latestHandover: string | undefined;
+    try {
+      const { loadLatestHandoverBrief: loadBrief, formatCompactSummary } =
+        await import("./session-handover.js");
+      const brief = await loadBrief(this.workspaceDir);
+      if (brief) {
+        latestHandover = formatCompactSummary(brief);
+      }
+    } catch {
+      // No handover briefs yet
+    }
+
+    return {
+      preferences: profile.preferences,
+      patterns: profile.patterns,
+      latestHandover,
+      stats: {
+        totalPreferences: profile.preferences.length,
+        categories,
+        avgConfidence,
+      },
+    };
+  }
+
+  // --- Skill execution tracker ---
+
+  /**
+   * Eagerly construct the SkillExecutionTracker at boot. Before PLAN-45
+   * Phase 1 this happened inside `ensureSkillRefiner()`; the refiner is
+   * gone, but several later `if (this.executionTracker)` wiring paths
+   * (crystallizer, network bridge, marketplace) still rely on it existing.
+   */
+  private ensureExecutionTracker(): void {
+    if (!this.executionTracker) {
+      this.executionTracker = new SkillExecutionTracker(this.db);
+    }
+  }
+
+  // --- Governance ---
+
+  private ensureGovernance(): void {
+    this.governance = new MemoryGovernance(this.db);
+  }
+
+  governanceStats(): ReturnType<MemoryGovernance["getStats"]> | null {
+    return this.governance?.getStats() ?? null;
+  }
+
+  /**
+   * PLAN-28 B4: retrieval-layer health for the management/telemetry surface.
+   * Folds the rolling per-layer dead-wire counters together with the knowledge
+   * graph + SABM belief stats so layer health is visible without a live DB
+   * probe (the way PLAN-28's analysis had to query it by hand). Cheap reads;
+   * safe to poll. `graph` is null when the knowledge graph isn't wired.
+   */
+  /**
+   * PLAN-34 Phase 6: same-DB cognition counters — the directive funnel,
+   * insight-promotion outcomes, research outcome codes, and egress vs the
+   * daily cap. Read-only aggregation over the memory DB; each leg is
+   * independently guarded so a missing table (pre-migration) yields nulls
+   * rather than throwing. Task counts live in a separate DB and are
+   * surfaced by the gateway RPC that owns the task store, not here.
+   */
+  cognitionHealth(): {
+    directiveFunnel: Record<string, number>;
+    insightPromotion: { promoted: number; rejectedByLeg: Record<string, number> };
+    research: { outcomes: Record<string, number>; egressToday: number; egressCapPerDay: number };
+    recentFindings: ReturnType<MemoryIndexManager["listResearchFindings"]>;
+    egress: ReturnType<MemoryIndexManager["listResearchEgress"]>;
+  } {
+    const directiveFunnel: Record<string, number> = {};
+    try {
+      // Count DISTINCT directives at each stage so the funnel is monotone and
+      // comparable (a directive injected in 3 sessions is one 'injected', not
+      // three). The contradicted lane is included so a re-ask is visible.
+      const rows = this.db
+        .prepare(
+          `SELECT event, COUNT(DISTINCT chunk_id) AS c FROM memory_audit_log
+           WHERE actor = 'epistemic_directives'
+             AND event IN ('directive_created','directive_injected','directive_answered',
+                           'directive_resolved','directive_answer_contradicted')
+           GROUP BY event`,
+        )
+        .all() as Array<{ event: string; c: number }>;
+      for (const r of rows) {
+        directiveFunnel[r.event.replace("directive_", "")] = r.c;
+      }
+    } catch {
+      // pre-migration / no audit log
+    }
+
+    let promoted = 0;
+    const rejectedByLeg: Record<string, number> = {};
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT metric_name AS metric, SUM(metric_value) AS total FROM dream_telemetry
+           WHERE phase = 'promotion' GROUP BY metric_name`,
+        )
+        .all() as Array<{ metric: string; total: number }>;
+      for (const r of rows) {
+        if (r.metric === "promoted") {
+          promoted = r.total;
+        } else if (r.metric.startsWith("reject_")) {
+          rejectedByLeg[r.metric.replace("reject_", "")] = r.total;
+        }
+      }
+    } catch {
+      // no telemetry table
+    }
+
+    const outcomes: Record<string, number> = {};
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT json_extract(metadata, '$.researchOutcome') AS outcome, COUNT(*) AS c
+           FROM curiosity_targets
+           WHERE json_extract(metadata, '$.researchOutcome') IS NOT NULL
+           GROUP BY outcome`,
+        )
+        .all() as Array<{ outcome: string; c: number }>;
+      for (const r of rows) {
+        outcomes[r.outcome] = r.c;
+      }
+    } catch {
+      // no curiosity targets
+    }
+
+    const egressCapPerDay = this.cfg.memory?.curiosity?.autoResearch?.maxPerDay ?? 10;
+    let egressToday = 0;
+    try {
+      const dayKey = `autoresearch_count_${new Date().toISOString().slice(0, 10)}`;
+      const row = this.db.prepare(`SELECT value FROM memory_meta WHERE key = ?`).get(dayKey) as
+        | { value: string }
+        | undefined;
+      if (row) {
+        const n = parseInt(row.value, 10);
+        // Match AutoResearchBudget: a corrupt counter reads as CAP-reached,
+        // never 0 — the dashboard must not show research as available when
+        // the budget guard is actually blocking it.
+        egressToday = Number.isFinite(n) ? n : egressCapPerDay;
+      }
+    } catch {
+      // no meta
+    }
+
+    return {
+      directiveFunnel,
+      insightPromotion: { promoted, rejectedByLeg },
+      research: { outcomes, egressToday, egressCapPerDay },
+      recentFindings: this.listResearchFindings(),
+      egress: this.listResearchEgress(),
+    };
+  }
+
+  retrievalHealth(): {
+    layers: { total: number; sinceContribution: Record<string, number> };
+    deadWires: ReturnType<RetrievalObservability["deadWiresSnapshot"]>;
+    graph: ReturnType<KnowledgeGraphManager["getStats"]> | null;
+    canonical: {
+      activeFacts: number;
+      lastInjection: { at: number; count: number } | null;
+      // PLAN-34 Phase 6 (§8), closing PLAN-33 Phase 4 debt: the ledger
+      // CONTENTS, not just the count. Bounded by maxFacts (default 48).
+      facts: Array<{
+        key: string;
+        value: string;
+        statement: string;
+        category: string;
+        source: string;
+        confidence: number;
+        corroborationCount: number;
+        lastConfirmedAt: number;
+      }>;
+    } | null;
+    cognition: ReturnType<MemoryIndexManager["cognitionHealth"]> | null;
+  } {
+    let graph: ReturnType<KnowledgeGraphManager["getStats"]> | null = null;
+    try {
+      graph = this.knowledgeGraph?.getStats() ?? null;
+    } catch {
+      graph = null;
+    }
+    let canonical: ReturnType<MemoryIndexManager["retrievalHealth"]>["canonical"] = null;
+    try {
+      canonical = this.canonicalFactsStore
+        ? {
+            activeFacts: this.canonicalFactsStore.activeCount(),
+            lastInjection: this.lastCanonicalInjection,
+            facts: this.canonicalFactsStore.listActive().map((f) => ({
+              key: f.key,
+              value: f.value,
+              statement: f.statement,
+              category: f.category,
+              source: f.source,
+              confidence: f.confidence,
+              corroborationCount: f.corroborationCount,
+              lastConfirmedAt: f.lastConfirmedAt,
+            })),
+          }
+        : null;
+    } catch {
+      canonical = null;
+    }
+    let cognition: ReturnType<MemoryIndexManager["cognitionHealth"]> | null = null;
+    try {
+      cognition = this.cognitionHealth();
+    } catch {
+      cognition = null;
+    }
+    return {
+      canonical,
+      layers: this.retrievalObs.snapshot(),
+      // Side-effect-free view: the dashboard must see a persistent fault on
+      // every poll — only the maintenance warn path consumes warn-dedupe.
+      deadWires: this.retrievalObs.deadWiresSnapshot(),
+      graph,
+      cognition,
+    };
+  }
+
+  enforceLifespan(): number {
+    return this.governance?.enforceLifespan() ?? 0;
+  }
+
+  // --- Task Memory ---
+
+  private ensureTaskMemory(): void {
+    this.taskMemory = new TaskMemoryManager(this.db);
+  }
+
+  registerGoal(description: string, sessionKey?: string): string | null {
+    return this.taskMemory?.registerGoal(description, sessionKey) ?? null;
+  }
+
+  updateGoalProgress(goalId: string, update: string, progress: number): void {
+    this.taskMemory?.updateProgress(goalId, update, progress);
+  }
+
+  getActiveGoals(): import("./task-memory.js").TaskGoal[] {
+    return this.taskMemory?.getActiveGoals() ?? [];
+  }
+
+  // --- Scheduler ---
+
+  private ensureScheduler(): void {
+    this.scheduler = new MemoryScheduler(this.cfg.memory?.scheduler);
+  }
+
+  schedulerStatus(): ReturnType<MemoryScheduler["getBudgetStatus"]> | null {
+    return this.scheduler?.getBudgetStatus() ?? null;
+  }
+
+  // --- MemStore ---
+
+  private ensureMemStore(): void {
+    this.memStore = new MemStore(this.db);
+  }
+
+  publishCrystal(
+    crystalId: string,
+    visibility: "shared" | "public",
+  ): import("./mem-store.js").PublishResult | null {
+    return this.memStore?.publish(crystalId, visibility) ?? null;
+  }
+
+  subscribeToCrystals(
+    filter: import("./mem-store.js").CrystalFilter,
+    callback: (crystal: import("./crystal-types.js").KnowledgeCrystal) => void,
+  ): string | null {
+    return this.memStore?.subscribe(filter, callback) ?? null;
+  }
+
+  // --- Skill Network Bridge ---
+
+  private ensureSkillNetworkBridge(): void {
+    // Created with null orchestrator; wire via setOrchestratorBridge() later
+    this.skillNetworkBridge = new SkillNetworkBridge(this.db, null);
+    this.skillNetworkBridge.setProceduralLearning(() => this.proceduralLearning());
+
+    // Wire hormonal manager and curiosity engine if available
+    if (this.hormonalManager) {
+      this.skillNetworkBridge.setHormonalManager(this.hormonalManager);
+    }
+    if (this.curiosityEngine) {
+      this.skillNetworkBridge.setCuriosityEngine(this.curiosityEngine);
+    }
+    if (this.executionTracker) {
+      this.skillNetworkBridge.setExecutionTracker(this.executionTracker);
+    }
+
+    // Plan 8, Phase 3: Wire SkillVerifier for P2P ingest safety gate
+    this.skillNetworkBridge.setSkillVerifier(new SkillVerifier(this.db));
+
+    // Peer reputation is created before this bridge (init order matters for
+    // SkillMarketplace below); wire it in here since ensurePeerReputationManager
+    // ran when the bridge didn't exist yet.
+    if (this.peerReputationManager) {
+      this.skillNetworkBridge.setPeerReputation(this.peerReputationManager);
+    }
+
+    // Initialize marketplace economics
+    const a2aCfg = this.cfg.a2a;
+    if (a2aCfg?.marketplace?.enabled !== false) {
+      this.marketplaceEconomics = new MarketplaceEconomics(this.db, a2aCfg?.marketplace?.pricing, {
+        // PLAN-43 Phase 0: listings rank by PLAN-42 validation verdicts,
+        // read off the live skill dirs at refresh time.
+        validationLookup: () => readValidationSummaries(),
+        // PLAN-43 Phase 3 (§3.7): kill switch read from the live config file.
+        freezeListings: () => loadConfig().a2a?.marketplace?.freezeListings === true,
+        // PLAN-43 Phase 3 (I4): registry royalty on sales of imported skills.
+        registryRoyalty: {
+          royaltyBps: this.cfg.skills?.agentskills?.royaltyBps ?? 0,
+          lookup: () => readRegistryProvenances(),
+          registryId: "agentskills.io",
+          ...(this.cfg.skills?.agentskills?.royaltyWallet
+            ? { royaltyWallet: this.cfg.skills.agentskills.royaltyWallet }
+            : {}),
+        },
+      });
+    }
+
+    // Plan 8, Phase 2: Initialize SkillMarketplace for search/browse/recommendations
+    if (!this.skillMarketplace && this.executionTracker && this.peerReputationManager) {
+      const ownAttesterPubkey = resolveOwnAttesterPubkey();
+      // PLAN-43 Phase 4: status-based contribution rewards (verified signals only).
+      this.contributorStatus = new ContributorStatusLedger(this.db);
+      this.skillMarketplace = new SkillMarketplace(
+        this.db,
+        this.executionTracker,
+        this.peerReputationManager,
+        {
+          // PLAN-43 Phase 3: verified-outcome aggregates on browse entries.
+          contributorStatus: (pk) => {
+            const s = this.contributorStatus?.get(pk);
+            return s ? { tier: s.tier, rank: s.rank } : null;
+          },
+          attesterWeight: makeAttesterWeight({
+            // Our own verdicts are trusted evidence (3c adversarial: without
+            // this the node's own -1 weighed 0.05 and strangers outvoted it).
+            ...(ownAttesterPubkey ? { ownAttesterPubkey } : {}),
+            trustedAttesters: this.cfg.a2a?.attestation?.trustedAttesters ?? [],
+            blockedAttesters: this.cfg.a2a?.attestation?.blockedAttesters ?? [],
+            ...(typeof this.cfg.a2a?.attestation?.unknownAttesterWeight === "number"
+              ? { unknownWeight: this.cfg.a2a.attestation.unknownAttesterWeight }
+              : {}),
+          }),
+        },
+      );
+    }
+
+    // Initialize experience signal collector
+    this.experienceCollector = new ExperienceSignalCollector(this.db);
+    if (this.hormonalManager) {
+      this.experienceCollector.setHormonalManager(this.hormonalManager);
+    }
+    if (this.curiosityEngine) {
+      this.experienceCollector.setCuriosityEngine(this.curiosityEngine);
+    }
+
+    // Skill Seekers adapter (optional external skill generation).
+    // V1 default flip (PLAN-41 D-D): opt-in via skills.skillSeekers.enabled.
+    const ssConfig = this.cfg.skills?.skillSeekers;
+    if (skillSeekersEnabled(ssConfig)) {
+      Promise.all([import("./skill-seekers-adapter.js"), import("./skill-seekers-url-finder.js")])
+        .then(([{ SkillSeekersAdapter }, { buildUrlFinder }]) => {
+          this.skillSeekersAdapter = new SkillSeekersAdapter(this.db, ssConfig);
+          this.skillSeekersAdapter.setBitterbotConfig(this.cfg);
+          if (this.epistemicDirectiveEngine) {
+            this.skillSeekersAdapter.setEpistemicDirectiveEngine(this.epistemicDirectiveEngine);
+          }
+          // Marketplace-demand driven skill generation
+          this.skillSeekersAdapter.setMarketplaceIntelligence(new MarketplaceIntelligence(this.db));
+          // Web-search fallback for URL-less knowledge gaps
+          const urlFinder = buildUrlFinder(this.cfg);
+          if (urlFinder) {
+            this.skillSeekersAdapter.setWebSearch(urlFinder);
+          }
+          // Late-wire into dream engine if already created
+          if (this.dreamEngine) {
+            this.dreamEngine.setSkillSeekersAdapter(this.skillSeekersAdapter);
+          }
+        })
+        .catch(() => {
+          // Skill Seekers adapter is optional — skip silently
+        });
+    }
+
+    // Create execution tracking hook for after_tool_call integration.
+    // The matured-unpublished callback closes audit F5: crystallization-time
+    // publish always fails the ≥3-execution maturity gate, so the moment a
+    // skill CROSSES the gate (an execution being recorded) must re-attempt.
+    // publishCrystalSkill re-runs the full gate chain and no-ops when the
+    // orchestrator bridge is absent, so this is safe to over-call.
+    // B4: verified task completion is the one grounded reward signal (an
+    // independent judge over executed checks), so it drives the hormonal
+    // system directly instead of "a tool returned ≥200 chars".
+    registerTaskRewardHook((event) => {
+      this.hormonalManager?.stimulate(event);
+    });
+    if (this.executionTracker) {
+      this.executionTrackingHook = createExecutionTrackingHook(
+        this.executionTracker,
+        this.db,
+        this.hormonalManager,
+        (skillCrystalId) => {
+          this.skillNetworkBridge?.publishCrystalSkill(skillCrystalId).catch((err) => {
+            log.debug(`maturity publish re-attempt failed: ${String(err)}`);
+          });
+        },
+      );
+    }
+  }
+
+  private ensurePeerReputationManager(): void {
+    if (!this.executionTracker) {
+      this.executionTracker = new SkillExecutionTracker(this.db);
+    }
+    const trustList = this.cfg.skills?.p2p?.trustList ?? [];
+    this.peerReputationManager = new PeerReputationManager(
+      this.db,
+      this.executionTracker,
+      trustList,
+    );
+    if (this.skillNetworkBridge) {
+      this.skillNetworkBridge.setPeerReputation(this.peerReputationManager);
+    }
+  }
+
+  /**
+   * Get the SkillNetworkBridge for external wiring (e.g. gateway startup).
+   */
+  getSkillNetworkBridge(): SkillNetworkBridge | null {
+    return this.skillNetworkBridge;
+  }
+
+  /** Called only by gateway startup; library/harness managers never start a live writer. */
+  startSkillPriorWriter(config: () => BitterbotConfig): void {
+    if (this.closed || this.skillPriorWriter) return;
+    this.skillPriorWriter = new SkillPriorWriterService({ db: () => this.db, config });
+  }
+
+  /**
+   * Get the `after_tool_call` hook handler for plugin registration.
+   * Returns null if execution tracking is not initialized.
+   */
+  getExecutionTrackingHook():
+    | ((event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => void)
+    | null {
+    return this.executionTrackingHook;
+  }
+
+  /**
+   * Expose the SkillExecutionTracker for read paths (gateway metrics surface).
+   * Returns null if telemetry has not been initialized.
+   */
+  getSkillExecutionTracker(): SkillExecutionTracker | null {
+    return this.executionTracker;
+  }
+
+  /**
+   * Wire the P2P orchestrator bridge into the skill network bridge.
+   * Called from gateway startup after the orchestrator starts.
+   */
+  wireOrchestratorBridge(bridge: OrchestratorBridgeLike): void {
+    this.skillNetworkBridge?.setOrchestratorBridge(bridge);
+    this.experienceCollector?.setOrchestratorBridge(bridge);
+  }
+
+  /**
+   * Proactive skill suggestions (Task 8).
+   * Analyzes friction patterns, goal alignment, curiosity gaps, and trending skills.
+   */
+  async suggestSkills(config?: SuggestSkillsConfig): Promise<SkillSuggestion[]> {
+    if (!this.discoveryAgent) {
+      const dreamCfg = this.cfg.memory?.dream;
+      const llmCall =
+        dreamCfg?.llmCall ??
+        this.buildLlmCallFn(dreamCfg?.model ?? this.resolveCheapLlmSpec(), {
+          feature: USAGE_FEATURES.memoryDiscovery,
+        });
+      this.discoveryAgent = new DiscoveryAgent(this.db, llmCall);
+    }
+    return this.discoveryAgent.suggestSkills(config);
+  }
+
+  // --- Curiosity Engine ---
+
+  private ensureCuriosityEngine(): void {
+    const curiosityCfg = this.cfg.memory?.curiosity;
+    // PLAN-59 Phase 0: the evidence layer observes retrieval and surfacing
+    // whether or not the curiosity engine itself is on; `evidence.mode: off`
+    // is its own switch. Shares this.db; a database without the tables
+    // (pre-v79) makes it a no-op.
+    if (!this.evidenceTelemetry) {
+      try {
+        this.evidenceTelemetry = new EvidenceTelemetry(
+          this.db,
+          resolveEvidenceConfig(curiosityCfg?.evidence),
+        );
+        this.evidenceTelemetry.startMaintenance();
+        this.dreamEngine?.setEvidenceTelemetry(this.evidenceTelemetry);
+        // PLAN-59 Phase 2: the surfacing trial rides on the same writer and
+        // inherits its `off`; its own mode only adds the shadow rows.
+        const evidenceRaw = curiosityCfg?.evidence as { surfacingTrial?: unknown } | undefined;
+        this.surfacingTrial = new SurfacingTrial(
+          this.evidenceTelemetry,
+          resolveSurfacingTrialConfig(evidenceRaw?.surfacingTrial),
+        );
+      } catch (err) {
+        log.debug(`evidence telemetry unavailable: ${String(err)}`);
+      }
+    }
+    if (!curiosityEnabled(curiosityCfg)) {
+      return;
+    }
+
+    this.curiosityEngine = new CuriosityEngine(this.db, {
+      ...curiosityCfg,
+      gccrf: this.cfg.memory?.gccrf,
+    });
+
+    // Wire curiosity engine to dream mode selection (influences which dream modes run)
+    if (this.dreamEngine && this.curiosityEngine) {
+      this.dreamEngine.setCuriosityWeightProvider(this.curiosityEngine);
+    }
+
+    // ── PLAN-9 Memory Supremacy: initialize new subsystems ──
+    this.knowledgeGraph = new KnowledgeGraphManager(this.db);
+    this.reconsolidationEngine = new ReconsolidationEngine(this.db);
+    this.epistemicDirectiveEngine = new EpistemicDirectiveEngine(this.db);
+    this.prospectiveMemoryEngine = new ProspectiveMemoryEngine(this.db);
+  }
+
+  curiosityState(): CuriosityState | null {
+    if (!this.curiosityEngine) {
+      return null;
+    }
+    return this.curiosityEngine.getState();
+  }
+
+  /** Default-on, lazy shadow service. Its separate database survives vector reindexing. */
+  proceduralLearning(): ProceduralLearning | null {
+    if (this.closed) return null;
+    const config = resolveLearningConfig(this.cfg.memory?.proceduralLearning);
+    if (config.mode === "off") return null;
+    if (!this.proceduralLearningService) {
+      const dir = resolveAgentDir(this.cfg, this.agentId);
+      mkdirSync(dir, { recursive: true });
+      const { DatabaseSync } = requireNodeSqlite();
+      const db = new DatabaseSync(path.join(dir, "procedural-learning.sqlite"));
+      db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000");
+      try {
+        this.proceduralLearningService = new ProceduralLearning(
+          new ProceduralLearningStore(db, config),
+        );
+      } catch (error) {
+        db.close();
+        throw error;
+      }
+    }
+    return this.proceduralLearningService;
+  }
+
+  curiosityResolve(targetId: string): boolean {
+    if (!this.curiosityEngine) {
+      return false;
+    }
+    return this.curiosityEngine.resolveTarget(targetId);
+  }
+
+  /**
+   * PLAN-10: Accessor for the Skill Seekers adapter.
+   * Returns null if the adapter has not been initialized yet (e.g. during startup,
+   * before the async wiring in ensureSkillNetworkBridge completes).
+   */
+  getSkillSeekersAdapter(): import("./skill-seekers-adapter.js").SkillSeekersAdapter | null {
+    return this.skillSeekersAdapter;
+  }
+
+  /**
+   * Assess a newly indexed chunk for novelty/surprise (called from embedding ops).
+   * CuriosityEngine.assessChunk() now handles unified GCCRF scoring internally.
+   * If surprise exceeds the novelty signal threshold, emits a signal to the P2P network.
+   */
+  assessChunkCuriosity(chunkId: string, chunkEmbedding: number[], chunkHash: string): void {
+    const assessment = this.curiosityEngine?.assessChunk(chunkId, chunkEmbedding, chunkHash);
+    if (assessment && assessment.compositeReward > CuriosityEngine.NOVELTY_SIGNAL_THRESHOLD) {
+      this.skillNetworkBridge?.emitNoveltySignal(assessment).catch(() => {});
+    }
+
+    // Trigger hormonal response from GCCRF signals (kept in manager for separation of concerns)
+    if (assessment?.gccrfReward != null && assessment.gccrfComponents && this.hormonalManager) {
+      let semanticType: string | null = null;
+      try {
+        const row = this.db
+          .prepare(`SELECT semantic_type FROM chunks WHERE id = ?`)
+          .get(chunkId) as { semantic_type: string | null } | undefined;
+        semanticType = row?.semantic_type ?? null;
+      } catch {
+        /* column may not exist */
+      }
+
+      this.hormonalManager.stimulateFromGCCRF(
+        assessment.gccrfReward,
+        assessment.gccrfComponents,
+        semanticType,
+      );
+      this.checkEmotionalDreamTrigger();
+    }
+  }
+
+  /**
+   * Get GCCRF diagnostics for the dashboard.
+   * Delegates to the unified CuriosityEngine.
+   */
+  gccrfDiagnostics(): {
+    alpha: number;
+    maturity: number;
+    state: Record<string, unknown>;
+    config: Record<string, unknown>;
+  } | null {
+    if (!this.curiosityEngine) {
+      return null;
+    }
+    return this.curiosityEngine.gccrfDiagnostics();
+  }
+
+  /**
+   * Emit the highest-priority unresolved exploration targets as P2P queries.
+   * Only emits 1 query per consolidation cycle to stay within rate limits.
+   */
+  private emitTopTargetsAsQueries(): void {
+    if (!this.curiosityEngine || !this.skillNetworkBridge) {
+      return;
+    }
+    const state = this.curiosityEngine.getState();
+    const topTarget = state.targets[0];
+    if (!topTarget || topTarget.priority < 0.6) {
+      return;
+    } // Only query for high-priority targets
+
+    const domainHint = topTarget.regionId
+      ? state.regions.find((r) => r.id === topTarget.regionId)?.label
+      : undefined;
+
+    this.skillNetworkBridge.emitNetworkQuery(topTarget.description, domainHint).catch(() => {});
+  }
+
+  /**
+   * Record search query for gap detection (called from search).
+   */
+  recordSearchQueryCuriosity(
+    query: string,
+    queryEmbedding: number[],
+    resultCount: number,
+    topScore: number,
+    meanScore: number,
+  ): void {
+    this.curiosityEngine?.recordSearchQuery(
+      query,
+      queryEmbedding,
+      resultCount,
+      topScore,
+      meanScore,
+    );
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    await this.evidenceTelemetry?.stopMaintenance();
+    // PLAN-57 §4.7: let the next default manager take over compute episodes.
+    if (this.episodeSink && getComputeEpisodeSink() === this.episodeSink) {
+      registerComputeEpisodeSink(null);
+    }
+    this.episodeSink = null;
+    if (this.nudgeSink && getComputeNudgeSink() === this.nudgeSink) {
+      registerComputeNudgeSink(null);
+    }
+    this.nudgeSink = null;
+    this.canonicalPropagation?.close();
+    if (this.watchTimer) {
+      clearTimeout(this.watchTimer);
+      this.watchTimer = null;
+    }
+    if (this.sessionWatchTimer) {
+      clearTimeout(this.sessionWatchTimer);
+      this.sessionWatchTimer = null;
+    }
+    if (this.intervalTimer) {
+      clearInterval(this.intervalTimer);
+      this.intervalTimer = null;
+    }
+    if (this.consolidationTimer) {
+      clearInterval(this.consolidationTimer);
+      this.consolidationTimer = null;
+    }
+    if (this.dreamInitialTimer) {
+      clearTimeout(this.dreamInitialTimer);
+      this.dreamInitialTimer = null;
+    }
+    if (this.dreamTimer) {
+      // May be either setInterval (fixed) or setTimeout (adaptive); clearing both
+      // is a no-op after the first call, but clearInterval handles timeouts on Node.
+      clearInterval(this.dreamTimer);
+      clearTimeout(this.dreamTimer);
+      this.dreamTimer = null;
+    }
+    if (this.digestTimer) {
+      clearTimeout(this.digestTimer);
+      this.digestTimer = null;
+    }
+    if (this.trendingSweepTimer) {
+      clearInterval(this.trendingSweepTimer);
+      this.trendingSweepTimer = null;
+    }
+    if (this.watcher) {
+      await this.watcher.close();
+      this.watcher = null;
+    }
+    if (this.sessionUnsubscribe) {
+      this.sessionUnsubscribe();
+      this.sessionUnsubscribe = null;
+    }
+    if (this.skillsUnsubscribe) {
+      this.skillsUnsubscribe();
+      this.skillsUnsubscribe = null;
+    }
+    // Drain any in-flight sync before closing the DB. The delta batch,
+    // interval, and watch paths all launch `void this.sync(...)`
+    // fire-and-forget; closing the handle underneath a running sync produces
+    // spurious errors and — on Windows — leaves the sqlite file handles open,
+    // making the store directory undeletable (CI: EBUSY on unlink in the
+    // session-staleness suite, whose claim path always fires such a sync).
+    if (this.syncing) {
+      try {
+        await this.syncing;
+      } catch {
+        // The launching call site already logs sync failures.
+      }
+    }
+    await this.skillPriorWriter?.close();
+    this.skillPriorWriter = null;
+    await this.failureLearningPending;
+    await this.dreamEngine?.waitForLearning();
+    await this.proceduralLearningService?.close();
+    this.proceduralLearningService = null;
+    this.db.close();
+    INDEX_CACHE.delete(this.cacheKey);
+  }
+}
+
+/**
+ * Extract a named section from working memory content.
+ */
+function extractWorkingMemorySection(content: string, sectionName: string): string | null {
+  if (!content) {
+    return null;
+  }
+  const pattern = new RegExp(`## ${sectionName}[^\\n]*\\n([\\s\\S]*?)(?=\\n## |$)`);
+  const match = content.match(pattern);
+  return match?.[1]?.trim() || null;
+}
+
+/**
+ * Compute the ratio of changed characters between two strings using bigram similarity.
+ * Returns 0 (identical) to 1 (completely different).
+ */
+function bigramDiffRatio(a: string, b: string): number {
+  if (a === b) {
+    return 0;
+  }
+  if (!a || !b) {
+    return 1;
+  }
+  const bigramsA = new Set<string>();
+  const bigramsB = new Set<string>();
+  for (let i = 0; i < a.length - 1; i++) {
+    bigramsA.add(a.slice(i, i + 2));
+  }
+  for (let i = 0; i < b.length - 1; i++) {
+    bigramsB.add(b.slice(i, i + 2));
+  }
+  let intersection = 0;
+  for (const bg of bigramsA) {
+    if (bigramsB.has(bg)) {
+      intersection++;
+    }
+  }
+  const union = bigramsA.size + bigramsB.size - intersection;
+  return union === 0 ? 0 : 1 - intersection / union;
+}
+
+function describeHormonalMood(state: {
+  dopamine: number;
+  cortisol: number;
+  oxytocin: number;
+}): string {
+  const parts: string[] = [];
+
+  if (state.dopamine > 0.6) {
+    parts.push("energized");
+  } else if (state.dopamine > 0.3) {
+    parts.push("motivated");
+  }
+
+  if (state.cortisol > 0.6) {
+    parts.push("stressed");
+  } else if (state.cortisol > 0.3) {
+    parts.push("alert");
+  }
+
+  if (state.oxytocin > 0.6) {
+    parts.push("deeply connected");
+  } else if (state.oxytocin > 0.3) {
+    parts.push("socially engaged");
+  }
+
+  if (parts.length === 0) {
+    if (state.dopamine < 0.1 && state.cortisol < 0.1 && state.oxytocin < 0.1) {
+      return "dormant";
+    }
+    return "calm";
+  }
+
+  return parts.join(", ");
+}
+
+function applyPrototypeMixins(target: object, ...sources: object[]): void {
+  for (const source of sources) {
+    for (const name of Object.getOwnPropertyNames(source)) {
+      if (name === "constructor") {
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(source, name);
+      if (!descriptor) {
+        continue;
+      }
+      Object.defineProperty(target, name, descriptor);
+    }
+  }
+}
+
+applyPrototypeMixins(MemoryIndexManager.prototype, memoryManagerSyncOps, memoryManagerEmbeddingOps);
+
+/**
+ * Key-aware cheap-model spec (PLAN-41 p0-22). Exported for tests and shared
+ * by every dream-adjacent background lane. Env-only by design: the full auth
+ * resolver chain can hit OAuth refresh / keychain calls and is not safe on
+ * these paths.
+ */
+export function resolveCheapLlmSpec(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.ANTHROPIC_API_KEY?.trim()) {
+    return "anthropic/claude-haiku-4-5";
+  }
+  return "openai/gpt-4o-mini";
+}

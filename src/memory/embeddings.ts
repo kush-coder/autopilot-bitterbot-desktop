@@ -1,0 +1,372 @@
+import fsSync from "node:fs";
+import type { Llama, LlamaEmbeddingContext, LlamaModel } from "node-llama-cpp";
+import type { BitterbotConfig } from "../config/config.js";
+import { formatErrorMessage } from "../infra/errors.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolveUserPath } from "../utils.js";
+import { type DigestResolver, digestOfFile } from "./embedding-profile.js";
+import { createGeminiEmbeddingProvider, type GeminiEmbeddingClient } from "./embeddings-gemini.js";
+import { createOpenAiEmbeddingProvider, type OpenAiEmbeddingClient } from "./embeddings-openai.js";
+import { createVoyageEmbeddingProvider, type VoyageEmbeddingClient } from "./embeddings-voyage.js";
+import { importNodeLlamaCpp } from "./node-llama.js";
+
+const log = createSubsystemLogger("memory/embeddings");
+
+export function sanitizeAndNormalizeEmbedding(vec: number[]): number[] {
+  const sanitized = vec.map((value) => (Number.isFinite(value) ? value : 0));
+  const magnitude = Math.sqrt(sanitized.reduce((sum, value) => sum + value * value, 0));
+  if (magnitude < 1e-10) {
+    return sanitized;
+  }
+  return sanitized.map((value) => value / magnitude);
+}
+
+export type { GeminiEmbeddingClient } from "./embeddings-gemini.js";
+export type { OpenAiEmbeddingClient } from "./embeddings-openai.js";
+export type { VoyageEmbeddingClient } from "./embeddings-voyage.js";
+import { recordEmbeddingUsage } from "./embeddings-usage.js";
+
+export type { EmbedCallOptions } from "./embeddings-usage.js";
+
+export type EmbeddingProvider = {
+  id: string;
+  model: string;
+  maxInputTokens?: number;
+  /**
+   * PLAN-57 §4.6: name the weights. Local GGUF providers hash the file; an
+   * OpenAI-compatible endpoint on localhost asks Ollama for its manifest
+   * digest. Remote APIs leave this out and never take part in pool parity.
+   */
+  resolveDigest?: DigestResolver;
+  /** PLAN-50: `opts.feature` attributes the call in the usage ledger. */
+  embedQuery: (text: string, opts?: EmbedCallOptionsLocal) => Promise<number[]>;
+  embedBatch: (texts: string[], opts?: EmbedCallOptionsLocal) => Promise<number[][]>;
+};
+type EmbedCallOptionsLocal = import("./embeddings-usage.js").EmbedCallOptions;
+
+export type EmbeddingProviderId = "openai" | "local" | "gemini" | "voyage";
+export type EmbeddingProviderRequest = EmbeddingProviderId | "auto";
+export type EmbeddingProviderFallback = EmbeddingProviderId | "none";
+
+const REMOTE_EMBEDDING_PROVIDER_IDS = ["openai", "gemini", "voyage"] as const;
+
+export type EmbeddingProviderResult = {
+  provider: EmbeddingProvider;
+  requestedProvider: EmbeddingProviderRequest;
+  fallbackFrom?: EmbeddingProviderId;
+  fallbackReason?: string;
+  openAi?: OpenAiEmbeddingClient;
+  gemini?: GeminiEmbeddingClient;
+  voyage?: VoyageEmbeddingClient;
+};
+
+export type EmbeddingProviderOptions = {
+  config: BitterbotConfig;
+  agentDir?: string;
+  /** PLAN-50: owning agent for usage attribution. */
+  agentId?: string;
+  provider: EmbeddingProviderRequest;
+  remote?: {
+    baseUrl?: string;
+    apiKey?: string;
+    headers?: Record<string, string>;
+  };
+  model: string;
+  fallback: EmbeddingProviderFallback;
+  local?: {
+    modelPath?: string;
+    modelCacheDir?: string;
+    /**
+     * PLAN-41 D-F kill switch: allow the auto chain to download the bundled
+     * GGUF (~330MB, first use) when no remote key exists. Default true.
+     */
+    autoDownload?: boolean;
+  };
+};
+
+export const DEFAULT_LOCAL_MODEL =
+  "hf:ggml-org/embeddinggemma-300m-qat-q8_0-GGUF/embeddinggemma-300m-qat-Q8_0.gguf";
+
+function canAutoSelectLocal(options: EmbeddingProviderOptions): boolean {
+  const modelPath = options.local?.modelPath?.trim();
+  if (!modelPath) {
+    return false;
+  }
+  if (/^(hf:|https?:)/i.test(modelPath)) {
+    return false;
+  }
+  const resolved = resolveUserPath(modelPath);
+  try {
+    return fsSync.statSync(resolved).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isMissingApiKeyError(err: unknown): boolean {
+  const message = formatErrorMessage(err);
+  return message.includes("No API key found for provider");
+}
+
+async function createLocalEmbeddingProvider(
+  options: EmbeddingProviderOptions,
+): Promise<EmbeddingProvider> {
+  const modelPath = options.local?.modelPath?.trim() || DEFAULT_LOCAL_MODEL;
+  const modelCacheDir = options.local?.modelCacheDir?.trim();
+
+  // Lazy-load node-llama-cpp to keep startup light unless local is enabled.
+  const { getLlama, resolveModelFile, LlamaLogLevel } = await importNodeLlamaCpp();
+
+  let llama: Llama | null = null;
+  let embeddingModel: LlamaModel | null = null;
+  let embeddingContext: LlamaEmbeddingContext | null = null;
+
+  const ensureContext = async () => {
+    if (!llama) {
+      llama = await getLlama({ logLevel: LlamaLogLevel.error });
+    }
+    if (!embeddingModel) {
+      // Progress at each decile: the first keyless boot downloads ~330MB and
+      // silence there reads as a hang.
+      let lastDecile = -1;
+      const resolved = await resolveModelFile(modelPath, {
+        directory: modelCacheDir || undefined,
+        cli: false,
+        onProgress: ({
+          totalSize,
+          downloadedSize,
+        }: {
+          totalSize: number;
+          downloadedSize: number;
+        }) => {
+          if (!totalSize) {
+            return;
+          }
+          const decile = Math.floor((downloadedSize / totalSize) * 10);
+          if (decile > lastDecile) {
+            lastDecile = decile;
+            log.info(
+              `local embedding model download ${decile * 10}% (${Math.round(downloadedSize / 1e6)}/${Math.round(totalSize / 1e6)} MB)`,
+            );
+          }
+        },
+      });
+      embeddingModel = await llama.loadModel({ modelPath: resolved });
+    }
+    if (!embeddingContext) {
+      embeddingContext = await embeddingModel.createEmbeddingContext();
+    }
+    return embeddingContext;
+  };
+
+  return {
+    id: "local",
+    model: modelPath,
+    resolveDigest: async (hint) => {
+      const resolved = await resolveModelFile(modelPath, {
+        directory: modelCacheDir || undefined,
+        cli: false,
+      });
+      return digestOfFile(resolved, hint);
+    },
+    embedQuery: async (text, opts) => {
+      const ctx = await ensureContext();
+      const started = Date.now();
+      const embedding = await ctx.getEmbeddingFor(text);
+      recordEmbeddingUsage({
+        providerId: "local",
+        model: modelPath,
+        texts: [text],
+        feature: opts?.feature,
+        agentId: options.agentId,
+        durationMs: Date.now() - started,
+      });
+      return sanitizeAndNormalizeEmbedding(Array.from(embedding.vector));
+    },
+    embedBatch: async (texts, opts) => {
+      const ctx = await ensureContext();
+      const started = Date.now();
+      const embeddings = await Promise.all(
+        texts.map(async (text) => {
+          const embedding = await ctx.getEmbeddingFor(text);
+          return sanitizeAndNormalizeEmbedding(Array.from(embedding.vector));
+        }),
+      );
+      recordEmbeddingUsage({
+        providerId: "local",
+        model: modelPath,
+        texts,
+        feature: opts?.feature,
+        agentId: options.agentId,
+        durationMs: Date.now() - started,
+      });
+      return embeddings;
+    },
+  };
+}
+
+/**
+ * Both native pieces must load before the auto chain commits to a 330MB
+ * download: node-llama-cpp (runs the model) and sqlite-vec (stores the
+ * vectors). Either missing means local memory couldn't work anyway.
+ */
+async function probeLocalEmbeddingStack(): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await importNodeLlamaCpp();
+  } catch (err) {
+    return { ok: false, error: formatLocalSetupError(err) };
+  }
+  try {
+    await import("sqlite-vec");
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Local embeddings unavailable: sqlite-vec failed to load (${formatErrorMessage(err)}).`,
+    };
+  }
+  return { ok: true };
+}
+
+export async function createEmbeddingProvider(
+  options: EmbeddingProviderOptions,
+): Promise<EmbeddingProviderResult> {
+  const requestedProvider = options.provider;
+  const fallback = options.fallback;
+
+  const createProvider = async (id: EmbeddingProviderId) => {
+    if (id === "local") {
+      const provider = await createLocalEmbeddingProvider(options);
+      return { provider };
+    }
+    if (id === "gemini") {
+      const { provider, client } = await createGeminiEmbeddingProvider(options);
+      return { provider, gemini: client };
+    }
+    if (id === "voyage") {
+      const { provider, client } = await createVoyageEmbeddingProvider(options);
+      return { provider, voyage: client };
+    }
+    const { provider, client } = await createOpenAiEmbeddingProvider(options);
+    return { provider, openAi: client };
+  };
+
+  const formatPrimaryError = (err: unknown, provider: EmbeddingProviderId) =>
+    provider === "local" ? formatLocalSetupError(err) : formatErrorMessage(err);
+
+  if (requestedProvider === "auto") {
+    const missingKeyErrors: string[] = [];
+    let localError: string | null = null;
+
+    if (canAutoSelectLocal(options)) {
+      try {
+        const local = await createProvider("local");
+        return { ...local, requestedProvider };
+      } catch (err) {
+        localError = formatLocalSetupError(err);
+      }
+    }
+
+    for (const provider of REMOTE_EMBEDDING_PROVIDER_IDS) {
+      try {
+        const result = await createProvider(provider);
+        return { ...result, requestedProvider };
+      } catch (err) {
+        const message = formatPrimaryError(err, provider);
+        if (isMissingApiKeyError(err)) {
+          missingKeyErrors.push(message);
+          continue;
+        }
+        throw new Error(message, { cause: err });
+      }
+    }
+
+    // PLAN-41 D-F (keyless memory): every remote provider missed its key.
+    // Reach the bundled local model LAST — the GGUF auto-downloads on first
+    // embed — so an Anthropic-only install still gets working memory.
+    // Gated on a load probe (both native pieces must import) and the
+    // local.autoDownload kill switch.
+    if (localError === null && options.local?.autoDownload !== false) {
+      const probe = await probeLocalEmbeddingStack();
+      if (probe.ok) {
+        try {
+          const local = await createProvider("local");
+          log.info(
+            "no remote embedding key found — using the bundled local model (downloads on first use)",
+          );
+          return { ...local, requestedProvider };
+        } catch (err) {
+          localError = formatLocalSetupError(err);
+        }
+      } else {
+        localError = probe.error ?? null;
+      }
+    }
+
+    const details = [...missingKeyErrors, localError].filter(Boolean) as string[];
+    if (details.length > 0) {
+      throw new Error(details.join("\n\n"));
+    }
+    throw new Error("No embeddings provider available.");
+  }
+
+  try {
+    const primary = await createProvider(requestedProvider);
+    return { ...primary, requestedProvider };
+  } catch (primaryErr) {
+    const reason = formatPrimaryError(primaryErr, requestedProvider);
+    if (fallback && fallback !== "none" && fallback !== requestedProvider) {
+      try {
+        const fallbackResult = await createProvider(fallback);
+        return {
+          ...fallbackResult,
+          requestedProvider,
+          fallbackFrom: requestedProvider,
+          fallbackReason: reason,
+        };
+      } catch (fallbackErr) {
+        // oxlint-disable-next-line preserve-caught-error
+        throw new Error(
+          `${reason}\n\nFallback to ${fallback} failed: ${formatErrorMessage(fallbackErr)}`,
+          { cause: fallbackErr },
+        );
+      }
+    }
+    throw new Error(reason, { cause: primaryErr });
+  }
+}
+
+function isNodeLlamaCppMissing(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const code = (err as Error & { code?: unknown }).code;
+  if (code === "ERR_MODULE_NOT_FOUND") {
+    return err.message.includes("node-llama-cpp");
+  }
+  return false;
+}
+
+function formatLocalSetupError(err: unknown): string {
+  const detail = formatErrorMessage(err);
+  const missing = isNodeLlamaCppMissing(err);
+  return [
+    "Local embeddings unavailable.",
+    missing
+      ? "Reason: optional dependency node-llama-cpp is missing (or failed to install)."
+      : detail
+        ? `Reason: ${detail}`
+        : undefined,
+    missing && detail ? `Detail: ${detail}` : null,
+    "To enable local embeddings:",
+    "1) Use Node 22 LTS (recommended for installs/updates)",
+    missing
+      ? "2) Reinstall the dependencies (this should install node-llama-cpp): run `pnpm install` in your Bitterbot checkout, or pull a fresh Docker image. A full-package npm install (bitterbot 1.6.1 or older) leaves it out (about 700 MB); update to the npm launcher with `npm install -g bitterbot@latest`, or add it with `npm install -g node-llama-cpp@3.15.1`"
+      : null,
+    "3) If you use pnpm: pnpm approve-builds (select node-llama-cpp), then pnpm rebuild node-llama-cpp",
+    ...REMOTE_EMBEDDING_PROVIDER_IDS.map(
+      (provider) => `Or set agents.defaults.memorySearch.provider = "${provider}" (remote).`,
+    ),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}

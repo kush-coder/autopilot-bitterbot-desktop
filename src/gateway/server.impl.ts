@@ -1,0 +1,881 @@
+import path from "node:path";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { getActiveEmbeddedRunCount } from "../agents/embedded-runner/runs.js";
+import {
+  getSkillsSnapshotVersion,
+  registerSkillsChangeListener,
+} from "../agents/skills/refresh.js";
+import { initSubagentRegistry } from "../agents/subagent-registry.js";
+import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
+import type { CanvasHostServer } from "../canvas-host/server.js";
+import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
+import { startCheckpointWriter } from "../checkpoints/agent-event-writer.js";
+import type { CirclesSchedulerHandle } from "../circles/scheduler.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import { createDefaultDeps } from "../cli/deps.js";
+import {
+  CONFIG_PATH,
+  isNixMode,
+  loadConfig,
+  migrateLegacyConfig,
+  readConfigFileSnapshot,
+  writeConfigFile,
+} from "../config/config.js";
+import { resolveStateDir } from "../config/paths.js";
+import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import { clearAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
+import { recordBootDurationMs } from "../infra/boot-duration.js";
+import { confirmBootHealthy } from "../infra/boot-verify.js";
+import { isDiagnosticsEnabled } from "../infra/diagnostic-events.js";
+import { logAcceptedEnvOption } from "../infra/env.js";
+import { startEventJournal } from "../infra/event-journal.js";
+import { createExecApprovalForwarder } from "../infra/exec-approval-forwarder.js";
+import { onHeartbeatEvent } from "../infra/heartbeat-events.js";
+import { startHeartbeatRunner, type HeartbeatRunner } from "../infra/heartbeat-runner.js";
+import { getMachineDisplayName } from "../infra/machine-name.js";
+import { ensureBitterbotCliOnPath } from "../infra/path-env.js";
+import { setGatewaySigusr1RestartPolicy, setPreRestartDeferralCheck } from "../infra/restart.js";
+import {
+  primeRemoteSkillsCache,
+  refreshRemoteBinsForConnectedNodes,
+  setSkillsRemoteRegistry,
+} from "../infra/skills-remote.js";
+import { enableSystemEventPersistence } from "../infra/system-events.js";
+import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
+import { checkUsageBudgetAlerts, onUsageBudgetAlert } from "../infra/usage-budgets.js";
+import { getUsageLedger, onUsageEvent, startUsageLedger } from "../infra/usage-ledger.js";
+import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
+import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
+import { initOtel } from "../observability/otel.js";
+import { startUsageMetricsExport } from "../observability/usage-metrics.js";
+import { getGlobalHookRunner, runGlobalGatewayStopSafely } from "../plugins/hook-runner-global.js";
+import { createEmptyPluginRegistry } from "../plugins/registry.js";
+import type { PluginServicesHandle } from "../plugins/services.js";
+import { getTotalQueueSize } from "../process/command-queue.js";
+import { setCommandApprovalResolver } from "../review/runtime.js";
+import type { RuntimeEnv } from "../runtime.js";
+import { registerTaskCheckContext } from "../tasks/checks.js";
+import { startCompletionNotifier } from "../tasks/completion-notifier.js";
+import { startHormonalAccessor } from "../tasks/hormonal-accessor.js";
+import { registerJudgeFromConfig } from "../tasks/judge-provider.js";
+import { startTaskStallSweep } from "../tasks/stall-sweep.js";
+import { startTaskStore } from "../tasks/store.js";
+import { VERSION } from "../version.js";
+import { createAuthRateLimiter, type AuthRateLimiter } from "./auth-rate-limit.js";
+import { startGatewayConfigReloader } from "./config-reload.js";
+import type { EventLoopMonitorHandle } from "./event-loop-monitor.js";
+import { ExecApprovalManager } from "./exec-approval-manager.js";
+import { NodeRegistry } from "./node-registry.js";
+import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
+import { createChannelManager } from "./server-channels.js";
+import { createAgentEventHandler } from "./server-chat.js";
+import { createGatewayCloseHandler } from "./server-close.js";
+import { TICK_INTERVAL_MS } from "./server-constants.js";
+import { startGatewayDiscovery } from "./server-discovery-runtime.js";
+import { applyGatewayLaneConcurrency } from "./server-lanes.js";
+import { startGatewayMaintenanceTimers } from "./server-maintenance.js";
+import { GATEWAY_EVENTS, listGatewayMethods } from "./server-methods-list.js";
+import { coreGatewayHandlers } from "./server-methods.js";
+import { registerAutoInitiation } from "./server-methods/auto-initiate-decider.js";
+import { createExecApprovalHandlers } from "./server-methods/exec-approval.js";
+import { safeParseJson } from "./server-methods/nodes.helpers.js";
+import type { GatewayRequestContext } from "./server-methods/types.js";
+import { hasConnectedMobileNode } from "./server-mobile-nodes.js";
+import { loadGatewayModelCatalog } from "./server-model-catalog.js";
+import { createNodeSubscriptionManager } from "./server-node-subscriptions.js";
+import { loadGatewayPlugins } from "./server-plugins.js";
+import { createGatewayReloadHandlers } from "./server-reload-handlers.js";
+import { resolveGatewayRuntimeConfig } from "./server-runtime-config.js";
+import { createGatewayRuntimeState } from "./server-runtime-state.js";
+import { resolveSessionKeyForRun } from "./server-session-key.js";
+import { logGatewayStartup } from "./server-startup-log.js";
+import { startGatewaySidecars } from "./server-startup.js";
+import { startGatewayTailscaleExposure } from "./server-tailscale.js";
+import { createWizardSessionTracker } from "./server-wizard-sessions.js";
+import { attachGatewayWsHandlers } from "./server-ws-runtime.js";
+import {
+  getHealthCache,
+  getHealthVersion,
+  getPresenceVersion,
+  incrementPresenceVersion,
+  refreshGatewayHealthSnapshot,
+} from "./server/health-state.js";
+import { loadGatewayTlsRuntime } from "./server/tls.js";
+
+export { __resetModelCatalogCacheForTest } from "./server-model-catalog.js";
+
+ensureBitterbotCliOnPath();
+
+const log = createSubsystemLogger("gateway");
+const logCanvas = log.child("canvas");
+const logDiscovery = log.child("discovery");
+const logTailscale = log.child("tailscale");
+const logChannels = log.child("channels");
+const logBrowser = log.child("browser");
+const logHealth = log.child("health");
+const logReload = log.child("reload");
+const logHooks = log.child("hooks");
+const logPlugins = log.child("plugins");
+const logWsControl = log.child("ws");
+const _gatewayRuntime = runtimeForLogger(log);
+const canvasRuntime = runtimeForLogger(logCanvas);
+
+export type GatewayServer = {
+  close: (opts?: { reason?: string; restartExpectedMs?: number | null }) => Promise<void>;
+};
+
+export type GatewayServerOptions = {
+  /**
+   * Bind address policy for the Gateway WebSocket/HTTP server.
+   * - loopback: 127.0.0.1
+   * - lan: 0.0.0.0
+   * - tailnet: bind only to the Tailscale IPv4 address (100.64.0.0/10)
+   * - auto: prefer loopback, else LAN
+   */
+  bind?: import("../config/config.js").GatewayBindMode;
+  /**
+   * Advanced override for the bind host, bypassing bind resolution.
+   * Prefer `bind` unless you really need a specific address.
+   */
+  host?: string;
+  /**
+   * If false, do not serve `POST /v1/chat/completions`.
+   * Default: config `gateway.http.endpoints.chatCompletions.enabled` (or false when absent).
+   */
+  openAiChatCompletionsEnabled?: boolean;
+  /**
+   * If false, do not serve `POST /v1/responses` (OpenResponses API).
+   * Default: config `gateway.http.endpoints.responses.enabled` (or false when absent).
+   */
+  openResponsesEnabled?: boolean;
+  /**
+   * Override gateway auth configuration (merges with config).
+   */
+  auth?: import("../config/config.js").GatewayAuthConfig;
+  /**
+   * Override gateway Tailscale exposure configuration (merges with config).
+   */
+  tailscale?: import("../config/config.js").GatewayTailscaleConfig;
+  /**
+   * Test-only: allow canvas host startup even when NODE_ENV/VITEST would disable it.
+   */
+  allowCanvasHostInTests?: boolean;
+  /**
+   * Test-only: override the onboarding wizard runner.
+   */
+  wizardRunner?: (
+    opts: import("../commands/onboard-types.js").OnboardOptions,
+    runtime: import("../runtime.js").RuntimeEnv,
+    prompter: import("../wizard/prompts.js").WizardPrompter,
+  ) => Promise<void>;
+};
+
+export async function startGatewayServer(
+  port = 19001,
+  opts: GatewayServerOptions = {},
+): Promise<GatewayServer> {
+  const minimalTestGateway =
+    process.env.VITEST === "1" && process.env.BITTERBOT_TEST_MINIMAL_GATEWAY === "1";
+
+  // Boot profiling (Option A): the gateway cold-boot has multi-minute SILENT
+  // stretches before `listen()` that the per-subsystem logs don't attribute.
+  // Time each major awaited boot step so the next restart names the culprit.
+  // Each step logs its own delta + cumulative; cheap and removable once the
+  // slow step is localized and fixed.
+  const __bootStart = Date.now();
+  let __bootLast = __bootStart;
+  const bootStep = (label: string): void => {
+    const now = Date.now();
+    log.info("gateway boot step", { label, ms: now - __bootLast, totalMs: now - __bootStart });
+    __bootLast = now;
+  };
+
+  // Ensure all default port derivations (browser/canvas) see the actual runtime port.
+  process.env.BITTERBOT_GATEWAY_PORT = String(port);
+  logAcceptedEnvOption({
+    key: "BITTERBOT_RAW_STREAM",
+    description: "raw stream logging enabled",
+  });
+  logAcceptedEnvOption({
+    key: "BITTERBOT_RAW_STREAM_PATH",
+    description: "raw stream log path override",
+  });
+
+  // PLAN-14 Pillar 6: bring up OpenTelemetry before any spans are created.
+  // No-op when OTEL_TRACES_EXPORTER / OTEL_EXPORTER_OTLP_ENDPOINT is unset.
+  await initOtel({ serviceName: "bitterbot-gateway" });
+
+  // PLAN-14 Pillar 6 #2: start the checkpoint writer (no-op unless
+  // BITTERBOT_CHECKPOINTS=1) so each agent run produces a forkable
+  // timeline in ~/.bitterbot/checkpoints.sqlite.
+  startCheckpointWriter();
+
+  // PLAN-16 Phase A: durable agent-event journal powering `task_monitor`
+  // and long-horizon task progress streams. On by default; disable with
+  // BITTERBOT_EVENT_JOURNAL=0.
+  startEventJournal();
+
+  // PLAN-53 E7: notices queued for a session (a reminder, an approval's
+  // outcome, a finished task) survive a restart.
+  try {
+    const restored = enableSystemEventPersistence(
+      path.join(resolveStateDir(), "system-events.json"),
+    );
+    if (restored > 0) {
+      log.info(`restored ${restored} queued system event(s) from before the restart`);
+    }
+  } catch (err) {
+    log.warn(`system event persistence is off: ${String(err)}`);
+  }
+
+  // PLAN-16 Phase B: long-horizon Task store. Hosts `task_*` agent tools'
+  // backing rows. On by default; override path with BITTERBOT_TASKS_DB.
+  startTaskStore();
+
+  // PLAN-17 Phase 4b: notify the owning agent's session when a task hits a
+  // terminal status. Channel monitor relays the next system-event reply.
+  // Disable with BITTERBOT_TASKS_COMPLETION_NOTIFY=0.
+  startCompletionNotifier();
+  // PLAN-53 E4: tell the owner about tasks nothing will resume.
+  startTaskStallSweep();
+  bootStep("early-subsystems");
+
+  let configSnapshot = await readConfigFileSnapshot();
+  bootStep("read-config-snapshot");
+  if (configSnapshot.legacyIssues.length > 0) {
+    if (isNixMode) {
+      throw new Error(
+        "Legacy config entries detected while running in Nix mode. Update your Nix config to the latest schema and restart.",
+      );
+    }
+    const { config: migrated, changes } = migrateLegacyConfig(configSnapshot.parsed);
+    if (!migrated) {
+      throw new Error(
+        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("bitterbot doctor")}" to migrate.`,
+      );
+    }
+    await writeConfigFile(migrated);
+    if (changes.length > 0) {
+      log.info(
+        `gateway: migrated legacy config entries:\n${changes
+          .map((entry) => `- ${entry}`)
+          .join("\n")}`,
+      );
+    }
+  }
+
+  configSnapshot = await readConfigFileSnapshot();
+  if (configSnapshot.exists && !configSnapshot.valid) {
+    const issues =
+      configSnapshot.issues.length > 0
+        ? configSnapshot.issues
+            .map((issue) => `${issue.path || "<root>"}: ${issue.message}`)
+            .join("\n")
+        : "Unknown validation issue.";
+    throw new Error(
+      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("bitterbot doctor")}" to repair, then retry.`,
+    );
+  }
+
+  const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
+  if (autoEnable.changes.length > 0) {
+    try {
+      await writeConfigFile(autoEnable.config);
+      log.info(
+        `gateway: auto-enabled plugins:\n${autoEnable.changes
+          .map((entry) => `- ${entry}`)
+          .join("\n")}`,
+      );
+    } catch (err) {
+      log.warn(`gateway: failed to persist plugin auto-enable changes: ${String(err)}`);
+    }
+  }
+
+  const cfgAtStart = loadConfig();
+  bootStep("config-load");
+
+  // PLAN-17 Phase 1: wire the long-horizon Task Judge to a real LLM provider.
+  // No-op when no Anthropic credential is configured; `task_judge` then
+  // reports "judge LLM call is not registered" and the agent can route around it.
+  registerJudgeFromConfig(cfgAtStart);
+
+  // PLAN-50: open the usage ledger, prune to retention, and start the transcript reconciler
+  // (one-time backfill, then a 10-minute safety net). On by default; BITTERBOT_USAGE_LEDGER=0
+  // or usage.ledger.enabled=false disables.
+  if (!minimalTestGateway) {
+    startUsageLedger({ cfg: cfgAtStart });
+  }
+
+  // PLAN-17 follow-up: feed live hormonal state into the long-horizon task
+  // concurrency gate. Refresh interval 30s; disable with
+  // BITTERBOT_TASKS_HORMONAL_GATE=0 to fall back to the baseline policy.
+  startHormonalAccessor(cfgAtStart);
+  // PLAN-22 Phase 3: register the complexity gate as the pre-turn decider.
+  registerAutoInitiation();
+
+  const diagnosticsEnabled = isDiagnosticsEnabled(cfgAtStart);
+  if (diagnosticsEnabled) {
+    startDiagnosticHeartbeat();
+  }
+  setGatewaySigusr1RestartPolicy({ allowExternal: cfgAtStart.commands?.restart === true });
+  setPreRestartDeferralCheck(
+    () => getTotalQueueSize() + getTotalPendingReplies() + getActiveEmbeddedRunCount(),
+  );
+  initSubagentRegistry();
+  const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
+  const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
+  // B4: task acceptance checks run against the default agent workspace;
+  // command checks stay off unless BITTERBOT_TASKS_CHECK_COMMANDS=1.
+  registerTaskCheckContext({ workspaceDir: defaultWorkspaceDir });
+  const baseMethods = listGatewayMethods();
+  const emptyPluginRegistry = createEmptyPluginRegistry();
+  const { pluginRegistry, gatewayMethods: baseGatewayMethods } = minimalTestGateway
+    ? { pluginRegistry: emptyPluginRegistry, gatewayMethods: baseMethods }
+    : loadGatewayPlugins({
+        cfg: cfgAtStart,
+        workspaceDir: defaultWorkspaceDir,
+        log,
+        coreGatewayHandlers,
+        baseMethods,
+      });
+  const channelLogs = Object.fromEntries(
+    listChannelPlugins().map((plugin) => [plugin.id, logChannels.child(plugin.id)]),
+  ) as Record<ChannelId, ReturnType<typeof createSubsystemLogger>>;
+  const channelRuntimeEnvs = Object.fromEntries(
+    Object.entries(channelLogs).map(([id, logger]) => [id, runtimeForLogger(logger)]),
+  ) as Record<ChannelId, RuntimeEnv>;
+  const channelMethods = listChannelPlugins().flatMap((plugin) => plugin.gatewayMethods ?? []);
+  const gatewayMethods = Array.from(new Set([...baseGatewayMethods, ...channelMethods]));
+  bootStep("load-plugins");
+  let pluginServices: PluginServicesHandle | null = null;
+  let orchestratorBridge: import("../infra/orchestrator-bridge.js").OrchestratorBridge | null =
+    null;
+  let computeMesh: import("../compute/mesh-service.js").ComputeMeshService | undefined;
+  let peerRpcTransport: { stop(): void } | undefined;
+  const runtimeConfig = await resolveGatewayRuntimeConfig({
+    cfg: cfgAtStart,
+    port,
+    bind: opts.bind,
+    host: opts.host,
+    openAiChatCompletionsEnabled: opts.openAiChatCompletionsEnabled,
+    openResponsesEnabled: opts.openResponsesEnabled,
+    auth: opts.auth,
+    tailscale: opts.tailscale,
+  });
+  const {
+    bindHost,
+    openAiChatCompletionsEnabled,
+    openResponsesEnabled,
+    openResponsesConfig,
+    avatarBasePath,
+    resolvedAuth,
+    tailscaleConfig,
+    tailscaleMode,
+  } = runtimeConfig;
+  bootStep("resolve-runtime-config");
+  let hooksConfig = runtimeConfig.hooksConfig;
+  const canvasHostEnabled = runtimeConfig.canvasHostEnabled;
+
+  // Create auth rate limiter only when explicitly configured.
+  const rateLimitConfig = cfgAtStart.gateway?.auth?.rateLimit;
+  const authRateLimiter: AuthRateLimiter | undefined = rateLimitConfig
+    ? createAuthRateLimiter(rateLimitConfig)
+    : undefined;
+
+  // Unset: wizard.* runs the setup step model (PLAN-56 Phase 4).
+  const wizardRunner = opts.wizardRunner;
+  const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
+
+  const deps = createDefaultDeps();
+  let canvasHostServer: CanvasHostServer | null = null;
+  const gatewayTls = await loadGatewayTlsRuntime(cfgAtStart.gateway?.tls, log.child("tls"));
+  if (cfgAtStart.gateway?.tls?.enabled && !gatewayTls.enabled) {
+    throw new Error(gatewayTls.error ?? "gateway tls: failed to enable");
+  }
+  bootStep("tls-runtime");
+  const {
+    canvasHost,
+    httpServer,
+    httpServers,
+    httpBindHosts,
+    wss,
+    clients,
+    broadcast,
+    broadcastToConnIds,
+    agentRunSeq,
+    dedupe,
+    chatRunState,
+    chatRunBuffers,
+    chatDeltaSentAt,
+    addChatRun,
+    removeChatRun,
+    chatAbortControllers,
+    toolEventRecipients,
+    closeA2a,
+  } = await createGatewayRuntimeState({
+    cfg: cfgAtStart,
+    bindHost,
+    port,
+    avatarBasePath,
+    openAiChatCompletionsEnabled,
+    openResponsesEnabled,
+    openResponsesConfig,
+    resolvedAuth,
+    rateLimiter: authRateLimiter,
+    gatewayTls,
+    hooksConfig: () => hooksConfig,
+    pluginRegistry,
+    deps,
+    canvasRuntime,
+    canvasHostEnabled,
+    allowCanvasHostInTests: opts.allowCanvasHostInTests,
+    logCanvas,
+    log,
+    logHooks,
+    logPlugins,
+  });
+  bootStep("create-runtime-state+listen");
+  const nodeRegistry = new NodeRegistry();
+  const nodePresenceTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const nodeSubscriptions = createNodeSubscriptionManager();
+  const nodeSendEvent = (opts: { nodeId: string; event: string; payloadJSON?: string | null }) => {
+    const payload = safeParseJson(opts.payloadJSON ?? null);
+    nodeRegistry.sendEvent(opts.nodeId, opts.event, payload);
+  };
+  const nodeSendToSession = (sessionKey: string, event: string, payload: unknown) =>
+    nodeSubscriptions.sendToSession(sessionKey, event, payload, nodeSendEvent);
+  const nodeSendToAllSubscribed = (event: string, payload: unknown) =>
+    nodeSubscriptions.sendToAllSubscribed(event, payload, nodeSendEvent);
+  const nodeSubscribe = nodeSubscriptions.subscribe;
+  const nodeUnsubscribe = nodeSubscriptions.unsubscribe;
+  const nodeUnsubscribeAll = nodeSubscriptions.unsubscribeAll;
+  const broadcastVoiceWakeChanged = (triggers: string[]) => {
+    broadcast("voicewake.changed", { triggers }, { dropIfSlow: true });
+  };
+  const hasMobileNodeConnected = () => hasConnectedMobileNode(nodeRegistry);
+  applyGatewayLaneConcurrency(cfgAtStart);
+
+  const channelManager = createChannelManager({
+    loadConfig,
+    channelLogs,
+    channelRuntimeEnvs,
+  });
+  const { getRuntimeSnapshot, startChannels, startChannel, stopChannel, markChannelLoggedOut } =
+    channelManager;
+
+  if (!minimalTestGateway) {
+    const machineDisplayName = await getMachineDisplayName();
+    await startGatewayDiscovery({
+      machineDisplayName,
+      port,
+      gatewayTls: gatewayTls.enabled
+        ? { enabled: true, fingerprintSha256: gatewayTls.fingerprintSha256 }
+        : undefined,
+      wideAreaDiscoveryEnabled: cfgAtStart.discovery?.wideArea?.enabled === true,
+      wideAreaDiscoveryDomain: cfgAtStart.discovery?.wideArea?.domain,
+      tailscaleMode,
+      logDiscovery,
+    });
+    bootStep("gateway-discovery");
+  }
+
+  if (!minimalTestGateway) {
+    setSkillsRemoteRegistry(nodeRegistry);
+    void primeRemoteSkillsCache();
+  }
+  // Debounce skills-triggered node probes to avoid feedback loops and rapid-fire invokes.
+  // Skills changes can happen in bursts (e.g., file watcher events), and each probe
+  // takes time to complete. A 30-second delay ensures we batch changes together.
+  let skillsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const skillsRefreshDelayMs = 30_000;
+  const skillsChangeUnsub = minimalTestGateway
+    ? () => {}
+    : registerSkillsChangeListener((event) => {
+        broadcast(
+          "skills.changed",
+          {
+            reason: event.reason,
+            workspaceDir: event.workspaceDir,
+            changedPath: event.changedPath,
+            version: getSkillsSnapshotVersion(event.workspaceDir),
+          },
+          { dropIfSlow: true },
+        );
+        if (event.reason === "remote-node") {
+          return;
+        }
+        if (skillsRefreshTimer) {
+          clearTimeout(skillsRefreshTimer);
+        }
+        skillsRefreshTimer = setTimeout(() => {
+          skillsRefreshTimer = null;
+          const latest = loadConfig();
+          void refreshRemoteBinsForConnectedNodes(latest);
+        }, skillsRefreshDelayMs);
+      });
+
+  const noopInterval = () => setInterval(() => {}, 1 << 30);
+  // Minimal integration servers still need protocol heartbeats for long-running jobs.
+  let tickInterval = minimalTestGateway
+    ? setInterval(
+        () => broadcast("tick", { ts: Date.now() }, { dropIfSlow: true }),
+        TICK_INTERVAL_MS,
+      )
+    : noopInterval();
+  let healthInterval = noopInterval();
+  let dedupeCleanup = noopInterval();
+  let eventLoopMonitor: EventLoopMonitorHandle = { stop: () => {} };
+  let circlesScheduler: CirclesSchedulerHandle = { stop: () => {} };
+  if (!minimalTestGateway) {
+    ({ tickInterval, healthInterval, dedupeCleanup, eventLoopMonitor, circlesScheduler } =
+      startGatewayMaintenanceTimers({
+        broadcast,
+        nodeSendToAllSubscribed,
+        getPresenceVersion,
+        getHealthVersion,
+        refreshGatewayHealthSnapshot,
+        logHealth,
+        dedupe,
+        chatAbortControllers,
+        chatRunState,
+        chatRunBuffers,
+        chatDeltaSentAt,
+        removeChatRun,
+        agentRunSeq,
+        nodeSendToSession,
+        getConfig: loadConfig,
+      }));
+  }
+
+  const agentUnsub = minimalTestGateway
+    ? null
+    : onAgentEvent(
+        createAgentEventHandler({
+          broadcast,
+          broadcastToConnIds,
+          nodeSendToSession,
+          agentRunSeq,
+          chatRunState,
+          resolveSessionKeyForRun,
+          clearAgentRunContext,
+          toolEventRecipients,
+        }),
+      );
+
+  const heartbeatUnsub = minimalTestGateway
+    ? null
+    : onHeartbeatEvent((evt) => {
+        broadcast("heartbeat", evt, { dropIfSlow: true });
+      });
+
+  // PLAN-50: stream every recorded usage row to the Control UI, and evaluate budgets at most
+  // once every few seconds so the alert ladder (50/80/95/100%) fires promptly without a SQL
+  // sum per token.
+  let usageBudgetTimer: NodeJS.Timeout | null = null;
+  const scheduleUsageBudgetCheck = () => {
+    if (usageBudgetTimer) {
+      return;
+    }
+    usageBudgetTimer = setTimeout(() => {
+      usageBudgetTimer = null;
+      try {
+        const ledger = getUsageLedger();
+        if (ledger) {
+          checkUsageBudgetAlerts({ ledger, cfg: loadConfig() });
+        }
+      } catch {
+        // budget evaluation never affects the gateway
+      }
+    }, 5_000);
+    usageBudgetTimer.unref?.();
+  };
+  const usageUnsub = minimalTestGateway
+    ? null
+    : onUsageEvent((evt) => {
+        broadcast("usage", evt, { dropIfSlow: true });
+        scheduleUsageBudgetCheck();
+      });
+  const usageBudgetUnsub = minimalTestGateway
+    ? null
+    : onUsageBudgetAlert((alert) => {
+        broadcast("usage.budget", alert);
+      });
+  // PLAN-50 Phase 5: OTel token counters (no-op unless an OTLP endpoint is configured).
+  const usageMetricsUnsub = minimalTestGateway ? null : startUsageMetricsExport();
+
+  let heartbeatRunner: HeartbeatRunner = minimalTestGateway
+    ? {
+        stop: () => {},
+        updateConfig: () => {},
+      }
+    : startHeartbeatRunner({ cfg: cfgAtStart });
+
+  // Recover pending outbound deliveries from previous crash/restart.
+  if (!minimalTestGateway) {
+    void (async () => {
+      const { recoverPendingDeliveries } = await import("../infra/outbound/delivery-queue.js");
+      const { deliverOutboundPayloads } = await import("../infra/outbound/deliver.js");
+      const logRecovery = log.child("delivery-recovery");
+      await recoverPendingDeliveries({
+        deliver: deliverOutboundPayloads,
+        log: logRecovery,
+        cfg: cfgAtStart,
+      });
+    })().catch((err) => log.error(`Delivery recovery failed: ${String(err)}`));
+  }
+
+  const execApprovalManager = new ExecApprovalManager();
+  const execApprovalForwarder = createExecApprovalForwarder();
+  // PLAN-53 B6: a command answered from the review queue resolves the same
+  // approval the exec tool is waiting on.
+  setCommandApprovalResolver((approvalId, decision, by) =>
+    execApprovalManager.resolve(approvalId, decision, by),
+  );
+  const execApprovalHandlers = createExecApprovalHandlers(execApprovalManager, {
+    forwarder: execApprovalForwarder,
+  });
+
+  const canvasHostServerPort = (canvasHostServer as CanvasHostServer | null)?.port;
+
+  // Hoisted so we can patch orchestratorBridge / skillNetworkBridge into it
+  // once startGatewaySidecars resolves. The `buildRequestContext` thunk in
+  // server-ws-runtime returns this same reference, so mutations propagate to
+  // every subsequent handler invocation.
+  const requestContext: GatewayRequestContext = {
+    deps,
+    execApprovalManager,
+    loadGatewayModelCatalog,
+    getHealthCache,
+    refreshHealthSnapshot: refreshGatewayHealthSnapshot,
+    logHealth,
+    logGateway: log,
+    incrementPresenceVersion,
+    getHealthVersion,
+    broadcast,
+    broadcastToConnIds,
+    nodeSendToSession,
+    nodeSendToAllSubscribed,
+    nodeSubscribe,
+    nodeUnsubscribe,
+    nodeUnsubscribeAll,
+    hasConnectedMobileNode: hasMobileNodeConnected,
+    nodeRegistry,
+    agentRunSeq,
+    chatAbortControllers,
+    chatAbortedRuns: chatRunState.abortedRuns,
+    chatRunBuffers: chatRunState.buffers,
+    chatDeltaSentAt: chatRunState.deltaSentAt,
+    addChatRun,
+    removeChatRun,
+    registerToolEventRecipient: toolEventRecipients.add,
+    dedupe,
+    wizardSessions,
+    findRunningWizard,
+    purgeWizardSession,
+    getRuntimeSnapshot,
+    startChannel,
+    stopChannel,
+    markChannelLoggedOut,
+    wizardRunner,
+    broadcastVoiceWakeChanged,
+    orchestratorBridge: orchestratorBridge ?? undefined,
+    skillNetworkBridge: null,
+  };
+
+  attachGatewayWsHandlers({
+    wss,
+    clients,
+    port,
+    gatewayHost: bindHost ?? undefined,
+    canvasHostEnabled: Boolean(canvasHost),
+    canvasHostServerPort,
+    resolvedAuth,
+    rateLimiter: authRateLimiter,
+    gatewayMethods,
+    events: GATEWAY_EVENTS,
+    logGateway: log,
+    logHealth,
+    logWsControl,
+    extraHandlers: {
+      ...pluginRegistry.gatewayHandlers,
+      ...execApprovalHandlers,
+    },
+    broadcast,
+    context: requestContext,
+  });
+  bootStep("pre-listen-log");
+  // Record how long this boot actually took so a restart can advertise an honest
+  // `restartExpectedMs` instead of the old hardcoded 1.5s. Boot time spans two
+  // orders of magnitude across filesystems, so the previous boot is the only
+  // sane predictor. Best-effort: never throws.
+  recordBootDurationMs(Date.now() - __bootStart);
+  logGatewayStartup({
+    cfg: cfgAtStart,
+    bindHost,
+    bindHosts: httpBindHosts,
+    port,
+    tlsEnabled: gatewayTls.enabled,
+    log,
+    isNixMode,
+  });
+  // The server is bound and serving — clear any post-update boot-health
+  // beacon. A healthy boot erases it so doctor never flags a phantom failure;
+  // a boot that never reaches this point leaves it for doctor to surface.
+  if (!minimalTestGateway) {
+    // With our version: a tarball update's beacon only clears for the
+    // version it expects (PLAN-56 Phase 3b).
+    confirmBootHealthy(VERSION);
+  }
+  const stopUpdateCheck = minimalTestGateway
+    ? null
+    : scheduleGatewayUpdateCheck({
+        cfg: cfgAtStart,
+        log,
+        isNixMode,
+        // Control UI listens for this to raise (or clear) its update prompt.
+        onStatus: (event) => broadcast("update", event, { dropIfSlow: true }),
+      });
+  const tailscaleCleanup = minimalTestGateway
+    ? null
+    : await startGatewayTailscaleExposure({
+        tailscaleMode,
+        resetOnExit: tailscaleConfig.resetOnExit,
+        port,
+        controlUiBasePath: avatarBasePath,
+        logTailscale,
+      });
+
+  let browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> = null;
+  if (!minimalTestGateway) {
+    ({ browserControl, pluginServices, orchestratorBridge, computeMesh, peerRpcTransport } =
+      await startGatewaySidecars({
+        cfg: cfgAtStart,
+        pluginRegistry,
+        defaultWorkspaceDir,
+        deps,
+        startChannels,
+        log,
+        logHooks,
+        logChannels,
+        logBrowser,
+        onSkillNetworkBridgeReady: (bridge) => {
+          // Memory backend init is fire-and-forget; this fires once the
+          // SkillNetworkBridge is wired so handlers see it.
+          requestContext.skillNetworkBridge = bridge;
+        },
+      }));
+    // Patch the live request context so handlers see the actual orchestrator
+    // bridge — without this, the object literal would forever hold the
+    // pre-sidecar `undefined`.
+    requestContext.orchestratorBridge = orchestratorBridge ?? undefined;
+    requestContext.computeMesh = computeMesh;
+    bootStep("start-sidecars");
+  }
+
+  // Run gateway_start plugin hook (fire-and-forget)
+  if (!minimalTestGateway) {
+    const hookRunner = getGlobalHookRunner();
+    if (hookRunner?.hasHooks("gateway_start")) {
+      void hookRunner.runGatewayStart({ port }, { port }).catch((err) => {
+        log.warn(`gateway_start hook failed: ${String(err)}`);
+      });
+    }
+  }
+
+  const configReloader = minimalTestGateway
+    ? { stop: async () => {} }
+    : (() => {
+        const { applyHotReload, requestGatewayRestart } = createGatewayReloadHandlers({
+          deps,
+          broadcast,
+          getState: () => ({
+            hooksConfig,
+            heartbeatRunner,
+            browserControl,
+          }),
+          setState: (nextState) => {
+            hooksConfig = nextState.hooksConfig;
+            heartbeatRunner = nextState.heartbeatRunner;
+            browserControl = nextState.browserControl;
+          },
+          startChannel,
+          stopChannel,
+          logHooks,
+          logBrowser,
+          logChannels,
+          logReload,
+        });
+
+        return startGatewayConfigReloader({
+          // Not cfgAtStart: startup itself can write the config (the browser
+          // control service saves a generated gateway.auth.token when none
+          // exists). Diffing later edits against the pre-write copy reported
+          // `gateway` as changed and restarted the gateway on the next
+          // unrelated save, which cut the browser setup off mid-wizard.
+          initialConfig: loadConfig(),
+          readSnapshot: readConfigFileSnapshot,
+          onHotReload: applyHotReload,
+          onRestart: requestGatewayRestart,
+          log: {
+            info: (msg) => logReload.info(msg),
+            warn: (msg) => logReload.warn(msg),
+            error: (msg) => logReload.error(msg),
+          },
+          watchPath: CONFIG_PATH,
+        });
+      })();
+
+  const close = createGatewayCloseHandler({
+    tailscaleCleanup,
+    canvasHost,
+    canvasHostServer,
+    stopChannel,
+    pluginServices,
+    heartbeatRunner,
+    nodePresenceTimers,
+    broadcast,
+    tickInterval,
+    healthInterval,
+    dedupeCleanup,
+    eventLoopMonitor,
+    circlesScheduler,
+    stopUpdateCheck,
+    agentUnsub,
+    heartbeatUnsub,
+    usageUnsub,
+    usageBudgetUnsub,
+    usageMetricsUnsub,
+    chatRunState,
+    clients,
+    configReloader,
+    browserControl,
+    orchestratorBridge,
+    computeMesh,
+    peerRpcTransport,
+    wss,
+    httpServer,
+    httpServers,
+    closeA2a,
+  });
+
+  return {
+    close: async (opts) => {
+      // Run gateway_stop plugin hook before shutdown
+      await runGlobalGatewayStopSafely({
+        event: { reason: opts?.reason ?? "gateway stopping" },
+        ctx: { port },
+        onError: (err) => log.warn(`gateway_stop hook failed: ${String(err)}`),
+      });
+      if (diagnosticsEnabled) {
+        stopDiagnosticHeartbeat();
+      }
+      if (skillsRefreshTimer) {
+        clearTimeout(skillsRefreshTimer);
+        skillsRefreshTimer = null;
+      }
+      skillsChangeUnsub();
+      authRateLimiter?.dispose();
+      await close(opts);
+    },
+  };
+}

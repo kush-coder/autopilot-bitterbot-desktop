@@ -1,0 +1,249 @@
+---
+summary: "Browser-based control UI for the Gateway (chat, nodes, config)"
+read_when:
+  - You want to operate the Gateway from a browser
+  - You want Tailnet access without SSH tunnels
+title: "Control UI"
+---
+
+# Control UI (browser)
+
+The Control UI is a small **Vite + React** single-page app served by the Gateway:
+
+- default: `http://127.0.0.1:19001` (served by the gateway; Vite on 5173 is the dev workflow)
+- optional prefix: set `gateway.controlUi.basePath` (e.g. `/bitterbot`)
+
+It speaks **directly to the Gateway WebSocket** on the same port.
+
+## Quick open (local)
+
+If the Gateway is running on the same computer, open:
+
+- [http://127.0.0.1:19001](http://127.0.0.1:19001) (served by the gateway)
+
+If the page fails to load, start the Gateway first: `bitterbot gateway`.
+
+Auth is supplied during the WebSocket handshake via:
+
+- `connect.params.auth.token`
+- `connect.params.auth.password`
+  The dashboard settings panel lets you store a token; passwords are not persisted.
+  The onboarding wizard generates a gateway token by default, so paste it here on first connect.
+
+## Device pairing (first connection)
+
+When you connect to the Control UI from a new browser or device, the Gateway
+requires a **one-time pairing approval** — even if you're on the same Tailnet
+with `gateway.auth.allowTailscale: true`. This is a security measure to prevent
+unauthorized access.
+
+**What you'll see:** "disconnected (1008): pairing required"
+
+**To approve the device:**
+
+```bash
+# List pending requests
+bitterbot devices list
+
+# Approve by request ID
+bitterbot devices approve <requestId>
+```
+
+Once approved, the device is remembered and won't require re-approval unless
+you revoke it with `bitterbot devices revoke --device <id> --role <role>`. See
+[Devices CLI](/cli/devices) for token rotation and revocation.
+
+**Notes:**
+
+- Local connections (`127.0.0.1`) are auto-approved.
+- Remote connections (LAN, Tailnet, etc.) require explicit approval.
+- On a fresh remote gateway with `gateway.controlUi.bootstrapPairing: true` (or
+  `BITTERBOT_BOOTSTRAP_PAIRING=1`, which the Fly, VPS and Compose setups set), the
+  first Control UI that proves the gateway token is paired automatically, once,
+  while no device is paired. See [Docker and always-on hosting](/platforms/docker).
+- Each browser profile generates a unique device ID, so switching browsers or
+  clearing browser data will require re-pairing.
+
+## What it can do (today)
+
+- Chat with the model via Gateway WS (`chat.history`, `chat.send`, `chat.abort`, `chat.inject`)
+- Switch the chat session's model on the fly from the chat header (`models.list`, `sessions.patch`): a model pill next to the session selector opens a searchable catalog grouped by provider; picking a model applies a per-session override live (no gateway restart), and "Reset to default" returns the session to the node's configured default. The pill turns amber while an override is active.
+- Models & Keys panel (Settings group): change the node default model (`models.setDefault`, applies next turn, no restart), see per-provider credential status including which source wins (profile vs env var vs config) and cooldown warnings (`models.auth.list`), test a key live before saving (`models.auth.test`), and add/rotate/delete keys (`models.auth.set`, `models.auth.delete`). Secrets are write-only: the UI never receives stored key material back.
+- Stream tool calls + live tool output cards in Chat (agent events)
+- Side panel ("BitterBot's Computer"): a **Browser** tab with a live view of the agent's page and a **Take over** control (see [Live view and take over](/tools/browser#live-view-and-take-over)), and a terminal view for shell commands. While the panel is open the window holds a tool output lease (`tools.output.subscribe`, `operator.admin`), so command output and file contents are shown there. The lease applies to that one connection: other clients and chat channels still get tool events without output unless the session runs at verbose `full`.
+- Channels: WhatsApp/Telegram/Discord/Slack/Signal status + QR login + per-channel config (`channels.status`, `web.login.*`, `config.patch`)
+- Channels on/off mid-session (`channels.update`): each account row has an enable/disable switch; the gateway flips the config flag and stops/starts just that account in-process - no gateway restart, other channels untouched. Channels the gateway host cannot run (wrong OS, missing binary like signal-cli) render greyed with the reason ("Requires a darwin gateway host...") via the `channelCapabilities` block in `channels.status`. Note the capability check reflects the GATEWAY host's OS, not the machine running the browser.
+- Bundled channels (Telegram, WhatsApp, Discord, Slack, Signal, Email, X) appear on the Channels tab out of the box, even on a fresh node with nothing configured - registration is boot-time only and nothing connects until credentials exist and the account is enabled. Set `plugins.entries.<id>.enabled=false` to hide one. Twitch is bundled but opt-in (`plugins.entries.twitch.enabled=true`).
+- Guided channel setup ("Set up" / "Edit setup" on each card): a per-channel credential form (Telegram bot token with BotFather help, Discord bot token, Slack bot + app tokens, Signal number/cli/daemon) with **Validate** - `channels.validate` probes the draft live against the provider without persisting anything - and **Save & Enable** - `channels.configure` writes the fields, hot-restarts just that channel, and returns a post-save probe. Redacted placeholders never overwrite stored secrets.
+- QR device linking for WhatsApp AND Signal (`web.login.start` / `web.login.wait` now accept a `channel` param): the dialog renders the QR, waits for the phone scan, and brings the channel up. Signal drives `signal-cli link` under the hood and reports the linked number.
+- Instances: presence list + refresh (`system-presence`)
+- Sessions: list + per-session thinking/verbose overrides (`sessions.list`, `sessions.patch`)
+- Cron jobs: list/add/run/enable/disable + run history (`cron.*`)
+- Skills: status, enable/disable, install, API key updates (`skills.*`)
+- Nodes: list + caps (`node.list`)
+- Exec approvals: edit gateway or node allowlists + ask policy for `exec host=gateway/node` (`exec.approvals.*`)
+- Config: view/edit `~/.bitterbot/bitterbot.json` (`config.get`, `config.set`)
+- Config: apply + restart with validation (`config.apply`) and wake the last active session
+- `config.patch` is restart-aware: it diffs the changed paths against the reload rules and only schedules a gateway restart when a changed path actually requires one (gateway/plugins/discovery/canvasHost). Hot and no-op paths (models, agents, per-channel prefixes) apply via the config watcher with `restart: null` and a `reload` summary in the response - no gateway blackout.
+- Config writes include a base-hash guard to prevent clobbering concurrent edits
+- Config schema + form rendering (`config.schema`, including plugin + channel schemas); Raw JSON editor remains available
+- The Settings form shows the effective value of every labelled key: a key you have not set renders its real default and wears a `default` badge; a key in your file renders without one. Booleans are switches, enumerated values are drop-downs, numbers are number inputs, and `meta.*` is read-only. "Add setting" lists every labelled key that is unset and has no default (daily/weekly/monthly budgets, the four review policies, sandbox mode, wallet caps and so on); an added row stays empty until you set it. "Show advanced" reveals tuning and transport knobs. Deprecated keys are never offered, show read-only with the reason when your file still sets them, and are warned about at gateway start.
+- Debug: status/health/models snapshots + event log + manual RPC calls (`status`, `health`, `models.list`)
+- Logs: live tail of gateway file logs with filter/export (`logs.tail`)
+- Update: run a package/git update + restart (`update.run`) with a restart report. In a container the update is refused; pull a newer image instead (VPS: `/opt/bitterbot/update.sh`, Fly: `fly deploy`)
+
+Cron jobs panel notes:
+
+- For isolated jobs, delivery defaults to announce summary. You can switch to none if you want internal-only runs.
+- Channel/target fields appear when announce is selected.
+- New job form includes a **Notify webhook** toggle (`notify` on the job).
+- Gateway webhook posting requires both `notify: true` on the job and `cron.webhook` in config.
+- Set `cron.webhookToken` to send a dedicated bearer token, if omitted the webhook is sent without an auth header.
+
+## Chat behavior
+
+- `chat.send` is **non-blocking**: it acks immediately with `{ runId, status: "started" }` and the response streams via `chat` events.
+- Re-sending with the same `idempotencyKey` returns `{ status: "in_flight" }` while running, and `{ status: "ok" }` after completion.
+- `chat.inject` appends an assistant note to the session transcript and broadcasts a `chat` event for UI-only updates (no agent run, no channel delivery).
+- Stop:
+  - Click **Stop** (calls `chat.abort`)
+  - Type `/stop` (or `stop|esc|abort|wait|exit|interrupt`) to abort out-of-band
+  - `chat.abort` supports `{ sessionKey }` (no `runId`) to abort all active runs for that session
+- Abort partial retention:
+  - When a run is aborted, partial assistant text can still be shown in the UI
+  - Gateway persists aborted partial assistant text into transcript history when buffered output exists
+  - Persisted entries include abort metadata so transcript consumers can tell abort partials from normal completion output
+
+## Talking to the agent
+
+Click the microphone in the chat box to talk instead of type. Voice mode keeps
+listening until you click it again:
+
+- When you stop talking (about a second of silence), what you said is turned into
+  text and sent as a chat message.
+- The reply is read aloud sentence by sentence as it streams in, so the agent starts
+  talking before it has finished writing. Code blocks are skipped and links are
+  read as "a link".
+- Talk over it to interrupt: its voice stops and the run is stopped (`chat.abort`),
+  and what you say next becomes the new message.
+
+Speech to text uses the same providers as voice notes from chat apps: an OpenAI,
+Groq, Deepgram or Google key, or whatever `tools.media.audio` names. Speech uses
+your [text-to-speech](/tools/tts) settings; Edge TTS works with no key. The browser
+asks for microphone access the first time, which needs `https` or `localhost`.
+
+Voice mode uses `talk.transcribe` and `talk.speak`, which need `operator.write`.
+
+## Tailnet access (recommended)
+
+### Integrated Tailscale Serve (preferred)
+
+Keep the Gateway on loopback and let Tailscale Serve proxy it with HTTPS:
+
+```bash
+bitterbot gateway --tailscale serve
+```
+
+Open:
+
+- `https://<magicdns>/` (or your configured `gateway.controlUi.basePath`)
+
+By default, Serve requests can authenticate via Tailscale identity headers
+(`tailscale-user-login`) when `gateway.auth.allowTailscale` is `true`. Bitterbot
+verifies the identity by resolving the `x-forwarded-for` address with
+`tailscale whois` and matching it to the header, and only accepts these when the
+request hits loopback with Tailscale’s `x-forwarded-*` headers. Set
+`gateway.auth.allowTailscale: false` (or force `gateway.auth.mode: "password"`)
+if you want to require a token/password even for Serve traffic.
+
+### Bind to tailnet + token
+
+```bash
+bitterbot gateway --bind tailnet --token "$(openssl rand -hex 32)"
+```
+
+Then open:
+
+- `http://<tailscale-ip>:19001/` (or your configured `gateway.controlUi.basePath`)
+
+Paste the token into the UI settings (sent as `connect.params.auth.token`).
+
+## Insecure HTTP
+
+If you open the dashboard over plain HTTP (`http://<lan-ip>` or `http://<tailscale-ip>`),
+the browser runs in a **non-secure context** and blocks WebCrypto. By default,
+Bitterbot **blocks** Control UI connections without device identity.
+
+**Recommended fix:** use HTTPS (Tailscale Serve) or open the UI locally:
+
+- `https://<magicdns>/` (Serve)
+- `http://127.0.0.1:19001/` (on the gateway host)
+
+**Downgrade example (token-only over HTTP):**
+
+```json5
+{
+  gateway: {
+    controlUi: { allowInsecureAuth: true },
+    bind: "tailnet",
+    auth: { mode: "token", token: "replace-me" },
+  },
+}
+```
+
+This disables device identity + pairing for the Control UI (even on HTTPS). Use
+only if you trust the network.
+
+See [Tailscale](/gateway/tailscale) for HTTPS setup guidance.
+
+## Building the UI
+
+The Gateway serves static files from `dist/control-ui`. Build them with:
+
+```bash
+pnpm install # at the repo root, once
+pnpm build
+```
+
+To serve the UI under a path prefix, set `gateway.controlUi.basePath` (for
+example `/bitterbot`); the build itself uses relative asset URLs.
+
+To run the Control UI locally:
+
+```bash
+pnpm install # at the repo root, once
+cd desktop && pnpm dev
+```
+
+Then point the UI at your Gateway WS URL (e.g. `ws://127.0.0.1:19001`).
+
+## Connecting to a remote Gateway
+
+The Control UI is static files; the WebSocket target is derived from the page's
+own origin, so when the gateway serves the UI (the default) there is nothing to
+configure — local or over an SSH tunnel/Tailscale Serve, the UI always talks to
+the gateway that served it.
+
+To point a UI at a _different_ gateway, use the first-run screen: open the UI,
+choose "Connect to a remote gateway", and enter the `ws(s)://` URL and token.
+The values are stored in the browser's localStorage; clearing site data resets
+them.
+
+> A previous revision documented a `?gatewayUrl=` URL parameter. It was never
+> implemented and has been removed from these docs; the first-run screen and
+> the same-origin token handoff replace it.
+
+For cross-origin dev setups (`pnpm dev:all`, Vite on 5173, gateway on 19001),
+add the dev origin to `gateway.controlUi.allowedOrigins`:
+
+```json5
+{
+  gateway: {
+    controlUi: {
+      allowedOrigins: ["http://localhost:5173"],
+    },
+  },
+}
+```
+
+Remote access setup details: [Remote access](/gateway/remote).

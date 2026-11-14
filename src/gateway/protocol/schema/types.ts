@@ -1,0 +1,308 @@
+import type { Static } from "@sinclair/typebox";
+import type {
+  AgentEventSchema,
+  AgentIdentityParamsSchema,
+  AgentIdentityResultSchema,
+  AgentWaitParamsSchema,
+  PollParamsSchema,
+  WakeParamsSchema,
+} from "./agent.js";
+import type {
+  AgentSummarySchema,
+  AgentsFileEntrySchema,
+  AgentsCreateParamsSchema,
+  AgentsCreateResultSchema,
+  AgentsDeleteParamsSchema,
+  AgentsDeleteResultSchema,
+  AgentsFilesGetParamsSchema,
+  AgentsFilesGetResultSchema,
+  AgentsFilesListParamsSchema,
+  AgentsFilesListResultSchema,
+  AgentsFilesSetParamsSchema,
+  AgentsFilesSetResultSchema,
+  AgentsListResultSchema,
+  AgentsUpdateParamsSchema,
+  AgentsUpdateResultSchema,
+  ModelChoiceSchema,
+  ModelsAuthDeleteParamsSchema,
+  ModelsAuthSetParamsSchema,
+  ModelsAuthTestParamsSchema,
+  ModelsListParamsSchema,
+  ModelsSetDefaultParamsSchema,
+  ModelsListResultSchema,
+  SkillsBinsResultSchema,
+  SkillsCreateParamsSchema,
+  SkillsInstallParamsSchema,
+  SkillsManageParamsSchema,
+  SkillsManageResultSchema,
+  SkillsMetricsParamsSchema,
+  SkillsMetricsResultSchema,
+  SkillsEvolutionCorpusReviewParamsSchema,
+  SkillsEvolutionFeedbackParamsSchema,
+  SkillsEvolutionCalibrationExportParamsSchema,
+  SkillsEvolutionCalibrationScoreParamsSchema,
+  SkillsPromoteParamsSchema,
+  SkillsPromoteResultSchema,
+  SkillsPublishParamsSchema,
+  SkillsPublishResultSchema,
+  SkillsRollbackParamsSchema,
+  SkillsRollbackResultSchema,
+  SkillsStatusParamsSchema,
+  SkillsUpdateAgentFilterParamsSchema,
+  SkillsUpdateAgentFilterResultSchema,
+  SkillsUpdateParamsSchema,
+  SkillsUpdateTrustSettingsParamsSchema,
+  SkillsUpdateTrustSettingsResultSchema,
+  SkillsUploadAgentskillsParamsSchema,
+  SkillsUploadAgentskillsResultSchema,
+  SkillsValidateParamsSchema,
+  SkillsValidateResultSchema,
+} from "./agents-models-skills.js";
+import type {
+  ChannelsLogoutParamsSchema,
+  ChannelsUpdateParamsSchema,
+  ChannelsValidateParamsSchema,
+  ChannelsConfigureParamsSchema,
+  TalkConfigParamsSchema,
+  TalkConfigResultSchema,
+  ChannelsStatusParamsSchema,
+  ChannelsStatusResultSchema,
+  TalkModeParamsSchema,
+  WebLoginStartParamsSchema,
+  WebLoginWaitParamsSchema,
+} from "./channels.js";
+import type {
+  ConfigApplyParamsSchema,
+  ConfigPatchParamsSchema,
+  ConfigSchemaResponseSchema,
+  ConfigSetParamsSchema,
+  UpdateCheckParamsSchema,
+  UpdateRunParamsSchema,
+} from "./config.js";
+import type {
+  DevicePairApproveParamsSchema,
+  DevicePairRejectParamsSchema,
+  DeviceTokenRevokeParamsSchema,
+  DeviceTokenRotateParamsSchema,
+} from "./devices.js";
+import type {
+  ExecApprovalsNodeGetParamsSchema,
+  ExecApprovalsNodeSetParamsSchema,
+  ExecApprovalsSetParamsSchema,
+  ExecApprovalsSnapshotSchema,
+  ExecApprovalRequestParamsSchema,
+  ExecApprovalResolveParamsSchema,
+} from "./exec-approvals.js";
+import type {
+  ConnectParamsSchema,
+  ErrorShapeSchema,
+  EventFrameSchema,
+  GatewayFrameSchema,
+  HelloOkSchema,
+  RequestFrameSchema,
+  ResponseFrameSchema,
+  ShutdownEventSchema,
+  TickEventSchema,
+} from "./frames.js";
+import type {
+  ChatAbortParamsSchema,
+  ChatEventSchema,
+  ChatInjectParamsSchema,
+  LogsTailParamsSchema,
+  LogsTailResultSchema,
+} from "./logs-chat.js";
+import type {
+  NodeDescribeParamsSchema,
+  NodeEventParamsSchema,
+  NodeInvokeParamsSchema,
+  NodeInvokeResultParamsSchema,
+  NodePairApproveParamsSchema,
+  NodePairRejectParamsSchema,
+  NodePairRequestParamsSchema,
+  NodePairVerifyParamsSchema,
+  NodeRenameParamsSchema,
+} from "./nodes.js";
+import type {
+  SessionsCompactParamsSchema,
+  SessionsDeleteParamsSchema,
+  SessionsListParamsSchema,
+  SessionsPatchParamsSchema,
+  SessionsPreviewParamsSchema,
+  SessionsResetParamsSchema,
+  SessionsResolveParamsSchema,
+  SessionsUsageParamsSchema,
+  UsageLedgerEventsParamsSchema,
+  UsageLedgerExplainParamsSchema,
+  UsageLedgerSummaryParamsSchema,
+  UsageLedgerWhatIfParamsSchema,
+} from "./sessions.js";
+import type {
+  GatewayRuntimeSchema,
+  PresenceEntrySchema,
+  SnapshotSchema,
+  StateVersionSchema,
+} from "./snapshot.js";
+import type {
+  WizardCancelParamsSchema,
+  WizardNextParamsSchema,
+  WizardNextResultSchema,
+  WizardStartParamsSchema,
+  WizardStartResultSchema,
+  WizardStatusParamsSchema,
+  WizardStatusResultSchema,
+  WizardStepSchema,
+} from "./wizard.js";
+
+export type ConnectParams = Static<typeof ConnectParamsSchema>;
+export type HelloOk = Static<typeof HelloOkSchema>;
+export type RequestFrame = Static<typeof RequestFrameSchema>;
+export type ResponseFrame = Static<typeof ResponseFrameSchema>;
+export type EventFrame = Static<typeof EventFrameSchema>;
+export type GatewayFrame = Static<typeof GatewayFrameSchema>;
+export type Snapshot = Static<typeof SnapshotSchema>;
+export type GatewayRuntime = Static<typeof GatewayRuntimeSchema>;
+export type PresenceEntry = Static<typeof PresenceEntrySchema>;
+export type ErrorShape = Static<typeof ErrorShapeSchema>;
+export type StateVersion = Static<typeof StateVersionSchema>;
+export type AgentEvent = Static<typeof AgentEventSchema>;
+export type AgentIdentityParams = Static<typeof AgentIdentityParamsSchema>;
+export type AgentIdentityResult = Static<typeof AgentIdentityResultSchema>;
+export type PollParams = Static<typeof PollParamsSchema>;
+export type AgentWaitParams = Static<typeof AgentWaitParamsSchema>;
+export type WakeParams = Static<typeof WakeParamsSchema>;
+export type NodePairRequestParams = Static<typeof NodePairRequestParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type NodePairListParams = Record<string, never>;
+export type NodePairApproveParams = Static<typeof NodePairApproveParamsSchema>;
+export type NodePairRejectParams = Static<typeof NodePairRejectParamsSchema>;
+export type NodePairVerifyParams = Static<typeof NodePairVerifyParamsSchema>;
+export type NodeRenameParams = Static<typeof NodeRenameParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type NodeListParams = Record<string, never>;
+export type NodeDescribeParams = Static<typeof NodeDescribeParamsSchema>;
+export type NodeInvokeParams = Static<typeof NodeInvokeParamsSchema>;
+export type NodeInvokeResultParams = Static<typeof NodeInvokeResultParamsSchema>;
+export type NodeEventParams = Static<typeof NodeEventParamsSchema>;
+export type SessionsListParams = Static<typeof SessionsListParamsSchema>;
+export type SessionsPreviewParams = Static<typeof SessionsPreviewParamsSchema>;
+export type SessionsResolveParams = Static<typeof SessionsResolveParamsSchema>;
+export type SessionsPatchParams = Static<typeof SessionsPatchParamsSchema>;
+export type SessionsResetParams = Static<typeof SessionsResetParamsSchema>;
+export type SessionsDeleteParams = Static<typeof SessionsDeleteParamsSchema>;
+export type SessionsCompactParams = Static<typeof SessionsCompactParamsSchema>;
+export type SessionsUsageParams = Static<typeof SessionsUsageParamsSchema>;
+export type UsageLedgerSummaryParams = Static<typeof UsageLedgerSummaryParamsSchema>;
+export type UsageLedgerEventsParams = Static<typeof UsageLedgerEventsParamsSchema>;
+export type UsageLedgerWhatIfParams = Static<typeof UsageLedgerWhatIfParamsSchema>;
+export type UsageLedgerExplainParams = Static<typeof UsageLedgerExplainParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type ConfigGetParams = Record<string, never>;
+export type ConfigSetParams = Static<typeof ConfigSetParamsSchema>;
+export type ConfigApplyParams = Static<typeof ConfigApplyParamsSchema>;
+export type ConfigPatchParams = Static<typeof ConfigPatchParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type ConfigSchemaParams = Record<string, never>;
+export type ConfigSchemaResponse = Static<typeof ConfigSchemaResponseSchema>;
+export type WizardStartParams = Static<typeof WizardStartParamsSchema>;
+export type WizardNextParams = Static<typeof WizardNextParamsSchema>;
+export type WizardCancelParams = Static<typeof WizardCancelParamsSchema>;
+export type WizardStatusParams = Static<typeof WizardStatusParamsSchema>;
+export type WizardStep = Static<typeof WizardStepSchema>;
+export type WizardNextResult = Static<typeof WizardNextResultSchema>;
+export type WizardStartResult = Static<typeof WizardStartResultSchema>;
+export type WizardStatusResult = Static<typeof WizardStatusResultSchema>;
+export type TalkModeParams = Static<typeof TalkModeParamsSchema>;
+export type TalkConfigParams = Static<typeof TalkConfigParamsSchema>;
+export type TalkConfigResult = Static<typeof TalkConfigResultSchema>;
+export type ChannelsStatusParams = Static<typeof ChannelsStatusParamsSchema>;
+export type ChannelsStatusResult = Static<typeof ChannelsStatusResultSchema>;
+export type ChannelsLogoutParams = Static<typeof ChannelsLogoutParamsSchema>;
+export type ChannelsUpdateParams = Static<typeof ChannelsUpdateParamsSchema>;
+export type ChannelsValidateParams = Static<typeof ChannelsValidateParamsSchema>;
+export type ChannelsConfigureParams = Static<typeof ChannelsConfigureParamsSchema>;
+export type WebLoginStartParams = Static<typeof WebLoginStartParamsSchema>;
+export type WebLoginWaitParams = Static<typeof WebLoginWaitParamsSchema>;
+export type AgentSummary = Static<typeof AgentSummarySchema>;
+export type AgentsFileEntry = Static<typeof AgentsFileEntrySchema>;
+export type AgentsCreateParams = Static<typeof AgentsCreateParamsSchema>;
+export type AgentsCreateResult = Static<typeof AgentsCreateResultSchema>;
+export type AgentsUpdateParams = Static<typeof AgentsUpdateParamsSchema>;
+export type AgentsUpdateResult = Static<typeof AgentsUpdateResultSchema>;
+export type AgentsDeleteParams = Static<typeof AgentsDeleteParamsSchema>;
+export type AgentsDeleteResult = Static<typeof AgentsDeleteResultSchema>;
+export type AgentsFilesListParams = Static<typeof AgentsFilesListParamsSchema>;
+export type AgentsFilesListResult = Static<typeof AgentsFilesListResultSchema>;
+export type AgentsFilesGetParams = Static<typeof AgentsFilesGetParamsSchema>;
+export type AgentsFilesGetResult = Static<typeof AgentsFilesGetResultSchema>;
+export type AgentsFilesSetParams = Static<typeof AgentsFilesSetParamsSchema>;
+export type AgentsFilesSetResult = Static<typeof AgentsFilesSetResultSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type AgentsListParams = Record<string, never>;
+export type AgentsListResult = Static<typeof AgentsListResultSchema>;
+export type ModelChoice = Static<typeof ModelChoiceSchema>;
+export type ModelsListParams = Static<typeof ModelsListParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type ModelsAuthListParams = Record<string, never>;
+export type ModelsAuthTestParams = Static<typeof ModelsAuthTestParamsSchema>;
+export type ModelsAuthSetParams = Static<typeof ModelsAuthSetParamsSchema>;
+export type ModelsAuthDeleteParams = Static<typeof ModelsAuthDeleteParamsSchema>;
+export type ModelsSetDefaultParams = Static<typeof ModelsSetDefaultParamsSchema>;
+export type ModelsListResult = Static<typeof ModelsListResultSchema>;
+export type SkillsStatusParams = Static<typeof SkillsStatusParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type SkillsBinsParams = Record<string, never>;
+export type SkillsBinsResult = Static<typeof SkillsBinsResultSchema>;
+export type SkillsInstallParams = Static<typeof SkillsInstallParamsSchema>;
+export type SkillsUpdateParams = Static<typeof SkillsUpdateParamsSchema>;
+export type SkillsCreateParams = Static<typeof SkillsCreateParamsSchema>;
+export type SkillsMetricsParams = Static<typeof SkillsMetricsParamsSchema>;
+export type SkillsMetricsResult = Static<typeof SkillsMetricsResultSchema>;
+export type SkillsUpdateAgentFilterParams = Static<typeof SkillsUpdateAgentFilterParamsSchema>;
+export type SkillsUpdateAgentFilterResult = Static<typeof SkillsUpdateAgentFilterResultSchema>;
+export type SkillsUpdateTrustSettingsParams = Static<typeof SkillsUpdateTrustSettingsParamsSchema>;
+export type SkillsUpdateTrustSettingsResult = Static<typeof SkillsUpdateTrustSettingsResultSchema>;
+export type SkillsValidateParams = Static<typeof SkillsValidateParamsSchema>;
+export type SkillsValidateResult = Static<typeof SkillsValidateResultSchema>;
+export type SkillsPublishParams = Static<typeof SkillsPublishParamsSchema>;
+export type SkillsPublishResult = Static<typeof SkillsPublishResultSchema>;
+export type SkillsManageParams = Static<typeof SkillsManageParamsSchema>;
+export type SkillsManageResult = Static<typeof SkillsManageResultSchema>;
+export type SkillsEvolutionCorpusReviewParams = Static<
+  typeof SkillsEvolutionCorpusReviewParamsSchema
+>;
+export type SkillsEvolutionFeedbackParams = Static<typeof SkillsEvolutionFeedbackParamsSchema>;
+export type SkillsEvolutionCalibrationExportParams = Static<
+  typeof SkillsEvolutionCalibrationExportParamsSchema
+>;
+export type SkillsEvolutionCalibrationScoreParams = Static<
+  typeof SkillsEvolutionCalibrationScoreParamsSchema
+>;
+export type SkillsPromoteParams = Static<typeof SkillsPromoteParamsSchema>;
+export type SkillsPromoteResult = Static<typeof SkillsPromoteResultSchema>;
+export type SkillsRollbackParams = Static<typeof SkillsRollbackParamsSchema>;
+export type SkillsRollbackResult = Static<typeof SkillsRollbackResultSchema>;
+export type SkillsUploadAgentskillsParams = Static<typeof SkillsUploadAgentskillsParamsSchema>;
+export type SkillsUploadAgentskillsResult = Static<typeof SkillsUploadAgentskillsResultSchema>;
+export type LogsTailParams = Static<typeof LogsTailParamsSchema>;
+export type LogsTailResult = Static<typeof LogsTailResultSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type ExecApprovalsGetParams = Record<string, never>;
+export type ExecApprovalsSetParams = Static<typeof ExecApprovalsSetParamsSchema>;
+export type ExecApprovalsNodeGetParams = Static<typeof ExecApprovalsNodeGetParamsSchema>;
+export type ExecApprovalsNodeSetParams = Static<typeof ExecApprovalsNodeSetParamsSchema>;
+export type ExecApprovalsSnapshot = Static<typeof ExecApprovalsSnapshotSchema>;
+export type ExecApprovalRequestParams = Static<typeof ExecApprovalRequestParamsSchema>;
+export type ExecApprovalResolveParams = Static<typeof ExecApprovalResolveParamsSchema>;
+// The schema accepts no properties (additionalProperties: false).
+export type DevicePairListParams = Record<string, never>;
+export type DevicePairApproveParams = Static<typeof DevicePairApproveParamsSchema>;
+export type DevicePairRejectParams = Static<typeof DevicePairRejectParamsSchema>;
+export type DeviceTokenRotateParams = Static<typeof DeviceTokenRotateParamsSchema>;
+export type DeviceTokenRevokeParams = Static<typeof DeviceTokenRevokeParamsSchema>;
+export type ChatAbortParams = Static<typeof ChatAbortParamsSchema>;
+export type ChatInjectParams = Static<typeof ChatInjectParamsSchema>;
+export type ChatEvent = Static<typeof ChatEventSchema>;
+export type UpdateRunParams = Static<typeof UpdateRunParamsSchema>;
+export type UpdateCheckParams = Static<typeof UpdateCheckParamsSchema>;
+export type TickEvent = Static<typeof TickEventSchema>;
+export type ShutdownEvent = Static<typeof ShutdownEventSchema>;

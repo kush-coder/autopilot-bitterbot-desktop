@@ -1,0 +1,201 @@
+import { Play, Terminal, Image, AlertCircle, CheckCircle2, Loader2 } from "lucide-react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { onCodeExecResult, type CodeExecResult } from "../../../lib/code-exec-manager";
+import { cn } from "../../../lib/utils";
+import { useArtifactStore } from "../../../stores/artifact-store";
+import { useGatewayStore } from "../../../stores/gateway-store";
+import { useUIStore } from "../../../stores/ui-store";
+import type { ToolViewProps } from "./ToolViewRegistry";
+
+/**
+ * Tool view for the code_interpreter tool call.
+ * Shows code, execution status, stdout/stderr, and generated images.
+ */
+export function CodeInterpreterView({ toolCall }: ToolViewProps) {
+  const setToolPanelOpen = useUIStore((s) => s.setToolPanelOpen);
+  const setPanelMode = useArtifactStore((s) => s.setPanelMode);
+  const outputRef = useRef<HTMLPreElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const [execResult, setExecResult] = useState<CodeExecResult | null>(null);
+  const [iframeLoaded, setIframeLoaded] = useState(false);
+
+  const args = toolCall.args as Record<string, unknown> | undefined;
+  const language = typeof args?.language === "string" ? args.language : "javascript";
+  const code = typeof args?.code === "string" ? args.code : "";
+
+  const isRunning = toolCall.status === "running";
+  const isCompleted = toolCall.status === "completed";
+  const isError = toolCall.status === "error";
+
+  // Parse execId from tool result
+  const execId = (() => {
+    if (!toolCall.result) return null;
+    try {
+      const parsed = JSON.parse(toolCall.result);
+      return typeof parsed.execId === "string" ? parsed.execId : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  // Derive the canvas host base URL from gateway connection (same pattern as ArtifactPanel)
+  const hello = useGatewayStore((s) => s.hello);
+  const canvasBaseUrl = (() => {
+    if (!hello?.ts) return null;
+    const gwUrl = useGatewayStore.getState().client?.url;
+    if (!gwUrl) return null;
+    try {
+      const parsed = new URL(gwUrl.replace("ws://", "http://").replace("wss://", "https://"));
+      return `${parsed.protocol}//${parsed.hostname}:${parsed.port}/__bitterbot__/canvas`;
+    } catch {
+      return null;
+    }
+  })();
+
+  // Listen for execution results
+  useEffect(() => {
+    if (!execId) return;
+    const cleanup = onCodeExecResult(execId, (result) => {
+      setExecResult(result);
+    });
+    return cleanup;
+  }, [execId]);
+
+  // Auto-scroll output
+  useEffect(() => {
+    if (outputRef.current) {
+      outputRef.current.scrollTop = outputRef.current.scrollHeight;
+    }
+  }, [execResult]);
+
+  // Build iframe URL for code execution
+  const iframeSrc = execId && canvasBaseUrl ? `${canvasBaseUrl}/code-exec/${execId}.html` : null;
+
+  const hasOutput =
+    execResult && (execResult.stdout || execResult.stderr || execResult.images.length > 0);
+  const hasImages = execResult && execResult.images.length > 0;
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-3 py-2 bg-card/60 border-b border-border/50">
+        <Terminal className="w-3.5 h-3.5 text-success" />
+        <span className="text-xs font-medium text-foreground">Code Interpreter</span>
+        <span
+          className={cn(
+            "text-badge uppercase tracking-wider px-1.5 py-0.5 rounded",
+            language === "python"
+              ? "bg-info/10 text-info border border-info/20"
+              : "bg-warning/10 text-warning border border-warning/20",
+          )}
+        >
+          {language}
+        </span>
+        <div className="ml-auto flex items-center gap-1.5">
+          {isRunning && !execResult && (
+            <>
+              <Loader2 className="w-3 h-3 text-success animate-spin" />
+              <span className="text-badge text-success">Running</span>
+            </>
+          )}
+          {execResult && !execResult.error && (
+            <>
+              <CheckCircle2 className="w-3 h-3 text-success" />
+              <span className="text-badge text-success">Completed</span>
+            </>
+          )}
+          {(isError || execResult?.error) && (
+            <>
+              <AlertCircle className="w-3 h-3 text-danger" />
+              <span className="text-badge text-danger">Error</span>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Code display */}
+      {code && (
+        <div className="border-b border-border/50">
+          <div className="px-3 py-1.5 bg-card/40 border-b border-border/30 flex items-center gap-1.5">
+            <Play className="w-3 h-3 text-muted-foreground/50" />
+            <span className="text-badge text-muted-foreground/60 uppercase tracking-wider">
+              Code
+            </span>
+          </div>
+          <pre className="p-3 bg-card/60 font-mono text-xs text-foreground leading-relaxed whitespace-pre-wrap break-all overflow-auto max-h-[200px]">
+            {code}
+          </pre>
+        </div>
+      )}
+
+      {/* Output area */}
+      <div className="flex-1 overflow-auto">
+        {/* stdout/stderr */}
+        {(hasOutput || isRunning) && (
+          <div className="border-b border-border/30">
+            <div className="px-3 py-1.5 bg-card/40 border-b border-border/30">
+              <span className="text-badge text-muted-foreground/60 uppercase tracking-wider">
+                Output
+              </span>
+            </div>
+            <pre
+              ref={outputRef}
+              className="p-3 bg-card/40 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all max-h-[300px] overflow-auto"
+            >
+              {execResult?.stdout && <span className="text-foreground">{execResult.stdout}</span>}
+              {execResult?.stderr && <span className="text-danger">{execResult.stderr}</span>}
+              {execResult?.returnValue && (
+                <span className="text-success/70">
+                  {"\n→ "}
+                  {execResult.returnValue}
+                </span>
+              )}
+              {isRunning && !execResult && (
+                <span className="text-muted-foreground animate-pulse">
+                  {language === "python" ? "Loading Python runtime..." : "Executing..."}
+                </span>
+              )}
+              {!hasOutput && !isRunning && isCompleted && !execResult && (
+                <span className="text-muted-foreground">Awaiting output...</span>
+              )}
+            </pre>
+          </div>
+        )}
+
+        {/* Generated images */}
+        {hasImages && (
+          <div>
+            <div className="px-3 py-1.5 bg-card/40 border-b border-border/30 flex items-center gap-1.5">
+              <Image className="w-3 h-3 text-muted-foreground/50" />
+              <span className="text-badge text-muted-foreground/60 uppercase tracking-wider">
+                Charts ({execResult.images.length})
+              </span>
+            </div>
+            <div className="p-3 space-y-3">
+              {execResult.images.map((dataUrl, i) => (
+                <img
+                  key={i}
+                  src={dataUrl}
+                  alt={`Generated chart ${i + 1}`}
+                  className="rounded-lg border border-border/30 max-w-full"
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Hidden iframe for execution */}
+        {iframeSrc && !execResult && (
+          <iframe
+            ref={iframeRef}
+            src={iframeSrc}
+            sandbox="allow-scripts allow-forms"
+            onLoad={() => setIframeLoaded(true)}
+            className="w-full h-0 border-0 opacity-0 pointer-events-none"
+            title="Code execution sandbox"
+          />
+        )}
+      </div>
+    </div>
+  );
+}

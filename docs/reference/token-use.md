@@ -1,0 +1,129 @@
+---
+summary: "How Bitterbot builds prompt context and reports token usage + costs"
+read_when:
+  - Explaining token usage, costs, or context windows
+  - Debugging context growth or compaction behavior
+title: "Token Use and Costs"
+---
+
+# Token use & costs
+
+Bitterbot tracks **tokens**, not characters. Tokens are model-specific, but most
+OpenAI-style models average ~4 characters per token for English text.
+
+## How the system prompt is built
+
+Bitterbot assembles its own system prompt on every run. It includes:
+
+- Tool list + short descriptions
+- Skills list (only metadata; instructions are loaded on demand with `read`)
+- Self-update instructions
+- Workspace + bootstrap files (`GENOME.md`, `PROTOCOLS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, `BOOTSTRAP.md` when new). Large files are truncated by `agents.defaults.bootstrapMaxChars` (default: 20000), and total bootstrap injection is capped by `agents.defaults.bootstrapTotalMaxChars` (default: 24000). `memory/*.md` files are on-demand via memory tools and are not auto-injected.
+- Time (UTC + user timezone)
+- Reply tags + heartbeat behavior
+- Runtime metadata (host/OS/model/thinking)
+
+See the full breakdown in [System Prompt](/concepts/system-prompt).
+
+## What counts in the context window
+
+Everything the model receives counts toward the context limit:
+
+- System prompt (all sections listed above)
+- Conversation history (user + assistant messages)
+- Tool calls and tool results
+- Attachments/transcripts (images, audio, files)
+- Compaction summaries and pruning artifacts
+- Provider wrappers or safety headers (not visible, but still counted)
+
+For a practical breakdown (per injected file, tools, skills, and system prompt size), use `/context list` or `/context detail`. See [Context](/concepts/context).
+
+## How to see current token usage
+
+Use these in chat:
+
+- `/status` → **emoji‑rich status card** with the session model, context usage,
+  last response input/output tokens, and **estimated cost** (API key only).
+- `/usage off|tokens|full` → appends a **per-response usage footer** to every reply.
+  - Persists per session (stored as `responseUsage`).
+  - OAuth auth **hides cost** (tokens only).
+- `/usage cost` → shows a local cost summary from Bitterbot session logs.
+- `/usage why [today|7d|30d]` → explains the window against the one before it
+  (which features, models and sessions moved the bill), from the usage ledger.
+
+Other surfaces:
+
+- **Control UI → Usage:** the usage ledger, which counts every model call
+  (chat, embeddings, dreams, extraction, evolution, judge, speech, search) per
+  model, feature, session and day, with cache health, burn rate, budgets,
+  cost per outcome and what-if replay. See
+  [Usage tracking](/concepts/usage-tracking).
+- **CLI:** `bitterbot gateway usage [--by model|feature|provider|kind|agent|day]
+  [--why] [--whatif provider/model] [--json]` reads the same ledger.
+- **CLI (provider quotas):** `bitterbot status --usage` and
+  `bitterbot channels list` show provider quota windows (not per-response costs).
+
+## Cost estimation (when shown)
+
+Costs are estimated from your model pricing config:
+
+```
+models.providers.<provider>.models[].cost
+```
+
+These are **USD per 1M tokens** for `input`, `output`, `cacheRead`, and
+`cacheWrite`. If pricing is missing, Bitterbot shows tokens only. OAuth tokens
+never show dollar cost.
+
+## Cache TTL and pruning impact
+
+Provider prompt caching only applies within the cache TTL window. The old
+**cache-ttl pruning** (`agents.defaults.contextPruning`) no longer runs: the key
+is accepted, has no effect and warns at load (see
+[Session pruning](/concepts/session-pruning)). Tool-output growth is handled by
+compaction's tool-output stubs instead.
+
+Heartbeats no longer warm the main-session cache by default. Since the
+token-efficiency build, an interval heartbeat is skipped outright when its inputs
+(`HEARTBEAT.md`, the heartbeat prompt, queued system events) are unchanged
+(`heartbeat.skipWhenUnchanged`), and when it does run it uses an isolated session
+with a minimal prompt on the cheap model tier (`heartbeat.isolatedSession`,
+`heartbeat.lightContext`). That is a different, much smaller prefix, so it cannot
+refresh the chat prefix. If you specifically want a keep-warm tick, set
+`isolatedSession: false`, `lightContext: false`, `skipWhenUnchanged: false`, pick
+an interval under the cache TTL, and confirm with the usage ledger that
+`cache_read` is non-zero on heartbeat rows; otherwise every tick is a full cache
+write that is never read back. See [Heartbeat](/gateway/heartbeat) for the cost
+model.
+
+For Anthropic API pricing, cache reads are significantly cheaper than input
+tokens, while cache writes are billed at a higher multiplier. See Anthropic’s
+prompt caching pricing for the latest rates and TTL multipliers:
+[https://docs.anthropic.com/docs/build-with-claude/prompt-caching](https://docs.anthropic.com/docs/build-with-claude/prompt-caching)
+
+### Example: keep 1h cache warm with heartbeat (opt-in)
+
+```yaml
+agents:
+  defaults:
+    model:
+      primary: "anthropic/claude-opus-4-6"
+    models:
+      "anthropic/claude-opus-4-6":
+        params:
+          cacheRetention: "long"
+    heartbeat:
+      every: "55m"
+      skipWhenUnchanged: false
+      isolatedSession: false
+      lightContext: false
+```
+
+## Tips for reducing token pressure
+
+- Use `/compact` to summarize long sessions.
+- Trim large tool outputs in your workflows.
+- Keep skill descriptions short (skill list is injected into the prompt).
+- Prefer smaller models for verbose, exploratory work.
+
+See [Skills](/tools/skills) for the exact skill list overhead formula.

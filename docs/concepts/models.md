@@ -1,0 +1,329 @@
+---
+summary: "Models CLI: list, set, aliases, fallbacks, scan, status"
+read_when:
+  - Adding or modifying models CLI (models list/set/scan/aliases/fallbacks)
+  - Changing model fallback behavior or selection UX
+  - Updating model scan probes (tools/images)
+title: "Models CLI"
+---
+
+# Models CLI
+
+See [/concepts/model-failover](/concepts/model-failover) for auth profile
+rotation, cooldowns, and how that interacts with fallbacks.
+Quick provider overview + examples: [/concepts/model-providers](/concepts/model-providers).
+
+## How model selection works
+
+Bitterbot selects models in this order:
+
+1. **Primary** model (`agents.defaults.model.primary` or `agents.defaults.model`).
+2. **Fallbacks** in `agents.defaults.model.fallbacks` (in order).
+3. **Provider auth failover** happens inside a provider before moving to the
+   next model.
+
+With no model configured at all, the runtime falls back to
+`anthropic/claude-sonnet-5-5`, the model setup recommends for Anthropic.
+Setup (`bitterbot onboard`) always writes a model: the provider's recommended
+one is Claude Sonnet 5.5 (`anthropic/claude-sonnet-5-5`), GPT-5.5
+(`openai/gpt-5.5`), OpenRouter Auto or Gemini 3.1 Pro (preview), and Claude
+Sonnet 5 is the everyday default the Control UI picker marks.
+
+Related:
+
+- `agents.defaults.models` is the catalog of models (aliases, per-model params). It restricts which models can be picked only when `agents.defaults.restrictModels: true`.
+- `agents.defaults.imageModel` is used **only when** the primary model can’t accept images.
+- Per-agent defaults can override `agents.defaults.model` via `agents.list[].model` plus bindings (see [/concepts/multi-agent](/concepts/multi-agent)).
+
+## Quick model picks (anecdotal)
+
+- **GLM**: a bit better for coding/tool calling.
+- **MiniMax**: better for writing and vibes.
+
+## Setup wizard (recommended)
+
+If you don’t want to hand-edit config, run the onboarding wizard:
+
+```bash
+bitterbot onboard
+```
+
+It can set up model + auth for common providers, including **OpenAI Code (Codex)
+subscription** (OAuth) and **Anthropic** (API key recommended; `claude
+setup-token` also supported).
+
+## Config keys (overview)
+
+- `agents.defaults.model.primary` and `agents.defaults.model.fallbacks`
+- `agents.defaults.imageModel.primary` and `agents.defaults.imageModel.fallbacks`
+- `agents.defaults.models` (catalog: aliases + provider params; an allowlist only with `agents.defaults.restrictModels: true`)
+- `models.providers` (custom providers written into `models.json`)
+
+Model refs are normalized to lowercase. Provider aliases like `z.ai/*` normalize
+to `zai/*`.
+
+Provider configuration examples (including OpenCode Zen) live in
+[/gateway/configuration](/gateway/configuration).
+
+## “Model is not allowed” (and why replies stop)
+
+`agents.defaults.models` is a catalog, not a restriction: setting a default
+model registers it there, and that alone must not forbid every other model.
+To restrict which models `/model` and session overrides may pick, opt in with
+`agents.defaults.restrictModels: true`; the map is then enforced as the
+**allowlist** (the current default is always allowed). When a user selects a
+model that isn’t in that allowlist, Bitterbot returns:
+
+```
+Model "provider/model" is not allowed. Use /model to list available models.
+```
+
+This happens **before** a normal reply is generated, so the message can feel
+like it “didn’t respond.” The fix is to either:
+
+- Add the model to `agents.defaults.models`, or
+- Turn the restriction off (`agents.defaults.restrictModels: false`, the default), or
+- Pick a model from `/model list`.
+
+Example allowlist config:
+
+```json5
+{
+  agents: {
+    defaults: {
+      restrictModels: true,
+      model: { primary: "anthropic/claude-sonnet-4-5" },
+      models: {
+        "anthropic/claude-sonnet-4-5": { alias: "Sonnet" },
+        "anthropic/claude-opus-4-6": { alias: "Opus" },
+      },
+    },
+  },
+}
+```
+
+## Family shortcuts follow the newest model
+
+An alias named after a Claude family (`opus`, `sonnet`, `haiku` or `fable`,
+any capitalization) that points at a model of that family resolves to the
+newest model of the family your provider serves. With
+`"anthropic/claude-opus-4-8": { alias: "opus" }`, `/model opus` picks Claude
+Opus 5.5 once Anthropic serves it, and the alias list the agent sees says so.
+The newest model comes from the model list the gateway loads at startup, so
+before that (or in a CLI command that does not load it) the alias resolves
+exactly as configured.
+
+Any other alias name is a pin and never moves: use `opus48` for
+`anthropic/claude-opus-4-8` to keep that exact model. With
+`restrictModels: true`, every alias resolves exactly as configured, since the
+newer model may not be on your allowlist.
+
+The agent is also told, on its own line every turn, which model it is running
+on (including right after a switch), and to answer "which model are you?"
+from that line rather than from memory.
+
+## Switching models in chat (`/model`)
+
+You can switch models for the current session without restarting:
+
+```
+/model
+/model list
+/model 3
+/model openai/gpt-5.2
+/model status
+```
+
+Notes:
+
+- `/model` (and `/model list`) is a compact, numbered picker (model family + available providers).
+- `/model <#>` selects from that picker.
+- `/model status` is the detailed view (auth candidates and, when configured, provider endpoint `baseUrl` + `api` mode).
+- Model refs are parsed by splitting on the **first** `/`. Use `provider/model` when typing `/model <ref>`.
+- If the model ID itself contains `/` (OpenRouter-style), you must include the provider prefix (example: `/model openrouter/moonshotai/kimi-k2`).
+- If you omit the provider, Bitterbot treats the input as an alias or a model for the **default provider** (only works when there is no `/` in the model ID).
+
+Full command behavior/config: [Slash commands](/tools/slash-commands).
+
+The Control UI offers the same session-scoped switch as a model pill in the chat header (backed by `sessions.patch`), so no chat command or restart is needed.
+
+## Key management over RPC (`models.auth.*`)
+
+The gateway exposes a key-management surface so UIs can manage provider credentials without the CLI wizard (admin scope required):
+
+- `models.auth.list` - per-provider status: auth profiles (with cooldown/disabled state), whether a provider env var is set, whether `models.providers.<id>.apiKey` is set in config, and which source currently wins under the runtime precedence chain (profile, then env, then config). Responses never contain secret material.
+- `models.auth.test` - live-probe a credential against the provider's model-listing endpoint before saving. Pass `apiKey` to test a draft key without persisting anything, or omit it to test the stored credential. OAuth/aws-sdk credentials report `unsupported` instead of probing.
+- `models.auth.set` - save or rotate a key (`provider`, optional `name`, optional `credentialType: api_key|token`, `value`). Writes through the auth-profiles helpers with input normalization, clears any cooldown/failure state the old key accumulated, and refreshes the model catalog cache so new providers appear in pickers immediately.
+- `models.auth.delete` - remove a profile plus its usage stats, rotation-order entries, and last-good pointer.
+
+Secrets are write-only across this surface: keys go in, only redacted status comes out. `models.list` additionally accepts `refresh: true` to bust the process-lifetime catalog cache after out-of-band provider changes, and `models.setDefault` sets `agents.defaults.model.primary` through the same validated path as `bitterbot models set` (restart-free).
+
+The Control UI's **Models & Keys** panel (Settings group) is built on this surface: default-model picker, per-provider status with the winning source, test-before-save key entry, and profile deletion.
+
+## CLI commands
+
+```bash
+bitterbot models list
+bitterbot models status
+bitterbot models set <provider/model>
+bitterbot models set-image <provider/model>
+
+bitterbot models aliases list
+bitterbot models aliases add <alias> <provider/model>
+bitterbot models aliases remove <alias>
+
+bitterbot models fallbacks list
+bitterbot models fallbacks add <provider/model>
+bitterbot models fallbacks remove <provider/model>
+bitterbot models fallbacks clear
+
+bitterbot models image-fallbacks list
+bitterbot models image-fallbacks add <provider/model>
+bitterbot models image-fallbacks remove <provider/model>
+bitterbot models image-fallbacks clear
+```
+
+`bitterbot models` (no subcommand) is a shortcut for `models status`.
+
+### `models list`
+
+Shows configured models by default. Useful flags:
+
+- `--all`: full catalog
+- `--local`: local providers only
+- `--provider <name>`: filter by provider
+- `--plain`: one model per line
+- `--json`: machine‑readable output
+
+### `models status`
+
+Shows the resolved primary model, fallbacks, image model, and an auth overview
+of configured providers. It also surfaces OAuth expiry status for profiles found
+in the auth store (warns within 24h by default). `--plain` prints only the
+resolved primary model.
+OAuth status is always shown (and included in `--json` output). If a configured
+provider has no credentials, `models status` prints a **Missing auth** section.
+JSON includes `auth.oauth` (warn window + profiles) and `auth.providers`
+(effective auth per provider).
+Use `--check` for automation (exit `1` when missing/expired, `2` when expiring).
+
+Preferred Anthropic auth is the Claude Code CLI setup-token (run anywhere; paste on the gateway host if needed):
+
+```bash
+claude setup-token
+bitterbot models status
+```
+
+## Scanning (OpenRouter free models)
+
+`bitterbot models scan` inspects OpenRouter’s **free model catalog** and can
+optionally probe models for tool and image support.
+
+Key flags:
+
+- `--no-probe`: skip live probes (metadata only)
+- `--min-params <b>`: minimum parameter size (billions)
+- `--max-age-days <days>`: skip older models
+- `--provider <name>`: provider prefix filter
+- `--max-candidates <n>`: fallback list size
+- `--set-default`: set `agents.defaults.model.primary` to the first selection
+- `--set-image`: set `agents.defaults.imageModel.primary` to the first image selection
+
+Probing requires an OpenRouter API key (from auth profiles or
+`OPENROUTER_API_KEY`). Without a key, use `--no-probe` to list candidates only.
+
+Scan results are ranked by:
+
+1. Image support
+2. Tool latency
+3. Context size
+4. Parameter count
+
+Input
+
+- OpenRouter `/models` list (filter `:free`)
+- Requires OpenRouter API key from auth profiles or `OPENROUTER_API_KEY` (see [/environment](/help/environment))
+- Optional filters: `--max-age-days`, `--min-params`, `--provider`, `--max-candidates`
+- Probe controls: `--timeout`, `--concurrency`
+
+When run in a TTY, you can select fallbacks interactively. In non‑interactive
+mode, pass `--yes` to accept defaults.
+
+## Models registry (`models.json`)
+
+Custom providers in `models.providers` are written into `models.json` under the
+agent directory (default `~/.bitterbot/agents/<agentId>/models.json`). This file
+is merged by default unless `models.mode` is set to `replace`.
+
+## Live model discovery
+
+The model picker's list starts from the vendored `@mariozechner/pi-ai` catalog,
+which goes stale between releases: it can list retired snapshots the provider
+now rejects (e.g. `claude-3-5-sonnet-20241022`, `claude-sonnet-4-20250514`) and
+omit models shipped after the SDK was published (e.g. the Claude 5 family,
+`claude-opus-4-8`). Picking a retired model surfaces as
+`LLM request rejected: ... not_found_error`.
+
+To keep the list honest, Bitterbot queries each provider's `/models` endpoint at
+catalog-build time and replaces that provider's slice with what it actually
+serves right now. Discovery covers providers reachable with a stored key plus a
+simple GET:
+
+- **anthropic-messages** family → `GET {baseUrl}/v1/models` (`x-api-key`)
+- **openai-completions / openai-responses** → `GET {baseUrl}/models` (`Bearer`)
+- **google-generative-ai** → `GET {baseUrl}/models?key=...`
+
+Discovered IDs are the source of truth for _which_ models exist; capability
+metadata (context window, image support, reasoning) is joined from the vendored
+catalog, and synthesized from the provider's richest known model for IDs the SDK
+has never seen. Providers without a listable endpoint (Bedrock via SigV4, Codex
+via OAuth) keep their vendored/curated entries.
+
+Discovery is **safe by construction**: any missing credential, non-200, timeout,
+or parse failure falls back to the vendored list for that provider — a failed
+probe never removes a working entry. It is skipped under tests.
+
+```jsonc
+// bitterbot.json — defaults shown; the whole block is optional
+{
+  "models": {
+    "liveDiscovery": {
+      "enabled": true, // set false to use the vendored/curated list only
+      "timeoutMs": 6000, // per-provider probe timeout
+    },
+  },
+}
+```
+
+The catalog is cached for the gateway process lifetime; `models.list` with
+`refresh: true` (and any credential write) re-runs discovery.
+
+## Featured (curated) models
+
+Live discovery decides which models _exist_; a curated **featured** overlay
+decides which we _recommend_. `src/agents/model-featured.ts` tiers a lean set —
+`frontier` / `mid` / `workhorse` — with one model marked as the everyday
+`isDefault` (Claude Sonnet 5). `models.list` annotates every catalog entry with
+`featured`, `tier`, and `isDefault` (alongside `allowed`).
+
+The overlay is additive, never a filter: a model that matches no rule stays
+selectable, it just isn't promoted. Rules that name an unconfigured provider
+never match, so the featured menu fills in tier-by-tier as providers are added.
+Matching is by lowercased provider + id prefix, so it survives whatever exact
+IDs a provider serves (both `claude-opus-5` and `claude-opus-4-8` map to the
+frontier slot; a dated snapshot like `claude-sonnet-4-5-20250929` is not
+featured).
+
+Two surfaces consume it:
+
+- **In-session picker** (Control UI chat header): shows the featured set grouped
+  by tier by default, with a **Show all N models** toggle for the full
+  discovered catalog. Typing a search always spans everything. Nodes with no
+  featured models fall back to the full provider-grouped list.
+- **Onboarding wizard** (`bitterbot onboard`): the model select leads with the
+  featured picks (frontier → mid → workhorse), each tagged with its tier and the
+  recommended default flagged, ahead of the rest of the catalog.
+
+To change the recommended lineup, edit the `FEATURED_RULES` table in
+`src/agents/model-featured.ts` — it is the single source of truth for both
+surfaces.

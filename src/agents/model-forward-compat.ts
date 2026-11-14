@@ -1,0 +1,309 @@
+import type { Api, Model } from "@mariozechner/pi-ai";
+import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
+import { normalizeModelCompat } from "./model-compat.js";
+import { normalizeProviderId } from "./model-selection.js";
+import type { ModelRegistry } from "./runtime/models/index.js";
+
+const OPENAI_CODEX_GPT_53_MODEL_ID = "gpt-5.3-codex";
+const OPENAI_CODEX_TEMPLATE_MODEL_IDS = ["gpt-5.2-codex"] as const;
+
+const ANTHROPIC_OPUS_46_MODEL_ID = "claude-opus-4-6";
+const ANTHROPIC_OPUS_46_DOT_MODEL_ID = "claude-opus-4.6";
+const ANTHROPIC_OPUS_TEMPLATE_MODEL_IDS = ["claude-opus-4-5", "claude-opus-4.5"] as const;
+
+// Opus 4.7 / 4.8 ship after pi-ai's built-in catalog (which tops out at
+// claude-opus-4-6). When a user configures one of them without a models.json
+// entry, clone the latest known opus (4-6) so it resolves with the correct
+// Anthropic transport, context window, cost, and capabilities instead of falling
+// through to the generic openai-responses fallback (which would break the API).
+const ANTHROPIC_OPUS_NEXT_MODEL_IDS = [
+  "claude-opus-4-7",
+  "claude-opus-4.7",
+  "claude-opus-4-8",
+  "claude-opus-4.8",
+] as const;
+const ANTHROPIC_OPUS_NEXT_TEMPLATE_MODEL_IDS = ["claude-opus-4-6", "claude-opus-4.6"] as const;
+
+const ZAI_GLM5_MODEL_ID = "glm-5";
+const ZAI_GLM5_TEMPLATE_MODEL_IDS = ["glm-4.7"] as const;
+
+/**
+ * A model cloned from a catalogued template carries the template's `cost`, which is a guess,
+ * not this model's price (claude-fable-5-1 cloned from Opus 4.7 was billed at $5/$25 per M while
+ * Anthropic charges $10/$50). The usage ledger reads this marker to prefer an exact live price
+ * and to label the borrowed one "estimated". The value is the template id the price came from.
+ */
+export type BorrowedPriceMarker = { pricingBorrowedFrom?: string };
+
+/** The template id whose price a forward-compat model borrowed, or undefined for a real entry. */
+export function borrowedPriceTemplate(model: unknown): string | undefined {
+  if (!model || typeof model !== "object") {
+    return undefined;
+  }
+  const from = (model as BorrowedPriceMarker).pricingBorrowedFrom;
+  return typeof from === "string" && from ? from : undefined;
+}
+
+function markBorrowedPrice(model: Model<Api>, templateId: string): Model<Api> {
+  return Object.assign(model, { pricingBorrowedFrom: templateId } satisfies BorrowedPriceMarker);
+}
+
+function cloneFirstTemplateModel(params: {
+  normalizedProvider: string;
+  trimmedModelId: string;
+  templateIds: string[];
+  modelRegistry: ModelRegistry;
+  patch?: Partial<Model<Api>>;
+}): Model<Api> | undefined {
+  const { normalizedProvider, trimmedModelId, templateIds, modelRegistry } = params;
+  for (const templateId of [...new Set(templateIds)].filter(Boolean)) {
+    const template = modelRegistry.find(normalizedProvider, templateId) as Model<Api> | null;
+    if (!template) {
+      continue;
+    }
+    return markBorrowedPrice(
+      normalizeModelCompat({
+        ...template,
+        id: trimmedModelId,
+        name: trimmedModelId,
+        ...params.patch,
+      } as Model<Api>),
+      templateId,
+    );
+  }
+  return undefined;
+}
+
+function resolveOpenAICodexGpt53FallbackModel(
+  provider: string,
+  modelId: string,
+  modelRegistry: ModelRegistry,
+): Model<Api> | undefined {
+  const normalizedProvider = normalizeProviderId(provider);
+  const trimmedModelId = modelId.trim();
+  if (normalizedProvider !== "openai-codex") {
+    return undefined;
+  }
+  if (trimmedModelId.toLowerCase() !== OPENAI_CODEX_GPT_53_MODEL_ID) {
+    return undefined;
+  }
+
+  for (const templateId of OPENAI_CODEX_TEMPLATE_MODEL_IDS) {
+    const template = modelRegistry.find(normalizedProvider, templateId) as Model<Api> | null;
+    if (!template) {
+      continue;
+    }
+    return markBorrowedPrice(
+      normalizeModelCompat({
+        ...template,
+        id: trimmedModelId,
+        name: trimmedModelId,
+      } as Model<Api>),
+      templateId,
+    );
+  }
+
+  return normalizeModelCompat({
+    id: trimmedModelId,
+    name: trimmedModelId,
+    api: "openai-codex-responses",
+    provider: normalizedProvider,
+    baseUrl: "https://chatgpt.com/backend-api",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: DEFAULT_CONTEXT_TOKENS,
+    maxTokens: DEFAULT_CONTEXT_TOKENS,
+  } as Model<Api>);
+}
+
+function resolveAnthropicOpus46ForwardCompatModel(
+  provider: string,
+  modelId: string,
+  modelRegistry: ModelRegistry,
+): Model<Api> | undefined {
+  const normalizedProvider = normalizeProviderId(provider);
+  if (normalizedProvider !== "anthropic") {
+    return undefined;
+  }
+
+  const trimmedModelId = modelId.trim();
+  const lower = trimmedModelId.toLowerCase();
+  const isOpus46 =
+    lower === ANTHROPIC_OPUS_46_MODEL_ID ||
+    lower === ANTHROPIC_OPUS_46_DOT_MODEL_ID ||
+    lower.startsWith(`${ANTHROPIC_OPUS_46_MODEL_ID}-`) ||
+    lower.startsWith(`${ANTHROPIC_OPUS_46_DOT_MODEL_ID}-`);
+  if (!isOpus46) {
+    return undefined;
+  }
+
+  const templateIds: string[] = [];
+  if (lower.startsWith(ANTHROPIC_OPUS_46_MODEL_ID)) {
+    templateIds.push(lower.replace(ANTHROPIC_OPUS_46_MODEL_ID, "claude-opus-4-5"));
+  }
+  if (lower.startsWith(ANTHROPIC_OPUS_46_DOT_MODEL_ID)) {
+    templateIds.push(lower.replace(ANTHROPIC_OPUS_46_DOT_MODEL_ID, "claude-opus-4.5"));
+  }
+  templateIds.push(...ANTHROPIC_OPUS_TEMPLATE_MODEL_IDS);
+
+  return cloneFirstTemplateModel({
+    normalizedProvider,
+    trimmedModelId,
+    templateIds,
+    modelRegistry,
+  });
+}
+
+/**
+ * Forward-compat for Anthropic Opus 4.7 / 4.8 (and dotted variants), which post-
+ * date pi-ai's built-in catalog. Clones the latest catalogued opus (4-6) so a
+ * config pinned to `anthropic/claude-opus-4-8` resolves to a real Anthropic model
+ * rather than erroring as "Unknown model". Mirrors the 4.6-from-4.5 rule above.
+ */
+function resolveAnthropicOpusNextForwardCompatModel(
+  provider: string,
+  modelId: string,
+  modelRegistry: ModelRegistry,
+): Model<Api> | undefined {
+  const normalizedProvider = normalizeProviderId(provider);
+  if (normalizedProvider !== "anthropic") {
+    return undefined;
+  }
+  const trimmedModelId = modelId.trim();
+  const lower = trimmedModelId.toLowerCase();
+  const isOpusNext = ANTHROPIC_OPUS_NEXT_MODEL_IDS.some(
+    (id) => lower === id || lower.startsWith(`${id}-`),
+  );
+  if (!isOpusNext) {
+    return undefined;
+  }
+  return cloneFirstTemplateModel({
+    normalizedProvider,
+    trimmedModelId,
+    templateIds: [...ANTHROPIC_OPUS_NEXT_TEMPLATE_MODEL_IDS],
+    modelRegistry,
+  });
+}
+
+/** `claude-<family>-<major>[-<minor>]`, e.g. claude-sonnet-5-5, claude-fable-5-1. */
+const CLAUDE_FAMILY_ID = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:$|-)/;
+
+function claudeVersion(id: string): { family: string; version: number } | undefined {
+  const m = CLAUDE_FAMILY_ID.exec(id.toLowerCase());
+  if (!m) {
+    return undefined;
+  }
+  return { family: m[1] ?? "", version: Number(m[2]) * 100 + Number(m[3] ?? 0) };
+}
+
+/**
+ * Any Claude model newer than pi-ai's built-in catalog (the Claude 5 family:
+ * claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1, ...). The model picker
+ * lists what Anthropic's /v1/models serves (model-live-discovery), so without
+ * this the picker offered models the runner then refused as "Unknown model".
+ * Clones the newest catalogued model of the same family (Fable, a newer
+ * family, from Opus) so the API, reasoning flag and limits are Anthropic's.
+ */
+function resolveAnthropicFamilyForwardCompatModel(
+  provider: string,
+  modelId: string,
+  modelRegistry: ModelRegistry,
+): Model<Api> | undefined {
+  const normalizedProvider = normalizeProviderId(provider);
+  if (normalizedProvider !== "anthropic") {
+    return undefined;
+  }
+  const trimmedModelId = modelId.trim();
+  const wanted = claudeVersion(trimmedModelId);
+  if (!wanted) {
+    return undefined;
+  }
+  const newestOf = (family: string) => {
+    let best: { id: string; version: number } | undefined;
+    // Test doubles may implement only find().
+    for (const model of modelRegistry.getAll?.() ?? []) {
+      if (model.provider !== normalizedProvider) {
+        continue;
+      }
+      const v = claudeVersion(model.id);
+      // Undated ids only (claude-sonnet-4-6, not claude-sonnet-4-20250514).
+      if (!v || v.family !== family || /-\d{8}$/.test(model.id)) {
+        continue;
+      }
+      if (!best || v.version > best.version) {
+        best = { id: model.id, version: v.version };
+      }
+    }
+    return best?.id;
+  };
+  const templateId = newestOf(wanted.family) ?? newestOf("opus") ?? newestOf("sonnet");
+  if (!templateId) {
+    return undefined;
+  }
+  return cloneFirstTemplateModel({
+    normalizedProvider,
+    trimmedModelId,
+    templateIds: [templateId],
+    modelRegistry,
+  });
+}
+
+// Z.ai's GLM-5 may not be present in pi-ai's built-in model catalog yet.
+// When a user configures zai/glm-5 without a models.json entry, clone glm-4.7 as a forward-compat fallback.
+function resolveZaiGlm5ForwardCompatModel(
+  provider: string,
+  modelId: string,
+  modelRegistry: ModelRegistry,
+): Model<Api> | undefined {
+  if (normalizeProviderId(provider) !== "zai") {
+    return undefined;
+  }
+  const trimmed = modelId.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower !== ZAI_GLM5_MODEL_ID && !lower.startsWith(`${ZAI_GLM5_MODEL_ID}-`)) {
+    return undefined;
+  }
+
+  for (const templateId of ZAI_GLM5_TEMPLATE_MODEL_IDS) {
+    const template = modelRegistry.find("zai", templateId) as Model<Api> | null;
+    if (!template) {
+      continue;
+    }
+    return markBorrowedPrice(
+      normalizeModelCompat({
+        ...template,
+        id: trimmed,
+        name: trimmed,
+        reasoning: true,
+      } as Model<Api>),
+      templateId,
+    );
+  }
+
+  return normalizeModelCompat({
+    id: trimmed,
+    name: trimmed,
+    api: "openai-completions",
+    provider: "zai",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: DEFAULT_CONTEXT_TOKENS,
+    maxTokens: DEFAULT_CONTEXT_TOKENS,
+  } as Model<Api>);
+}
+
+export function resolveForwardCompatModel(
+  provider: string,
+  modelId: string,
+  modelRegistry: ModelRegistry,
+): Model<Api> | undefined {
+  return (
+    resolveOpenAICodexGpt53FallbackModel(provider, modelId, modelRegistry) ??
+    resolveAnthropicOpus46ForwardCompatModel(provider, modelId, modelRegistry) ??
+    resolveAnthropicOpusNextForwardCompatModel(provider, modelId, modelRegistry) ??
+    resolveAnthropicFamilyForwardCompatModel(provider, modelId, modelRegistry) ??
+    resolveZaiGlm5ForwardCompatModel(provider, modelId, modelRegistry)
+  );
+}

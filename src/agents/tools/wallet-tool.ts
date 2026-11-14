@@ -1,0 +1,307 @@
+import { Type } from "@sinclair/typebox";
+import type { BitterbotConfig } from "../../config/config.js";
+import { walletToolEnabled } from "../../config/feature-switches.js";
+import type { WalletConfig } from "../../config/types.wallet.js";
+import { getPeerWalletCapability } from "../../infra/wallet-discovery.js";
+import { sessionSpentUsd } from "../../payments/ap2/gate.js";
+import { gatedWallet } from "../../review/spend.js";
+import { createWalletService, type WalletService } from "../../services/wallet-service.js";
+import { stringEnum } from "../schema/typebox.js";
+import {
+  type AnyAgentTool,
+  ToolInputError,
+  jsonResult,
+  readNumberParam,
+  readStringParam,
+} from "./common.js";
+
+const WALLET_ACTIONS = [
+  "get_balance",
+  "send_usdc",
+  "get_address",
+  "get_transaction_history",
+  "fund_wallet",
+  "pay_for_resource",
+  "send_to_peer",
+  "request_funding",
+] as const;
+
+// NOTE: Using a flattened object schema instead of Type.Union([Type.Object(...), ...])
+// because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
+// The discriminator (action) determines which properties are relevant; runtime validates.
+const WalletToolSchema = Type.Object({
+  action: stringEnum(WALLET_ACTIONS, {
+    description:
+      "The wallet action to perform: get_balance, send_usdc, get_address, get_transaction_history, fund_wallet, or pay_for_resource.",
+  }),
+  address: Type.Optional(
+    Type.String({ description: "Recipient address or ENS name (for send_usdc)." }),
+  ),
+  amount: Type.Optional(
+    Type.Number({ description: "Amount in token units (for send_usdc, pay_for_resource)." }),
+  ),
+  token: Type.Optional(
+    Type.String({ description: "Token symbol for balance queries (default: ETH)." }),
+  ),
+  limit: Type.Optional(
+    Type.Number({
+      description:
+        "Max number of transactions to return (for get_transaction_history, default: 10).",
+    }),
+  ),
+  resource_url: Type.Optional(
+    Type.String({
+      description: "URL of the paywalled resource to pay for and retrieve (for pay_for_resource).",
+    }),
+  ),
+  reason: Type.Optional(
+    Type.String({
+      description: "Brief explanation of why this resource is needed (for pay_for_resource).",
+    }),
+  ),
+  peer_id: Type.Optional(
+    Type.String({
+      description:
+        "libp2p peer ID of a connected peer to pay (for send_to_peer). The peer's wallet " +
+        "address is resolved from its advertised wallet_capability.",
+    }),
+  ),
+});
+
+type WalletToolOptions = {
+  config?: BitterbotConfig;
+  agentSessionKey?: string;
+};
+
+export function createWalletTool(opts?: WalletToolOptions): AnyAgentTool | undefined {
+  const walletConfig: WalletConfig | undefined = opts?.config?.tools?.wallet;
+  // V1 default flip (PLAN-41 D-D): the wallet tool is opt-in
+  // (tools.wallet.enabled=true) — money-adjacent surfaces don't self-enable.
+  if (!walletToolEnabled(walletConfig)) {
+    return undefined;
+  }
+
+  const effectiveConfig: WalletConfig = walletConfig ?? {};
+
+  // Lazily created wallet service instance
+  let service: WalletService | null = null;
+  function getService(): WalletService {
+    if (!service) {
+      // Every payment from this tool goes through the spend gate (PLAN-53 C0):
+      // the session cap, the decision record, and the limits underneath.
+      service = gatedWallet(createWalletService(effectiveConfig), {
+        origin: "wallet-tool",
+        sessionKey: spendSessionKey,
+        sessionCapUsd: sessionSpendCapUsd,
+      });
+    }
+    return service;
+  }
+
+  // The session cap is kept by the gate, per session over 24 hours. It used
+  // to live here, in a counter that started again with every run and every
+  // approved action.
+  const sessionSpendCapUsd = effectiveConfig.sessionSpendCapUsd ?? 50;
+  const spendSessionKey = opts?.agentSessionKey?.trim() || "wallet-tool";
+  const sessionSpent = () => sessionSpentUsd(spendSessionKey);
+
+  const network = effectiveConfig.network ?? "base-sepolia";
+
+  return {
+    label: "Wallet",
+    name: "wallet",
+    description: `Manage a crypto wallet on Base ${network === "base-sepolia" ? "(testnet)" : "(mainnet)"}. Actions:
+- get_address: Get the wallet's address.
+- get_balance: Check token balance (default: ETH). Pass token="USDC" for USDC.
+- send_usdc: Send USDC to an address. Requires: address, amount.
+- send_to_peer: Send USDC to a connected peer by libp2p peer ID, resolving their advertised wallet address automatically. Requires: peer_id, amount. Use network_status action="wallets" to see payable peers.
+- get_transaction_history: View recent transactions. Optional: limit (default 10).
+- fund_wallet: Get a URL to fund the wallet via Coinbase Onramp or faucet.
+- pay_for_resource: Pay for a paywalled HTTP resource via x402 protocol (USDC on Base). Pass the exact price from the 402 response. This tool signs the payment AND fetches the resource — it RETURNS THE ACTUAL CONTENT. Do NOT call web_fetch again after using this action. Requires: resource_url, amount. Optional: reason.
+- request_funding: When the balance is too low to complete what the user asked, ask the human to add funds instead of giving up. Notifies the operator to top up (via the licensed onramp). Requires: amount (USD needed). Optional: reason. Does NOT move money — a human completes the top-up.
+
+Session spend cap: $${sessionSpendCapUsd}. Per-tx cap: $${effectiveConfig.perTransactionCapUsd ?? 25}. x402 max per request: $${effectiveConfig.x402?.maxCostPerRequestUsd ?? 1}.`,
+    parameters: WalletToolSchema,
+    execute: async (_toolCallId, args) => {
+      const params = args as Record<string, unknown>;
+      const action = readStringParam(params, "action", { required: true });
+      const svc = getService();
+
+      switch (action) {
+        case "get_address": {
+          const address = await svc.getAddress();
+          // Single wallet for receiving, send_usdc, and x402. Fund this address
+          // with USDC (and a little ETH for send_usdc gas; x402 is gasless).
+          return jsonResult({
+            address,
+            network: svc.getNetwork(),
+          });
+        }
+
+        case "get_balance": {
+          const token = readStringParam(params, "token") ?? "ETH";
+          const result = await svc.getBalance(token);
+          return jsonResult(result);
+        }
+
+        case "send_usdc": {
+          const address = readStringParam(params, "address", {
+            required: true,
+            label: "recipient address",
+          });
+          const amount = readNumberParam(params, "amount", { required: true });
+
+          const result = await svc.sendUsdc(address, amount);
+
+          return jsonResult({
+            ...result,
+            amount,
+            to: address,
+            sessionSpent: sessionSpent(),
+            sessionRemaining: Math.max(0, sessionSpendCapUsd - sessionSpent()),
+          });
+        }
+
+        case "send_to_peer": {
+          const peerId = readStringParam(params, "peer_id", {
+            required: true,
+            label: "peer ID",
+          });
+          const amount = readNumberParam(params, "amount", { required: true });
+
+          const capability = getPeerWalletCapability(peerId);
+          if (!capability) {
+            throw new ToolInputError(
+              `No fresh wallet advertised by peer ${peerId}. The peer may be offline, not ` +
+                `running a wallet, or hasn't advertised recently. Use network_status ` +
+                `action="wallets" to list payable peers.`,
+            );
+          }
+          if (!capability.acceptsPayments) {
+            throw new ToolInputError(
+              `Peer ${peerId} has advertised that it does not accept payments.`,
+            );
+          }
+          if (capability.network !== svc.getNetwork()) {
+            throw new ToolInputError(
+              `Peer ${peerId} is on network "${capability.network}" but this wallet is on ` +
+                `"${svc.getNetwork()}". Cross-network sends are not supported.`,
+            );
+          }
+          const result = await svc.sendUsdc(capability.address, amount);
+
+          return jsonResult({
+            ...result,
+            amount,
+            peerId,
+            to: capability.address,
+            sessionSpent: sessionSpent(),
+            sessionRemaining: Math.max(0, sessionSpendCapUsd - sessionSpent()),
+          });
+        }
+
+        case "get_transaction_history": {
+          const limit = readNumberParam(params, "limit", { integer: true }) ?? 10;
+          const history = await svc.getTransactionHistory(limit);
+          return jsonResult({ transactions: history, count: history.length });
+        }
+
+        case "fund_wallet": {
+          const url = await svc.getFundingUrl();
+          return jsonResult({
+            fundingUrl: url,
+            network: svc.getNetwork(),
+            instructions:
+              network === "base-sepolia"
+                ? "Visit the faucet URL to get free testnet tokens."
+                : "Visit the Coinbase Onramp URL to fund with USDC.",
+          });
+        }
+
+        case "request_funding": {
+          // PLAN-49 Phase 2: ask the human to add funds instead of dead-ending.
+          // Notifies the operator (best-effort) and returns the onramp URL +
+          // monthly-ceiling headroom. Moves no money. Gated by
+          // payments.fiat.onramp.enabled; when off, falls back to fund guidance.
+          const amount = readNumberParam(params, "amount", { required: true });
+          const reason = readStringParam(params, "reason");
+          const onramp = opts?.config?.payments?.fiat?.onramp;
+
+          let balanceUsd: number | undefined;
+          try {
+            const bal = await svc.getBalance("USDC");
+            const n = Number.parseFloat(bal.balance);
+            balanceUsd = Number.isFinite(n) ? n : undefined;
+          } catch {
+            // best-effort context
+          }
+
+          if (onramp?.enabled !== true) {
+            const url = await svc.getFundingUrl();
+            return jsonResult({
+              requested: amount,
+              delivered: false,
+              note: "In-app funding is off (payments.fiat.onramp.enabled). Share this funding URL with the operator.",
+              fundingUrl: url,
+              balanceUsd,
+            });
+          }
+
+          const { checkFundingWithinCeiling } =
+            await import("../../payments/fiat/funding-policy.js");
+          const { defaultTopUpLedgerPath, listTopUps } =
+            await import("../../payments/fiat/topup-ledger.js");
+          const ceiling = checkFundingWithinCeiling({
+            requestUsd: amount,
+            ceilingUsd: onramp.monthlyCeilingUsd,
+            priorTopUps: await listTopUps(defaultTopUpLedgerPath(effectiveConfig.walletStorePath)),
+          });
+          const { notifyFundingNeeded } = await import("../../payments/fiat/funding-notifier.js");
+          await notifyFundingNeeded({ amountUsd: amount, reason, balanceUsd });
+
+          return jsonResult({
+            requested: amount,
+            delivered: true,
+            withinCeiling: ceiling.allowed,
+            note: "Asked the operator to add funds. Pause this spend until the balance is topped up.",
+            balanceUsd,
+          });
+        }
+
+        case "pay_for_resource": {
+          const x402Config = effectiveConfig.x402;
+          if (!x402Config?.enabled) {
+            throw new ToolInputError(
+              "x402 payments are not enabled. Set tools.wallet.x402.enabled: true in config.",
+            );
+          }
+
+          const resourceUrl = readStringParam(params, "resource_url", {
+            required: true,
+            label: "resource URL",
+          });
+          const amount = readNumberParam(params, "amount", { required: true });
+          const maxPerRequest = x402Config.maxCostPerRequestUsd ?? 1;
+          if (amount > maxPerRequest) {
+            throw new ToolInputError(
+              `Amount $${amount} exceeds x402 per-request cap of $${maxPerRequest}.`,
+            );
+          }
+
+          const result = await svc.payForResource(resourceUrl, amount);
+
+          return jsonResult({
+            ...result,
+            resource_url: resourceUrl,
+            reason: readStringParam(params, "reason") ?? "",
+            sessionSpent: sessionSpent(),
+            sessionRemaining: Math.max(0, sessionSpendCapUsd - sessionSpent()),
+          });
+        }
+
+        default:
+          throw new ToolInputError(`Unknown wallet action: ${action}`);
+      }
+    },
+  };
+}

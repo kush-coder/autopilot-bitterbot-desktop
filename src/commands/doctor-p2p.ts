@@ -1,0 +1,294 @@
+/**
+ * Top-level P2P network doctor section.
+ *
+ * Promoted from a subsection of the biological memory architecture
+ * block to its own section because P2P is now core infrastructure
+ * for the agent, not a memory subsystem. The old `checkP2POrchestrator`
+ * in doctor-memory-system.ts has been removed and its responsibilities
+ * split across:
+ *
+ *   - Binary availability → probeOrchestratorBinary (shared with bridge/wizard)
+ *   - DNS bootstrap reachability → resolveBootstrapDns
+ *   - Hardcoded fallback peer TCP probe → probeTcpReachable
+ *   - Live orchestrator state → HTTP /api/stats when gateway is running
+ */
+
+import fs from "node:fs";
+import type { BitterbotConfig } from "../config/config.js";
+import { resolveBootstrapDns } from "../infra/dns-bootstrap.js";
+import type { InstallKind } from "../infra/install-kind.js";
+import {
+  orchestratorMissingAdvice,
+  orchestratorSignatureStatus,
+} from "../infra/orchestrator-advice.js";
+import {
+  parseMultiaddr,
+  probeOrchestratorBinary,
+  probeTcpReachable,
+  type BinarySource,
+} from "../infra/orchestrator-binary.js";
+import { renderSectionQuietIfAllInfo, type CheckResult, ok, warn, info } from "./doctor-check.js";
+
+/**
+ * Describe a resolved binary source in operator-facing language.
+ * Matches the vocabulary used by the orchestrator-binary probe.
+ */
+function describeSource(source: BinarySource): string {
+  switch (source) {
+    case "config":
+      return "explicit config override";
+    case "bundled":
+      return "bundled with the release tarball";
+    case "release":
+      return "local cargo release build";
+    case "debug":
+      return "local cargo debug build";
+    case "prebuilt":
+      return "downloaded prebuilt (~/.bitterbot/bin)";
+  }
+}
+
+/**
+ * Query the orchestrator's HTTP dashboard for live peer state.
+ * Only meaningful when a gateway is actively running somewhere on
+ * this host — otherwise the port is closed and we fall through.
+ */
+async function queryLiveStats(
+  httpAddr: string,
+  timeoutMs = 2000,
+): Promise<{
+  peerId?: string;
+  connectedPeers?: number;
+  meshPeers?: number;
+  subscribedTopics?: string[];
+  peakConcurrentPeers?: number;
+  lifetimeUniquePeerIds?: number;
+  routingTableSize?: number;
+  natStatus?: string;
+  timeToFirstPeerMs?: number | null;
+  skillLatencyP50Ms?: number | null;
+  skillLatencyP95Ms?: number | null;
+  error?: string;
+}> {
+  const url = `http://${httpAddr}/api/stats`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) {
+      return { error: `HTTP ${res.status}` };
+    }
+    const data = (await res.json()) as Record<string, unknown>;
+    return {
+      peerId: typeof data.peer_id === "string" ? data.peer_id : undefined,
+      connectedPeers: typeof data.connected_peers === "number" ? data.connected_peers : undefined,
+      meshPeers: typeof data.mesh_peers_count === "number" ? data.mesh_peers_count : undefined,
+      subscribedTopics: Array.isArray(data.subscribed_topics)
+        ? (data.subscribed_topics.filter((t) => typeof t === "string") as string[])
+        : undefined,
+      peakConcurrentPeers:
+        typeof data.peak_concurrent_peers === "number" ? data.peak_concurrent_peers : undefined,
+      lifetimeUniquePeerIds:
+        typeof data.lifetime_unique_peer_ids === "number"
+          ? data.lifetime_unique_peer_ids
+          : undefined,
+      routingTableSize:
+        typeof data.routing_table_size === "number" ? data.routing_table_size : undefined,
+      natStatus: typeof data.nat_status === "string" ? data.nat_status : undefined,
+      timeToFirstPeerMs:
+        typeof data.time_to_first_peer_ms === "number" ? data.time_to_first_peer_ms : null,
+      skillLatencyP50Ms:
+        typeof data.skill_latency_p50_ms === "number" ? data.skill_latency_p50_ms : null,
+      skillLatencyP95Ms:
+        typeof data.skill_latency_p95_ms === "number" ? data.skill_latency_p95_ms : null,
+    };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+export async function runP2pNetworkChecks(params: {
+  config: BitterbotConfig;
+  isGatewayRunning: boolean;
+  /** How this Bitterbot is installed; picks the remediation text. */
+  installKind?: InstallKind;
+}): Promise<void> {
+  const { config, isGatewayRunning } = params;
+  const installKind = params.installKind ?? "unknown";
+  const results: CheckResult[] = [];
+
+  // ── Enabled check ──
+  const p2pEnabled = config.p2p?.enabled !== false;
+  if (!p2pEnabled) {
+    results.push(info("P2P is disabled in config (p2p.enabled = false). Node runs local-only."));
+    renderSection(results);
+    return;
+  }
+  results.push(ok("P2P is enabled"));
+
+  // ── Binary availability ──
+  const probe = probeOrchestratorBinary(config.p2p);
+  if (probe.found) {
+    // Verify the binary is actually executable, not just present on disk.
+    let isExecutable = true;
+    if (process.platform !== "win32") {
+      try {
+        fs.accessSync(probe.path, fs.constants.X_OK);
+      } catch {
+        isExecutable = false;
+      }
+    }
+
+    if (!isExecutable) {
+      results.push(
+        warn(
+          `Orchestrator found at ${probe.path} but is not executable.\n` +
+            `  Fix: chmod +x ${probe.path}`,
+        ),
+      );
+    } else if (probe.source === "debug") {
+      results.push(
+        warn(
+          `Orchestrator: ${describeSource(probe.source)} — run \`cargo build --release --manifest-path orchestrator/Cargo.toml\` for production`,
+        ),
+      );
+    } else {
+      results.push(ok(`Orchestrator: ${describeSource(probe.source)}`));
+    }
+    results.push(
+      info(`Orchestrator signature: ${orchestratorSignatureStatus(probe.source, installKind)}`),
+    );
+  } else {
+    // warn, not error: a p2p-less node still functions locally, and the
+    // update gate re-running pnpm install may be exactly what restores the
+    // binary — blocking the update would prevent the fix.
+    results.push(
+      warn(
+        [
+          "Orchestrator binary NOT FOUND: the node cannot join the P2P network.",
+          ...orchestratorMissingAdvice(installKind),
+        ].join("\n"),
+      ),
+    );
+    // Still run the rest of the checks so the operator gets the full picture.
+  }
+
+  // ── DNS bootstrap resolution ──
+  const dnsDomain = config.p2p?.bootstrapDns;
+  if (dnsDomain) {
+    try {
+      const peers = await resolveBootstrapDns(dnsDomain);
+      if (peers.length === 0) {
+        results.push(
+          warn(
+            `DNS bootstrap: _dnsaddr.${dnsDomain} returned 0 peers (fallback peers will be used)`,
+          ),
+        );
+      } else {
+        results.push(
+          ok(`DNS bootstrap: _dnsaddr.${dnsDomain} → ${peers.length} peer(s) discovered`),
+        );
+      }
+    } catch (err) {
+      results.push(
+        warn(
+          `DNS bootstrap: _dnsaddr.${dnsDomain} resolution failed (${err instanceof Error ? err.message : String(err)})`,
+        ),
+      );
+    }
+  } else {
+    results.push(info("DNS bootstrap: no domain configured (p2p.bootstrapDns unset)"));
+  }
+
+  // ── Hardcoded fallback peer reachability ──
+  const fallbackPeers = config.p2p?.bootstrapPeers ?? [];
+  if (fallbackPeers.length === 0) {
+    results.push(info("No hardcoded bootstrap peers configured"));
+  } else {
+    // Probe the first one as a representative sample — no need to hammer
+    // every peer in the list during a doctor run.
+    const firstPeer = fallbackPeers[0];
+    const parsed = parseMultiaddr(firstPeer);
+    if (!parsed) {
+      results.push(warn(`Could not parse first bootstrap peer: ${firstPeer}`));
+    } else {
+      const probeResult = await probeTcpReachable(parsed.host, parsed.port, 3000);
+      if (probeResult.reachable) {
+        const rtt = probeResult.rttMs != null ? ` (${probeResult.rttMs}ms)` : "";
+        results.push(ok(`Fallback peer ${parsed.host}:${parsed.port} reachable via TCP${rtt}`));
+        if (fallbackPeers.length > 1) {
+          results.push(
+            info(
+              `${fallbackPeers.length - 1} additional fallback peer(s) not probed (sampling first only)`,
+            ),
+          );
+        }
+      } else {
+        results.push(
+          warn(
+            `Fallback peer ${parsed.host}:${parsed.port} unreachable via TCP (${probeResult.error ?? "unknown"})`,
+          ),
+        );
+      }
+    }
+  }
+
+  // ── Live orchestrator stats (only if gateway is running) ──
+  if (isGatewayRunning) {
+    const httpAddr = config.p2p?.httpAddr ?? "127.0.0.1:9847";
+    const stats = await queryLiveStats(httpAddr);
+    if (stats.error) {
+      results.push(
+        info(
+          `Live orchestrator stats: ${httpAddr} unreachable (${stats.error}) — orchestrator may still be starting`,
+        ),
+      );
+    } else {
+      if (stats.peerId) {
+        results.push(ok(`Local peer ID: ${stats.peerId}`));
+      }
+      if (typeof stats.connectedPeers === "number") {
+        const label = stats.connectedPeers === 1 ? "peer" : "peers";
+        results.push(
+          stats.connectedPeers > 0
+            ? ok(`Connected to ${stats.connectedPeers} ${label}`)
+            : warn(`Connected to ${stats.connectedPeers} ${label}`),
+        );
+      }
+      if (typeof stats.meshPeers === "number" && stats.meshPeers !== stats.connectedPeers) {
+        results.push(info(`Gossipsub mesh peers: ${stats.meshPeers}`));
+      }
+      if (stats.subscribedTopics && stats.subscribedTopics.length > 0) {
+        results.push(info(`Subscribed topics: ${stats.subscribedTopics.length}`));
+      }
+      if (typeof stats.peakConcurrentPeers === "number") {
+        results.push(info(`Peak concurrent peers (this session): ${stats.peakConcurrentPeers}`));
+      }
+      if (typeof stats.lifetimeUniquePeerIds === "number") {
+        results.push(info(`Distinct peer IDs seen this session: ${stats.lifetimeUniquePeerIds}`));
+      }
+      if (typeof stats.routingTableSize === "number" && stats.routingTableSize > 0) {
+        results.push(info(`Kademlia routing table size: ${stats.routingTableSize}`));
+      }
+      if (stats.natStatus && stats.natStatus !== "unknown") {
+        results.push(info(`NAT status: ${stats.natStatus}`));
+      }
+      if (typeof stats.timeToFirstPeerMs === "number") {
+        results.push(info(`Time to first peer: ${stats.timeToFirstPeerMs}ms`));
+      }
+      if (typeof stats.skillLatencyP50Ms === "number") {
+        const p95 =
+          typeof stats.skillLatencyP95Ms === "number" ? `, p95 ${stats.skillLatencyP95Ms}ms` : "";
+        results.push(info(`Skill propagation latency: p50 ${stats.skillLatencyP50Ms}ms${p95}`));
+      }
+    }
+  } else {
+    results.push(info("Gateway not running — live orchestrator stats unavailable"));
+  }
+
+  renderSection(results);
+}
+
+function renderSection(results: CheckResult[]): void {
+  // Quiet when posture-only (e.g. "P2P is disabled ... local-only"):
+  // recorded, not printed (PLAN-41 p0-28).
+  renderSectionQuietIfAllInfo("P2P Network", results);
+}

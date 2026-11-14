@@ -1,0 +1,188 @@
+# Curiosity Reward Function (GCCRF)
+
+## What Is GCCRF?
+
+The Geodesic Crystal-Field Curiosity Reward Function (GCCRF) is Bitterbot's intrinsic curiosity system, integrated into the unified `CuriosityEngine`. It scores every new piece of information the agent encounters on a 0-to-1 scale of "how curious should I be about this?"
+
+Unlike simple keyword matching or random exploration, the curiosity engine computes curiosity from five neuroscience-grounded components that together model how biological curiosity actually works. The GCCRF reward function is invoked internally by `CuriosityEngine.assessChunk()` — there is no separate scoring path.
+
+## Where the score is read, and how that is measured
+
+Every place on main that reads the score is listed in [Evidence telemetry](/memory/evidence-telemetry), together with the surfaces the agent uses to put self-learned material in front of the owner. With `memory.curiosity.evidence.mode: "shadow"` the two dream-engine readers (mode selection weight and seed ranking) also record what they would have decided with the GCCRF term removed, next to what they did decide. This is observation only: the score keeps steering exactly as described on this page in every mode.
+
+## The Five Components
+
+### 1. Prediction Error ("How surprising is this?")
+
+When new information arrives, GCCRF measures how far it is from what the agent already knows. Information that fits neatly into an existing knowledge region scores low. Information that's far from anything the agent has seen scores high.
+
+### 2. Learning Progress ("Am I getting better at understanding this area?")
+
+For each knowledge region, the agent tracks whether it's getting less surprised over time. If prediction errors are decreasing in a region, the agent is learning. This component rewards active learning zones and deprioritizes areas where the agent is stuck or already understands.
+
+Progress **preserves zero**: a region whose error is not moving contributes 0, not the normalizer's resting value of 0.5. The raw Δη (a bounded difference of two per-region η EMAs, both seeded at the first observed η rather than at a constant) is clamped to `[0, 1]` directly; the running normalizer still records it for telemetry.
+
+### 3. Information-Theoretic Novelty ("How rare is this part of my knowledge space?")
+
+This is GCCRF's most distinctive feature. It uses density estimation to determine how crowded or sparse a region of knowledge space is.
+
+Density is an RBF kernel over the raw cosine distances to the K nearest neighbours with one **shared bandwidth** (`gccrf.densityBandwidth`, default 0.3). The bandwidth is deliberately not fitted per query: a per-query min/max stretch (the previous behaviour) made every neighbourhood look identical, so a chunk sitting on top of fifty near-duplicates scored the same density as one far from everything. The assessed chunk is excluded from its own neighbourhood, and archived chunks still present in the vector index are filtered out.
+
+The shaped term is the alpha-family novelty of Nedergaard & Morales (eq. 23) **with its prefactor**: `I_α(p) = 4 / (1 - α²) · (p^(-(α+1)/2) - 1)`, with `I_-1(p) = -log p` as the limit (a small window around α = -1 uses the log form because the prefactor is numerically unstable there). The prefactor matters: without it the ordering flips for α < -1, and the "young agent" end of the schedule rewarded the most familiar material (the bare power term at α = -3 is `p - 1`). With it, `I_α` is decreasing in density for every α.
+
+**The developmental twist**: a young agent (few dream cycles completed) gets a _bounded, forgiving_ novelty bonus: at α = -3 the term is `(1 - p) / 2`, between 0 and 0.5, so common and rare material differ only mildly. As the agent matures the bonus becomes _sharply frontier-seeking_: at α = 0 it is `4 (1/√p - 1)`, unbounded as density falls. The per-component normalizer absorbs the scale change; what anneals is how strongly rarity is preferred, never the direction.
+
+This transition happens automatically through **alpha annealing**, a parameter that moves from -3 to 0 over the agent's completed dream cycles.
+
+### 4. Empowerment ("Does knowing this give me more agency?")
+
+Knowledge that bridges multiple different knowledge regions and semantic types has high empowerment -- it opens diverse pathways for future action. Knowledge that only touches one narrow area has low empowerment.
+
+This component is gated by an **interoceptive modulator**: when the agent's prediction errors are volatile (it's confused), the empowerment signal amplifies -- "seek agency when disoriented." When errors are stable, empowerment is dampened.
+
+### 5. Strategic Alignment ("Does this match what I'm trying to learn?")
+
+This measures how well new information aligns with the agent's active exploration targets -- specific knowledge gaps or frontiers the curiosity engine has identified. It closes the loop: the agent generates curiosity targets, then rewards information that helps fulfill them.
+
+## How It Affects the Agent
+
+### Dream Cycles
+
+GCCRF rewards directly influence which memories the Dream Engine selects as seeds for dream cycles. Higher curiosity reward = more likely to be dreamed about = more likely to generate insights.
+
+Each GCCRF component also influences which _mode_ the Dream Engine uses:
+
+- High prediction error --> Exploration mode
+- High learning progress --> Compression mode (consolidate what's being learned)
+- High novelty --> Simulation mode (cross-domain connections)
+
+(The empowerment → Mutation and strategic alignment → Research couplings were retired with those modes in PLAN-45 Phase 1.)
+
+### Hormonal Feedback
+
+`HormonalStateManager.stimulateFromGCCRF` turns the score into hormonal events: a reward above 0.7 fires `curiosity_high` (dopamine +0.25, discovery), a learning-progress component above 0.7 fires `curiosity_progress` (dopamine +0.2, mastery), a strategic-alignment component above 0.7 fires `curiosity_aligned` (dopamine +0.1), a run of 5 consecutive rewards below 0.2 fires `curiosity_stagnant` once (cortisol +0.15, stagnation), and an empowerment component above 0.6 on a `preference`, `relationship` or `episode` chunk fires `curiosity_bonding` (oxytocin +0.25, dopamine +0.1: the agent is learning about its human).
+
+### Memory Consolidation
+
+Chunks with high curiosity rewards resist decay longer during consolidation. The curiosity engine uses GCCRF signals to generate and retire exploration targets -- areas the agent should investigate or can stop worrying about.
+
+## Developmental Annealing
+
+The alpha parameter controls the agent's developmental stage:
+
+| Alpha Range  | Stage      | Behavior                                  |
+| ------------ | ---------- | ----------------------------------------- |
+| -3.0 to -1.5 | Infant     | Curious about common, foundational things |
+| -1.5 to -0.5 | Adolescent | Transitioning from common to novel        |
+| -0.5 to 0.0  | Mature     | Curious about rare, frontier things       |
+
+These bands describe the schedule; the dashboard's stage label uses coarser cut-offs (Infant below -1, Adolescent below -0.3, Mature otherwise).
+
+Maturity is tied to **dream cycles completed** and nothing else: `maturity = min(1, completed_cycles / expectedMatureCycles)`. Chunk count and calendar age used to count too (500 chunks or 30 days meant "mature"), which let a node with a large import and almost no completed cycles jump straight to the frontier-seeking regime. Removing those shortcuts means an upgraded node with many chunks but few completed cycles moves back toward the young regime until its dreams catch up.
+
+## Configuration
+
+GCCRF configuration is set in the `memory.gccrf` section of the Bitterbot config:
+
+| Setting                | Default                          | Description                                                       |
+| ---------------------- | -------------------------------- | ----------------------------------------------------------------- |
+| `weights`              | `[0.25, 0.20, 0.25, 0.20, 0.10]` | Component weights (eta, deltaEta, iAlpha, empowerment, strategic) |
+| `alphaStart`           | `-3.0`                           | Alpha at birth (rewards commonality)                              |
+| `alphaEnd`             | `0.0`                            | Alpha at maturity (rewards novelty)                               |
+| `expectedMatureCycles` | `100`                            | Dream cycles to full maturity                                     |
+| `kdeK`                 | `50`                             | Neighbors for density estimation                                  |
+| `empowermentK`         | `30`                             | Neighbors for empowerment computation                             |
+| `muGain`               | `5.0`                            | Interoceptive modulator sensitivity                               |
+| `muThreshold`          | `0.3`                            | Interoceptive modulator threshold                                 |
+| `densityBandwidth`     | `0.3`                            | Shared RBF bandwidth over cosine distance for KDE density         |
+
+FSHO alpha coupling is switched on with `memory.curiosity.fshoCoupling: true` (default `false`, see below).
+
+Normalizer statistics and per-region η EMAs are stamped with a scoring version (`gccrf_state.scoring_version`, currently `gccrf-v2`). When the version changes, those statistics are reset once on load because their units changed; the η window and processed-chunk counter are kept.
+
+## FSHO Oscillator Coupling
+
+The Dream Engine's **FSHO oscillator** (Fractional Stuart-Landau Hopf Oscillator) provides a complementary signal to GCCRF for dream mode selection. While GCCRF tells the agent what it _needs to learn_, the FSHO order parameter R tells the agent what the _memory landscape looks like_:
+
+- **GCCRF high prediction error + FSHO low R** → Both agree: explore (scattered, surprising memories)
+- **GCCRF high learning progress + FSHO high R** → Both agree: compress (coherent, consolidating memories)
+- **GCCRF wants exploration + FSHO wants compression** → Disagreement resolved via weighted normalization (0.3 GCCRF, 0.4 FSHO × validation factor, 0.3 curiosity heuristics; the GCCRF and curiosity shares drop to 0.275 when long-horizon tasks are pending and to 0.25 when the marketplace is active, see the dream engine page)
+
+**FSHO alpha coupling (opt-in, `memory.curiosity.fshoCoupling`, default off):** when enabled, the FSHO order parameter R informs alpha annealing via a running EMA: `effective_alpha = base_alpha + 0.5 × (R_avg - 0.5)`, clamped to `[alphaStart, alphaEnd]`. High R (coherent memory set) shifts alpha toward frontier-seeking; low R shifts toward consolidation. By default the coupling is **not** applied: R is tracked (and persisted as `gccrf_state.fsho_r_avg`) for telemetry, and novelty uses the pure maturity schedule. The FSHO signal is also **self-validating**: `computeFshoWeightAdjustment()` checks Pearson correlation between R and DQS, scaling FSHO's mode selection weight between 0.5x (noise) and 1.5x (validated).
+
+### Maturity Calculation
+
+Maturity is computed from completed dream cycles only (see Developmental Annealing above). It is exposed on the dashboard together with the current alpha.
+
+### Exploration Target TTL
+
+Exploration targets expire after **48 hours** (reduced from 168h). This prevents stale targets from accumulating and biasing dream mode selection toward exploration when the knowledge gaps may no longer be relevant.
+
+## Dashboard
+
+The Dream Engine dashboard includes a "Curiosity" tab showing:
+
+- Current alpha value and maturity percentage
+- All five GCCRF components with their current mean values
+- Per-region learning progress (which topics are improving?)
+- Reward history chart
+- Active exploration targets and their alignment scores
+
+## Closed-loop cognition observability (PLAN-34 Phase 6)
+
+`memory.retrievalHealth` gained a `cognition` section, derived only from
+same-DB sources (task counts live in a separate DB and are surfaced by the
+gateway RPC that owns the task store, not here):
+
+- **Directive funnel** — created / injected / answered / resolved counts by
+  stage, from `memory_audit_log` (actor `epistemic_directives`).
+- **Insight promotion** — total promoted plus per-leg rejection counts
+  (which grounding/verifier leg is starving), from `dream_telemetry`.
+- **Research** — outcome codes (`resolved` / `irrelevant` / `no_url` /
+  `domain_blocked` / `sensitive_skipped` / `containment_rejected` /
+  `transient_error`) from curiosity-target metadata, plus egress-today vs
+  the daily cap.
+
+The dream dashboard renders these under a "Closed-loop cognition" card.
+
+The Retrieval tab also carries the plan's three detail surfaces:
+
+- **Research findings card** — recent `research_findings` rows (finding,
+  source URL, relevance, created/surfaced timestamps). This is a read-only
+  history view via `listResearchFindings()`; it never marks rows surfaced —
+  the one-time "while you were away" drain stays owned by
+  `consumeResearchFindings()`, so a finding still shows "awaiting surfacing"
+  here until a live session voices it.
+- **Research egress log** — the `research_egress_log` audit trail via
+  `listResearchEgress()`: all-time request counts per seam (search-query /
+  fetch-host / transport-post) plus the most recent rows with destination,
+  payload length, and payload-hash prefix. The per-seam totals are computed
+  over the whole table so truncating the recent list can never understate
+  the real network footprint.
+- **Canonical memory ledger** (closes the PLAN-33 Phase 4 pane debt) —
+  `retrievalHealth().canonical` now includes `facts`, the active ledger
+  contents (key, value, source, confidence, corroboration count) alongside
+  the existing active-fact count and last-injection record.
+
+Dead-wire detection distinguishes lane cadence: most layers use the
+PLAN-28 rolling 200-call window, but LOW-FREQUENCY lanes (currently
+`open_loops`, which legitimately contributes 0 whenever no unfinished work
+exists) are judged by a **30-day time window** instead. A time-window lane
+warns only when ALL THREE hold: silent for the full window, the system
+contributed recently (a process that sat idle for a month must never warn
+off pure wall-clock), and at least 25 system-active retrievals occurred
+since the lane last fired (one post-idle retrieval is not evidence). Lane
+baselines (last fire / first seen / last warn) persist in `memory_meta`,
+so gateway restarts do not reset the 30-day clock. Warnings carry
+`kind: "time_window"` and `daysSinceContribution` and render with their
+own wording on the dashboard. The dashboard reads the side-effect-free
+`deadWiresSnapshot()` — a persistent fault stays visible on every poll —
+while only the maintenance log path consumes the once-per-window
+re-warn suppression.
+
+## Related Documentation
+
+- [Dream Engine](./dream-engine.md) — GCCRF mode adjustments, FSHO coupling
+- [Architecture Overview](./architecture-overview.md) — full system data flow
+- [Knowledge Crystals](./knowledge-crystals.md) — curiosity_reward column (unified scoring)
+- [Emotional System](./emotional-system.md) — GCCRF → hormonal feedback loop

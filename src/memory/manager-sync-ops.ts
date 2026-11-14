@@ -1,0 +1,1647 @@
+// @ts-nocheck
+// oxlint-disable eslint/no-unused-vars, typescript/no-explicit-any
+
+import { randomUUID } from "node:crypto";
+import fsSync from "node:fs";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import chokidar, { type FSWatcher } from "chokidar";
+import { isExcludedMemoryPath } from "../agents/memory-search.js";
+import { resolveWatchPaths } from "../agents/skills/refresh.js";
+import { conversationMemoryEnabled } from "../config/feature-switches.js";
+import { resolveSessionTranscriptsDirForAgent } from "../config/sessions/paths.js";
+import { assertNotRealStateUnderTest } from "../infra/test-state-guard.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
+import { resolveUserPath } from "../utils.js";
+import {
+  type EmbeddingProfile,
+  buildEmbeddingProfile,
+  compareEmbeddingProfiles,
+} from "./embedding-profile.js";
+import {
+  buildFileEntry,
+  ensureDir,
+  isMemoryPath,
+  listMemoryFiles,
+  normalizeExtraMemoryPaths,
+  parseEmbedding,
+  remapChunkLines,
+  runWithConcurrency,
+  type MemoryFileEntry,
+} from "./internal.js";
+import { ensureMemoryIndexSchema } from "./memory-schema.js";
+import {
+  buildSessionEntry,
+  listSessionFilesForAgent,
+  sessionPathForFile,
+  type SessionFileEntry,
+} from "./session-files.js";
+import { loadSqliteVecExtension } from "./sqlite-vec.js";
+import { requireNodeSqlite } from "./sqlite.js";
+import type { MemorySource, MemorySyncProgressUpdate } from "./types.js";
+
+type MemoryIndexMeta = {
+  model: string;
+  provider: string;
+  providerKey?: string;
+  chunkTokens: number;
+  chunkOverlap: number;
+  vectorDims?: number;
+  /** PLAN-57 §4.6: the exact profile this index is written under. */
+  profile?: EmbeddingProfile;
+};
+
+const PROFILE_DIGEST_TIMEOUT_MS = 30_000;
+
+type MemorySyncProgressState = {
+  completed: number;
+  total: number;
+  label?: string;
+  report: (update: MemorySyncProgressUpdate) => void;
+};
+
+const META_KEY = "memory_index_meta_v1";
+const VECTOR_TABLE = "chunks_vec";
+/** meta key stamped once the post-v63 vector orphan sweep has run. */
+const VECTOR_ORPHAN_SWEEP_META_KEY = "vector_orphan_sweep_v63";
+const FTS_TABLE = "chunks_fts";
+const EMBEDDING_CACHE_TABLE = "embedding_cache";
+const SESSION_DIRTY_DEBOUNCE_MS = 5000;
+/**
+ * Longest a session may hold unindexed content before it is indexed regardless
+ * of the byte/message thresholds. Anything the user says is invisible to
+ * extraction (preferences, canonical facts, recall) until its session is
+ * indexed, so this bounds "the agent has not heard me yet".
+ */
+const SESSION_MAX_PENDING_MS = 10 * 60_000;
+const SESSION_DELTA_READ_CHUNK_BYTES = 64 * 1024;
+const VECTOR_LOAD_TIMEOUT_MS = 30_000;
+const IGNORED_MEMORY_WATCH_DIR_NAMES = new Set([
+  ".git",
+  "node_modules",
+  ".pnpm-store",
+  ".venv",
+  "venv",
+  ".tox",
+  "__pycache__",
+]);
+
+const log = createSubsystemLogger("memory");
+
+// WSL2's inotify is unreliable for cross-filesystem watching; use polling as fallback
+const isWSL = (() => {
+  try {
+    const release = os.release().toLowerCase();
+    return release.includes("microsoft") || release.includes("wsl");
+  } catch {
+    return false;
+  }
+})();
+
+function shouldIgnoreMemoryWatchPath(watchPath: string): boolean {
+  const normalized = path.normalize(watchPath);
+  const parts = normalized.split(path.sep).map((segment) => segment.trim().toLowerCase());
+  return parts.some((segment) => IGNORED_MEMORY_WATCH_DIR_NAMES.has(segment));
+}
+
+class MemoryManagerSyncOps {
+  [key: string]: any;
+  private sessionInitialSyncDone = false;
+  private vectorOrphanSweepDone = false;
+  private lastSyncedAt: number | null = null;
+  private async ensureVectorReady(dimensions?: number): Promise<boolean> {
+    if (!this.vector.enabled) {
+      return false;
+    }
+    if (!this.vectorReady) {
+      this.vectorReady = this.withTimeout(
+        this.loadVectorExtension(),
+        VECTOR_LOAD_TIMEOUT_MS,
+        `sqlite-vec load timed out after ${Math.round(VECTOR_LOAD_TIMEOUT_MS / 1000)}s`,
+      );
+    }
+    let ready = false;
+    try {
+      ready = await this.vectorReady;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.vector.available = false;
+      this.vector.loadError = message;
+      this.vectorReady = null;
+      log.warn(`sqlite-vec unavailable: ${message}`);
+      return false;
+    }
+    if (ready && typeof dimensions === "number" && dimensions > 0) {
+      this.ensureVectorTable(dimensions);
+      this.sweepVectorOrphansOnce();
+    }
+    return ready;
+  }
+
+  /**
+   * PLAN-45 Phase 0: delete vector rows whose chunk no longer exists. Runs
+   * once per database (meta key) after sqlite-vec is loaded, because chunk
+   * deletions that happen inside migrations (v63 purged 572 crystallizer
+   * chunks) cannot touch chunks_vec: the vec0 module is not on the
+   * connection at migration time. Orphan vector rows are not harmless; they
+   * occupy KNN `k` slots on every search and are never returned as chunks.
+   */
+  private sweepVectorOrphansOnce(): void {
+    if (this.vectorOrphanSweepDone) {
+      return;
+    }
+    this.vectorOrphanSweepDone = true;
+    try {
+      const done = this.db
+        .prepare(`SELECT value FROM meta WHERE key = ?`)
+        .get(VECTOR_ORPHAN_SWEEP_META_KEY) as { value: string } | undefined;
+      if (done?.value === "1") {
+        return;
+      }
+      const result = this.db
+        .prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id NOT IN (SELECT id FROM chunks)`)
+        .run();
+      this.db
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = '1'`,
+        )
+        .run(VECTOR_ORPHAN_SWEEP_META_KEY);
+      if (Number(result.changes) > 0) {
+        log.info(
+          `vector orphan sweep removed ${result.changes} ${VECTOR_TABLE} rows with no chunk`,
+        );
+      }
+    } catch (err) {
+      // Not stamped: retried on the next boot.
+      this.vectorOrphanSweepDone = false;
+      log.warn(`vector orphan sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async loadVectorExtension(): Promise<boolean> {
+    if (this.vector.available !== null) {
+      return this.vector.available;
+    }
+    if (!this.vector.enabled) {
+      this.vector.available = false;
+      return false;
+    }
+    try {
+      const resolvedPath = this.vector.extensionPath?.trim()
+        ? resolveUserPath(this.vector.extensionPath)
+        : undefined;
+      const loaded = await loadSqliteVecExtension({ db: this.db, extensionPath: resolvedPath });
+      if (!loaded.ok) {
+        throw new Error(loaded.error ?? "unknown sqlite-vec load error");
+      }
+      this.vector.extensionPath = loaded.extensionPath;
+      this.vector.available = true;
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.vector.available = false;
+      this.vector.loadError = message;
+      log.warn(`sqlite-vec unavailable: ${message}`);
+      return false;
+    }
+  }
+
+  private ensureVectorTable(dimensions: number): void {
+    // The cached dims come from PERSISTED meta (memory_index_meta_v1), so they
+    // can claim a vector table that no longer exists in this database — a
+    // fresh-start copy, a restore, or any past session where sqlite-vec failed
+    // to load and the table was never created. Trusting dims alone made
+    // ensureVectorReady() report READY against a missing table, and every
+    // downstream `DELETE/INSERT ... chunks_vec` prepare threw "no such table:
+    // chunks_vec". That silently killed BOTH the embedding backfill (the
+    // long-standing never-embedded-crystal backlog: the drainer threw on its
+    // first statement every run) and vector search. Verify existence, not just
+    // the remembered dimension.
+    if (this.vector.dims === dimensions && this.vectorTableExists()) {
+      return;
+    }
+    if (this.vector.dims && this.vector.dims !== dimensions) {
+      this.dropVectorTable();
+    }
+    this.db.exec(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS ${VECTOR_TABLE} USING vec0(\n` +
+        `  id TEXT PRIMARY KEY,\n` +
+        `  embedding FLOAT[${dimensions}]\n` +
+        `)`,
+    );
+    this.vector.dims = dimensions;
+  }
+
+  /** True when the vec virtual table is actually present in THIS database. */
+  private vectorTableExists(): boolean {
+    try {
+      return Boolean(
+        this.db
+          .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`)
+          .get(VECTOR_TABLE),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private dropVectorTable(): void {
+    try {
+      this.db.exec(`DROP TABLE IF EXISTS ${VECTOR_TABLE}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.debug(`Failed to drop ${VECTOR_TABLE}: ${message}`);
+    }
+  }
+
+  private buildSourceFilter(alias?: string): { sql: string; params: MemorySource[] } {
+    const sources = Array.from(this.sources);
+    if (sources.length === 0) {
+      return { sql: "", params: [] };
+    }
+    const column = alias ? `${alias}.source` : "source";
+    const placeholders = sources.map(() => "?").join(", ");
+    return { sql: ` AND ${column} IN (${placeholders})`, params: sources };
+  }
+
+  private openDatabase(): DatabaseSync {
+    const dbPath = resolveUserPath(this.settings.store.path);
+    return this.openDatabaseAtPath(dbPath);
+  }
+
+  private openDatabaseAtPath(dbPath: string): DatabaseSync {
+    assertNotRealStateUnderTest(dbPath);
+    const dir = path.dirname(dbPath);
+    ensureDir(dir);
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(dbPath, {
+      allowExtension: this.settings.store.vector.enabled,
+    });
+    restrictDbFilePermissions(dbPath);
+    // Tune for concurrent writer workload. Without WAL, the default
+    // rollback journal + synchronous=FULL + busy_timeout=0 serialized
+    // every writer and failed reads on contention — dream cycles,
+    // management census, RLM writes, and skill ops all fought for the
+    // exclusive lock and readers saw SQLITE_BUSY. On WSL's ext4-backed
+    // VHDX, the resulting jbd2 journal-commit waits also stalled the
+    // Node event loop in 2–60 s bursts.
+    //   - journal_mode=WAL:   writers append to WAL, readers never
+    //                         block writers, only one writer at a time
+    //                         but the lock window is short.
+    //   - synchronous=NORMAL: fsync only at checkpoint boundaries
+    //                         instead of every commit. Crash-safe; on
+    //                         power loss, only the last few commits in
+    //                         the WAL may be lost. DB itself won't corrupt.
+    //   - busy_timeout=5000:  if a lock IS contended, wait up to 5 s
+    //                         before returning SQLITE_BUSY so callers
+    //                         don't fail instantly.
+    //   - wal_autocheckpoint=1000: default is 1000 pages (~4 MB) which
+    //                         is fine; stating it explicitly documents
+    //                         the expectation.
+    // journal_mode returns a result row (the new mode), which db.exec()
+    // of a multi-statement string swallows incorrectly under node:sqlite —
+    // use prepare().get() for it and exec() for the rest. Each PRAGMA is
+    // guarded independently so one failure doesn't skip the others.
+    try {
+      db.prepare("PRAGMA journal_mode = WAL").get();
+    } catch {}
+    try {
+      db.exec("PRAGMA synchronous = NORMAL");
+    } catch {}
+    try {
+      db.exec("PRAGMA busy_timeout = 5000");
+    } catch {}
+    try {
+      db.exec("PRAGMA wal_autocheckpoint = 1000");
+    } catch {}
+    return db;
+  }
+
+  private seedEmbeddingCache(sourceDb: DatabaseSync): void {
+    if (!this.cache.enabled) {
+      return;
+    }
+    try {
+      const rows = sourceDb
+        .prepare(
+          `SELECT provider, model, provider_key, hash, embedding, dims, updated_at FROM ${EMBEDDING_CACHE_TABLE}`,
+        )
+        .all() as Array<{
+        provider: string;
+        model: string;
+        provider_key: string;
+        hash: string;
+        embedding: string;
+        dims: number | null;
+        updated_at: number;
+      }>;
+      if (!rows.length) {
+        return;
+      }
+      const insert = this.db.prepare(
+        `INSERT INTO ${EMBEDDING_CACHE_TABLE} (provider, model, provider_key, hash, embedding, dims, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider, model, provider_key, hash) DO UPDATE SET
+           embedding=excluded.embedding,
+           dims=excluded.dims,
+           updated_at=excluded.updated_at`,
+      );
+      this.db.exec("BEGIN");
+      for (const row of rows) {
+        insert.run(
+          row.provider,
+          row.model,
+          row.provider_key,
+          row.hash,
+          row.embedding,
+          row.dims,
+          row.updated_at,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw err;
+    }
+  }
+
+  private async swapIndexFiles(targetPath: string, tempPath: string): Promise<void> {
+    const backupPath = `${targetPath}.backup-${randomUUID()}`;
+    await this.moveIndexFiles(targetPath, backupPath);
+    try {
+      await this.moveIndexFiles(tempPath, targetPath);
+    } catch (err) {
+      await this.moveIndexFiles(backupPath, targetPath);
+      throw err;
+    }
+    await this.removeIndexFiles(backupPath);
+  }
+
+  private async moveIndexFiles(sourceBase: string, targetBase: string): Promise<void> {
+    const suffixes = ["", "-wal", "-shm"];
+    for (const suffix of suffixes) {
+      const source = `${sourceBase}${suffix}`;
+      const target = `${targetBase}${suffix}`;
+      try {
+        await fs.rename(source, target);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw err;
+        }
+      }
+    }
+  }
+
+  private async removeIndexFiles(basePath: string): Promise<void> {
+    const suffixes = ["", "-wal", "-shm"];
+    await Promise.all(suffixes.map((suffix) => fs.rm(`${basePath}${suffix}`, { force: true })));
+  }
+
+  private ensureSchema() {
+    const result = ensureMemoryIndexSchema({
+      db: this.db,
+      embeddingCacheTable: EMBEDDING_CACHE_TABLE,
+      ftsTable: FTS_TABLE,
+      ftsEnabled: this.fts.enabled,
+    });
+    this.fts.available = result.ftsAvailable;
+    if (result.ftsError) {
+      this.fts.loadError = result.ftsError;
+      log.warn(`fts unavailable: ${result.ftsError}`);
+    }
+    if (result.ftsBackfilled && result.ftsBackfilled > 0) {
+      log.warn(
+        `fts drift repaired: backfilled ${result.ftsBackfilled} chunks missing from ${FTS_TABLE}`,
+      );
+    }
+  }
+
+  private ensureWatcher() {
+    const hasMemory = this.sources.has("memory");
+    const hasSkills = this.sources.has("skills");
+    if ((!hasMemory && !hasSkills) || !this.settings.sync.watch || this.watcher) {
+      return;
+    }
+    const watchPaths = new Set<string>();
+    if (hasMemory) {
+      watchPaths.add(path.join(this.workspaceDir, "MEMORY.md"));
+      watchPaths.add(path.join(this.workspaceDir, "memory.md"));
+      watchPaths.add(path.join(this.workspaceDir, "memory", "**", "*.md"));
+    }
+    const additionalPaths = normalizeExtraMemoryPaths(this.workspaceDir, this.settings.extraPaths);
+    for (const entry of additionalPaths) {
+      try {
+        const stat = fsSync.lstatSync(entry);
+        if (stat.isSymbolicLink()) {
+          continue;
+        }
+        if (stat.isDirectory()) {
+          watchPaths.add(path.join(entry, "**", "*.md"));
+          continue;
+        }
+        if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+          watchPaths.add(entry);
+        }
+      } catch {
+        // Skip missing/unreadable additional paths.
+      }
+    }
+    if (hasSkills) {
+      const skillRoots = resolveWatchPaths(this.workspaceDir, this.cfg);
+      for (const skillRoot of skillRoots) {
+        watchPaths.add(path.join(skillRoot, "SKILL.md"));
+        watchPaths.add(path.join(skillRoot, "*", "SKILL.md"));
+      }
+    }
+    this.watcher = chokidar.watch(Array.from(watchPaths), {
+      ignoreInitial: true,
+      ignored: (watchPath) => shouldIgnoreMemoryWatchPath(String(watchPath)),
+      awaitWriteFinish: {
+        stabilityThreshold: this.settings.sync.watchDebounceMs,
+        pollInterval: 100,
+      },
+      usePolling: isWSL,
+      interval: isWSL ? 2000 : undefined,
+    });
+    const markDirty = (changedPath?: string) => {
+      const isSkillPath =
+        typeof changedPath === "string" && path.basename(changedPath) === "SKILL.md";
+      if (isSkillPath) {
+        this.skillsDirty = true;
+      } else {
+        this.dirty = true;
+      }
+      this.scheduleWatchSync();
+    };
+    this.watcher.on("add", (p) => markDirty(p));
+    this.watcher.on("change", (p) => markDirty(p));
+    this.watcher.on("unlink", (p) => markDirty(p));
+  }
+
+  private ensureSessionListener() {
+    if (!this.sources.has("sessions") || this.sessionUnsubscribe) {
+      return;
+    }
+    this.sessionUnsubscribe = onSessionTranscriptUpdate((update) => {
+      if (this.closed) {
+        return;
+      }
+      const sessionFile = update.sessionFile;
+      if (!this.isSessionFileForAgent(sessionFile)) {
+        return;
+      }
+      this.scheduleSessionDirty(sessionFile);
+    });
+  }
+
+  private scheduleSessionDirty(sessionFile: string) {
+    this.sessionPendingFiles.add(sessionFile);
+    if (this.sessionWatchTimer) {
+      return;
+    }
+    this.sessionWatchTimer = setTimeout(() => {
+      this.sessionWatchTimer = null;
+      void this.processSessionDeltaBatch().catch((err) => {
+        log.warn(`memory session delta failed: ${String(err)}`);
+      });
+    }, SESSION_DIRTY_DEBOUNCE_MS);
+  }
+
+  private async processSessionDeltaBatch(): Promise<void> {
+    if (this.sessionPendingFiles.size === 0) {
+      return;
+    }
+    const pending = Array.from(this.sessionPendingFiles);
+    this.sessionPendingFiles.clear();
+    let shouldSync = false;
+    for (const sessionFile of pending) {
+      const delta = await this.updateSessionDelta(sessionFile);
+      if (!delta) {
+        continue;
+      }
+      const bytesThreshold = delta.deltaBytes;
+      const messagesThreshold = delta.deltaMessages;
+      const bytesHit =
+        bytesThreshold <= 0 ? delta.pendingBytes > 0 : delta.pendingBytes >= bytesThreshold;
+      const messagesHit =
+        messagesThreshold <= 0
+          ? delta.pendingMessages > 0
+          : delta.pendingMessages >= messagesThreshold;
+      // Staleness backstop. The byte/message thresholds exist to stop a chatty
+      // session re-indexing on every keystroke, but they were the ONLY trigger:
+      // at the defaults (100,000 bytes / 50 messages) a normal conversation can
+      // run for hours without ever crossing one, and until it does, nothing the
+      // user said is visible to extraction. Measured 2026-08-13: a 59 KB session
+      // sat unindexed for over four hours while the operator stated two explicit
+      // standing preferences, neither of which reached user_preferences — and
+      // the regex preference extractor, which only ever sees session text, had
+      // produced ZERO rows in its entire lifetime. Thresholds may delay
+      // indexing; they must not defer it indefinitely.
+      const pendingAge = delta.pendingSince ? Date.now() - delta.pendingSince : 0;
+      const staleHit = delta.pendingBytes > 0 && pendingAge >= SESSION_MAX_PENDING_MS;
+      if (!bytesHit && !messagesHit && !staleHit) {
+        continue;
+      }
+      if (staleHit && !bytesHit && !messagesHit) {
+        log.debug(
+          `session ${String(sessionFile)}: indexing ${delta.pendingBytes}B held for ${Math.round(
+            pendingAge / 60_000,
+          )}m (below threshold, staleness backstop)`,
+        );
+      }
+      this.sessionsDirtyFiles.add(sessionFile);
+      this.sessionsDirty = true;
+      // Consume the pending counters on the STATE, not on the returned copy.
+      // The previous code decremented the copy, so the counters never actually
+      // reset: once a file crossed a threshold it stayed "over" forever and
+      // re-marked itself dirty on every batch. Without this the staleness
+      // backstop would fire on every pass instead of once.
+      const state = this.sessionDeltas.get(sessionFile);
+      if (state) {
+        state.pendingBytes =
+          staleHit || bytesThreshold <= 0 ? 0 : Math.max(0, state.pendingBytes - bytesThreshold);
+        state.pendingMessages =
+          staleHit || messagesThreshold <= 0
+            ? 0
+            : Math.max(0, state.pendingMessages - messagesThreshold);
+        state.pendingSince = state.pendingBytes > 0 ? Date.now() : undefined;
+      }
+      shouldSync = true;
+    }
+    if (shouldSync) {
+      void this.sync({ reason: "session-delta" }).catch((err) => {
+        log.warn(`memory sync failed (session-delta): ${String(err)}`);
+      });
+    }
+  }
+
+  private async updateSessionDelta(sessionFile: string): Promise<{
+    deltaBytes: number;
+    deltaMessages: number;
+    pendingBytes: number;
+    pendingMessages: number;
+    pendingSince?: number;
+  } | null> {
+    const thresholds = this.settings.sync.sessions;
+    if (!thresholds) {
+      return null;
+    }
+    let stat: { size: number };
+    try {
+      stat = await fs.stat(sessionFile);
+    } catch {
+      return null;
+    }
+    const size = stat.size;
+    let state = this.sessionDeltas.get(sessionFile);
+    if (!state) {
+      state = { lastSize: 0, pendingBytes: 0, pendingMessages: 0 };
+      this.sessionDeltas.set(sessionFile, state);
+    }
+    const deltaBytes = Math.max(0, size - state.lastSize);
+    if (deltaBytes === 0 && size === state.lastSize) {
+      // Unchanged file, but content may still be pending from an earlier append
+      // that never crossed a threshold — carry pendingSince so the staleness
+      // backstop can still fire on a later pass.
+      return {
+        deltaBytes: thresholds.deltaBytes,
+        deltaMessages: thresholds.deltaMessages,
+        pendingBytes: state.pendingBytes,
+        pendingMessages: state.pendingMessages,
+        pendingSince: state.pendingSince,
+      };
+    }
+    if (size < state.lastSize) {
+      state.lastSize = size;
+      state.pendingBytes += size;
+      const shouldCountMessages =
+        thresholds.deltaMessages > 0 &&
+        (thresholds.deltaBytes <= 0 || state.pendingBytes < thresholds.deltaBytes);
+      if (shouldCountMessages) {
+        state.pendingMessages += await this.countNewlines(sessionFile, 0, size);
+      }
+    } else {
+      state.pendingBytes += deltaBytes;
+      const shouldCountMessages =
+        thresholds.deltaMessages > 0 &&
+        (thresholds.deltaBytes <= 0 || state.pendingBytes < thresholds.deltaBytes);
+      if (shouldCountMessages) {
+        state.pendingMessages += await this.countNewlines(sessionFile, state.lastSize, size);
+      }
+      state.lastSize = size;
+    }
+    if (state.pendingBytes > 0 && state.pendingSince === undefined) {
+      state.pendingSince = Date.now();
+    } else if (state.pendingBytes === 0) {
+      state.pendingSince = undefined;
+    }
+    this.sessionDeltas.set(sessionFile, state);
+    return {
+      deltaBytes: thresholds.deltaBytes,
+      deltaMessages: thresholds.deltaMessages,
+      pendingBytes: state.pendingBytes,
+      pendingMessages: state.pendingMessages,
+      pendingSince: state.pendingSince,
+    };
+  }
+
+  private async countNewlines(absPath: string, start: number, end: number): Promise<number> {
+    if (end <= start) {
+      return 0;
+    }
+    const handle = await fs.open(absPath, "r");
+    try {
+      let offset = start;
+      let count = 0;
+      const buffer = Buffer.alloc(SESSION_DELTA_READ_CHUNK_BYTES);
+      while (offset < end) {
+        const toRead = Math.min(buffer.length, end - offset);
+        const { bytesRead } = await handle.read(buffer, 0, toRead, offset);
+        if (bytesRead <= 0) {
+          break;
+        }
+        for (let i = 0; i < bytesRead; i += 1) {
+          if (buffer[i] === 10) {
+            count += 1;
+          }
+        }
+        offset += bytesRead;
+      }
+      return count;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private resetSessionDelta(absPath: string, size: number): void {
+    const state = this.sessionDeltas.get(absPath);
+    if (!state) {
+      return;
+    }
+    state.lastSize = size;
+    state.pendingBytes = 0;
+    state.pendingMessages = 0;
+  }
+
+  private isSessionFileForAgent(sessionFile: string): boolean {
+    if (!sessionFile) {
+      return false;
+    }
+    const sessionsDir = resolveSessionTranscriptsDirForAgent(this.agentId);
+    const resolvedFile = path.resolve(sessionFile);
+    const resolvedDir = path.resolve(sessionsDir);
+    return resolvedFile.startsWith(`${resolvedDir}${path.sep}`);
+  }
+
+  private ensureIntervalSync() {
+    const minutes = this.settings.sync.intervalMinutes;
+    if (!minutes || minutes <= 0 || this.intervalTimer) {
+      return;
+    }
+    const ms = minutes * 60 * 1000;
+    this.intervalTimer = setInterval(() => {
+      void this.sync({ reason: "interval" }).catch((err) => {
+        log.warn(`memory sync failed (interval): ${String(err)}`);
+      });
+    }, ms);
+  }
+
+  private scheduleWatchSync() {
+    if (!this.sources.has("memory") || !this.settings.sync.watch) {
+      return;
+    }
+    if (this.watchTimer) {
+      clearTimeout(this.watchTimer);
+    }
+    this.watchTimer = setTimeout(() => {
+      this.watchTimer = null;
+      void this.sync({ reason: "watch" }).catch((err) => {
+        log.warn(`memory sync failed (watch): ${String(err)}`);
+      });
+    }, this.settings.sync.watchDebounceMs);
+  }
+
+  private shouldSyncSessions(
+    params?: { reason?: string; force?: boolean },
+    needsFullReindex = false,
+  ) {
+    if (!this.sources.has("sessions")) {
+      return false;
+    }
+    if (params?.force) {
+      return true;
+    }
+    if (needsFullReindex) {
+      return true;
+    }
+    // On first sync per manager lifetime, check if disk has sessions not yet in DB.
+    // This catches historical sessions from before the memory backend was configured.
+    if (!this.sessionInitialSyncDone) {
+      return true;
+    }
+    const reason = params?.reason;
+    if (reason === "session-start" || reason === "watch") {
+      return false;
+    }
+    if (this.sessionsDirty && this.sessionsDirtyFiles.size > 0) {
+      return true;
+    }
+    // The staleness backstop is otherwise only evaluated when a NEW transcript
+    // write schedules a delta batch — so a user who says something and then
+    // goes quiet would leave it pending forever, which is precisely the case
+    // that matters (a stated preference, then silence). The periodic sync
+    // re-checks it here so the deadline holds without further activity.
+    return this.hasStaleSessionContent();
+  }
+
+  /** True when some session has held unindexed content past the deadline. */
+  private hasStaleSessionContent(now: number = Date.now()): boolean {
+    for (const [sessionFile, state] of this.sessionDeltas) {
+      if (state.pendingBytes <= 0 || state.pendingSince === undefined) {
+        continue;
+      }
+      if (now - state.pendingSince >= SESSION_MAX_PENDING_MS) {
+        this.sessionsDirtyFiles.add(sessionFile);
+        this.sessionsDirty = true;
+        state.pendingBytes = 0;
+        state.pendingMessages = 0;
+        state.pendingSince = undefined;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async syncMemoryFiles(params: {
+    needsFullReindex: boolean;
+    progress?: MemorySyncProgressState;
+  }) {
+    const files = await listMemoryFiles(this.workspaceDir, this.settings.extraPaths);
+    // Token-efficiency pass (2026-09-19): memorySearch.excludePaths (default:
+    // dream journal + working-memory snapshots) never reach the index.
+    const excludePaths = this.settings.excludePaths ?? [];
+    const fileEntries = (
+      await Promise.all(files.map(async (file) => buildFileEntry(file, this.workspaceDir)))
+    ).filter((entry) => !isExcludedMemoryPath(entry.path, excludePaths));
+    log.debug("memory sync: indexing memory files", {
+      files: fileEntries.length,
+      needsFullReindex: params.needsFullReindex,
+      batch: this.batch.enabled,
+      concurrency: this.getIndexConcurrency(),
+    });
+    const activePaths = new Set(fileEntries.map((entry) => entry.path));
+    if (params.progress) {
+      params.progress.total += fileEntries.length;
+      params.progress.report({
+        completed: params.progress.completed,
+        total: params.progress.total,
+        label: this.batch.enabled ? "Indexing memory files (batch)..." : "Indexing memory files…",
+      });
+    }
+
+    const tasks = fileEntries.map((entry) => async () => {
+      const record = this.db
+        .prepare(`SELECT hash FROM files WHERE path = ? AND source = ?`)
+        .get(entry.path, "memory") as { hash: string } | undefined;
+      if (!params.needsFullReindex && record?.hash === entry.hash) {
+        if (params.progress) {
+          params.progress.completed += 1;
+          params.progress.report({
+            completed: params.progress.completed,
+            total: params.progress.total,
+          });
+        }
+        return;
+      }
+      await this.indexFile(entry, { source: "memory" });
+      if (params.progress) {
+        params.progress.completed += 1;
+        params.progress.report({
+          completed: params.progress.completed,
+          total: params.progress.total,
+        });
+      }
+    });
+    await runWithConcurrency(tasks, this.getIndexConcurrency());
+
+    const staleRows = this.db
+      .prepare(`SELECT path FROM files WHERE source = ?`)
+      .all("memory") as Array<{ path: string }>;
+    for (const stale of staleRows) {
+      if (activePaths.has(stale.path)) {
+        continue;
+      }
+      this.db.prepare(`DELETE FROM files WHERE path = ? AND source = ?`).run(stale.path, "memory");
+      try {
+        this.db
+          .prepare(
+            `DELETE FROM ${VECTOR_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ?)`,
+          )
+          .run(stale.path, "memory");
+      } catch {}
+      this.db.prepare(`DELETE FROM chunks WHERE path = ? AND source = ?`).run(stale.path, "memory");
+      if (this.fts.enabled && this.fts.available) {
+        try {
+          this.db
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
+            .run(stale.path, "memory", this.provider.model);
+        } catch {}
+      }
+    }
+  }
+
+  private async syncSessionFiles(params: {
+    needsFullReindex: boolean;
+    progress?: MemorySyncProgressState;
+  }) {
+    // PLAN-55 Phase 1: incognito. Transcripts stay on disk but are not
+    // indexed into memory while session.memory is "off".
+    if (!conversationMemoryEnabled(this.cfg.session)) {
+      log.debug("memory sync: session indexing skipped (session.memory is off)");
+      return;
+    }
+    const files = await listSessionFilesForAgent(this.agentId);
+    const activePaths = new Set(files.map((file) => sessionPathForFile(file)));
+    const indexAll = params.needsFullReindex || this.sessionsDirtyFiles.size === 0;
+    log.debug("memory sync: indexing session files", {
+      files: files.length,
+      indexAll,
+      dirtyFiles: this.sessionsDirtyFiles.size,
+      batch: this.batch.enabled,
+      concurrency: this.getIndexConcurrency(),
+    });
+    if (params.progress) {
+      params.progress.total += files.length;
+      params.progress.report({
+        completed: params.progress.completed,
+        total: params.progress.total,
+        label: this.batch.enabled ? "Indexing session files (batch)..." : "Indexing session files…",
+      });
+    }
+
+    const tasks = files.map((absPath) => async () => {
+      if (!indexAll && !this.sessionsDirtyFiles.has(absPath)) {
+        if (params.progress) {
+          params.progress.completed += 1;
+          params.progress.report({
+            completed: params.progress.completed,
+            total: params.progress.total,
+          });
+        }
+        return;
+      }
+      const entry = await buildSessionEntry(absPath);
+      if (!entry) {
+        if (params.progress) {
+          params.progress.completed += 1;
+          params.progress.report({
+            completed: params.progress.completed,
+            total: params.progress.total,
+          });
+        }
+        return;
+      }
+      const record = this.db
+        .prepare(`SELECT hash FROM files WHERE path = ? AND source = ?`)
+        .get(entry.path, "sessions") as { hash: string } | undefined;
+      if (!params.needsFullReindex && record?.hash === entry.hash) {
+        if (params.progress) {
+          params.progress.completed += 1;
+          params.progress.report({
+            completed: params.progress.completed,
+            total: params.progress.total,
+          });
+        }
+        this.resetSessionDelta(absPath, entry.size);
+        return;
+      }
+      await this.indexFile(entry, { source: "sessions", content: entry.content });
+      this.resetSessionDelta(absPath, entry.size);
+      if (params.progress) {
+        params.progress.completed += 1;
+        params.progress.report({
+          completed: params.progress.completed,
+          total: params.progress.total,
+        });
+      }
+    });
+    await runWithConcurrency(tasks, this.getIndexConcurrency());
+
+    const staleRows = this.db
+      .prepare(`SELECT path FROM files WHERE source = ?`)
+      .all("sessions") as Array<{ path: string }>;
+    for (const stale of staleRows) {
+      if (activePaths.has(stale.path)) {
+        continue;
+      }
+      this.db
+        .prepare(`DELETE FROM files WHERE path = ? AND source = ?`)
+        .run(stale.path, "sessions");
+      try {
+        this.db
+          .prepare(
+            `DELETE FROM ${VECTOR_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ?)`,
+          )
+          .run(stale.path, "sessions");
+      } catch {}
+      this.db
+        .prepare(`DELETE FROM chunks WHERE path = ? AND source = ?`)
+        .run(stale.path, "sessions");
+      if (this.fts.enabled && this.fts.available) {
+        try {
+          this.db
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
+            .run(stale.path, "sessions", this.provider.model);
+        } catch {}
+      }
+    }
+  }
+
+  private async syncSkillFiles(params: {
+    needsFullReindex: boolean;
+    progress?: MemorySyncProgressState;
+  }) {
+    const skillPaths = resolveWatchPaths(this.workspaceDir, this.cfg);
+    const skillFiles: string[] = [];
+    for (const skillRoot of skillPaths) {
+      try {
+        const entries = await fs.readdir(skillRoot, { withFileTypes: true });
+        // Check for SKILL.md directly in the root
+        const rootSkill = path.join(skillRoot, "SKILL.md");
+        try {
+          const stat = await fs.stat(rootSkill);
+          if (stat.isFile()) {
+            skillFiles.push(rootSkill);
+          }
+        } catch {}
+        // Check for <skillName>/SKILL.md subdirectories
+        for (const entry of entries) {
+          if (!entry.isDirectory()) {
+            continue;
+          }
+          const subSkill = path.join(skillRoot, entry.name, "SKILL.md");
+          try {
+            const stat = await fs.stat(subSkill);
+            if (stat.isFile()) {
+              skillFiles.push(subSkill);
+            }
+          } catch {}
+        }
+      } catch {
+        // Skill directory doesn't exist or isn't accessible — skip.
+      }
+    }
+
+    const fileEntries = await Promise.all(
+      skillFiles.map(async (file) => buildFileEntry(file, this.workspaceDir)),
+    );
+    log.debug("memory sync: indexing skill files", {
+      files: fileEntries.length,
+      needsFullReindex: params.needsFullReindex,
+      batch: this.batch.enabled,
+      concurrency: this.getIndexConcurrency(),
+    });
+    const activePaths = new Set(fileEntries.map((entry) => entry.path));
+    if (params.progress) {
+      params.progress.total += fileEntries.length;
+      params.progress.report({
+        completed: params.progress.completed,
+        total: params.progress.total,
+        label: this.batch.enabled ? "Indexing skill files (batch)..." : "Indexing skill files…",
+      });
+    }
+
+    const tasks = fileEntries.map((entry) => async () => {
+      const record = this.db
+        .prepare(`SELECT hash FROM files WHERE path = ? AND source = ?`)
+        .get(entry.path, "skills") as { hash: string } | undefined;
+      if (!params.needsFullReindex && record?.hash === entry.hash) {
+        if (params.progress) {
+          params.progress.completed += 1;
+          params.progress.report({
+            completed: params.progress.completed,
+            total: params.progress.total,
+          });
+        }
+        return;
+      }
+      await this.indexFile(entry, { source: "skills" });
+      if (params.progress) {
+        params.progress.completed += 1;
+        params.progress.report({
+          completed: params.progress.completed,
+          total: params.progress.total,
+        });
+      }
+    });
+    await runWithConcurrency(tasks, this.getIndexConcurrency());
+
+    // Remove stale skill entries (skills uninstalled/deleted)
+    const staleRows = this.db
+      .prepare(`SELECT path FROM files WHERE source = ?`)
+      .all("skills") as Array<{ path: string }>;
+    for (const stale of staleRows) {
+      if (activePaths.has(stale.path)) {
+        continue;
+      }
+      this.db.prepare(`DELETE FROM files WHERE path = ? AND source = ?`).run(stale.path, "skills");
+      try {
+        this.db
+          .prepare(
+            `DELETE FROM ${VECTOR_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ?)`,
+          )
+          .run(stale.path, "skills");
+      } catch {}
+      this.db.prepare(`DELETE FROM chunks WHERE path = ? AND source = ?`).run(stale.path, "skills");
+      if (this.fts.enabled && this.fts.available) {
+        try {
+          this.db
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
+            .run(stale.path, "skills", this.provider.model);
+        } catch {}
+      }
+    }
+  }
+
+  private createSyncProgress(
+    onProgress: (update: MemorySyncProgressUpdate) => void,
+  ): MemorySyncProgressState {
+    const state: MemorySyncProgressState = {
+      completed: 0,
+      total: 0,
+      label: undefined,
+      report: (update) => {
+        if (update.label) {
+          state.label = update.label;
+        }
+        const label =
+          update.total > 0 && state.label
+            ? `${state.label} ${update.completed}/${update.total}`
+            : state.label;
+        onProgress({
+          completed: update.completed,
+          total: update.total,
+          label,
+        });
+      },
+    };
+    return state;
+  }
+
+  private async runSync(params?: {
+    reason?: string;
+    force?: boolean;
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }) {
+    const progress = params?.progress ? this.createSyncProgress(params.progress) : undefined;
+    if (progress) {
+      progress.report({
+        completed: progress.completed,
+        total: progress.total,
+        label: "Loading vector extension…",
+      });
+    }
+    const vectorReady = await this.ensureVectorReady();
+    const meta = this.readMeta();
+    await this.ensureEmbeddingProfile(meta, { force: Boolean(params?.force) });
+    if (this.embeddingProfileHold) {
+      if (!this.embeddingHoldLogged) {
+        this.embeddingHoldLogged = true;
+        log.error(
+          `memory index on hold: the embedding profile changed under the same model (${this.embeddingProfileHold.conflicts.join("; ")}). ` +
+            `No new vectors are written and vector search is paused until you run \`bitterbot memory migrate-embeddings\`.`,
+        );
+      }
+      return;
+    }
+    const needsFullReindex =
+      params?.force ||
+      !meta ||
+      meta.model !== this.provider.model ||
+      meta.provider !== this.provider.id ||
+      meta.providerKey !== this.providerKey ||
+      meta.chunkTokens !== this.settings.chunking.tokens ||
+      meta.chunkOverlap !== this.settings.chunking.overlap ||
+      (vectorReady && !meta?.vectorDims);
+    try {
+      if (needsFullReindex) {
+        if (
+          process.env.BITTERBOT_TEST_FAST === "1" &&
+          process.env.BITTERBOT_TEST_MEMORY_UNSAFE_REINDEX === "1"
+        ) {
+          await this.runUnsafeReindex({
+            reason: params?.reason,
+            force: params?.force,
+            progress: progress ?? undefined,
+          });
+        } else {
+          await this.runSafeReindex({
+            reason: params?.reason,
+            force: params?.force,
+            progress: progress ?? undefined,
+          });
+        }
+        return;
+      }
+
+      const shouldSyncMemory =
+        this.sources.has("memory") && (params?.force || needsFullReindex || this.dirty);
+      const shouldSyncSessions = this.shouldSyncSessions(params, needsFullReindex);
+      const shouldSyncSkills =
+        this.sources.has("skills") && (params?.force || needsFullReindex || this.skillsDirty);
+
+      if (shouldSyncMemory) {
+        await this.syncMemoryFiles({ needsFullReindex, progress: progress ?? undefined });
+        this.dirty = false;
+      }
+
+      if (shouldSyncSessions) {
+        await this.syncSessionFiles({ needsFullReindex, progress: progress ?? undefined });
+        this.sessionsDirty = false;
+        this.sessionsDirtyFiles.clear();
+        this.sessionInitialSyncDone = true;
+      } else if (this.sessionsDirtyFiles.size > 0) {
+        this.sessionsDirty = true;
+      } else {
+        this.sessionsDirty = false;
+      }
+
+      if (shouldSyncSkills) {
+        await this.syncSkillFiles({ needsFullReindex, progress: progress ?? undefined });
+        this.cleanupOrphanedSkillChunks();
+        this.skillsDirty = false;
+      }
+      // Re-embed any crystals inserted with placeholder embeddings (extracted
+      // facts, scratch notes, handover briefs, peer imports). Bounded per cycle
+      // and a no-op when the backlog is clear; never let it break a sync.
+      try {
+        await this.backfillPendingEmbeddings();
+      } catch (err) {
+        log.warn(`memory sync: pending-embedding backfill failed: ${String(err)}`);
+      }
+      this.lastSyncedAt = Date.now();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const activated =
+        this.shouldFallbackOnError(reason) && (await this.activateFallbackProvider(reason));
+      if (activated) {
+        await this.runSafeReindex({
+          reason: params?.reason ?? "fallback",
+          force: true,
+          progress: progress ?? undefined,
+        });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  private shouldFallbackOnError(message: string): boolean {
+    return /embedding|embeddings|batch/i.test(message);
+  }
+
+  private resolveBatchConfig(): {
+    enabled: boolean;
+    wait: boolean;
+    concurrency: number;
+    pollIntervalMs: number;
+    timeoutMs: number;
+  } {
+    const batch = this.settings.remote?.batch;
+    const enabled = Boolean(
+      batch?.enabled &&
+      ((this.openAi && this.provider.id === "openai") ||
+        (this.gemini && this.provider.id === "gemini") ||
+        (this.voyage && this.provider.id === "voyage")),
+    );
+    return {
+      enabled,
+      wait: batch?.wait ?? true,
+      concurrency: Math.max(1, batch?.concurrency ?? 2),
+      pollIntervalMs: batch?.pollIntervalMs ?? 2000,
+      timeoutMs: (batch?.timeoutMinutes ?? 60) * 60 * 1000,
+    };
+  }
+
+  private async activateFallbackProvider(reason: string): Promise<boolean> {
+    const fallback = this.settings.fallback;
+    if (!fallback || fallback === "none" || fallback === this.provider.id) {
+      return false;
+    }
+    if (this.fallbackFrom) {
+      return false;
+    }
+    const fallbackFrom = this.provider.id as "openai" | "gemini" | "local" | "voyage";
+
+    const fallbackModel =
+      fallback === "gemini"
+        ? DEFAULT_GEMINI_EMBEDDING_MODEL
+        : fallback === "openai"
+          ? DEFAULT_OPENAI_EMBEDDING_MODEL
+          : fallback === "voyage"
+            ? DEFAULT_VOYAGE_EMBEDDING_MODEL
+            : this.settings.model;
+
+    const fallbackResult = await createEmbeddingProvider({
+      config: this.cfg,
+      agentDir: resolveAgentDir(this.cfg, this.agentId),
+      agentId: this.agentId,
+      provider: fallback,
+      remote: this.settings.remote,
+      model: fallbackModel,
+      fallback: "none",
+      local: this.settings.local,
+    });
+
+    this.fallbackFrom = fallbackFrom;
+    this.fallbackReason = reason;
+    this.provider = fallbackResult.provider;
+    this.openAi = fallbackResult.openAi;
+    this.gemini = fallbackResult.gemini;
+    this.voyage = fallbackResult.voyage;
+    this.providerKey = this.computeProviderKey();
+    this.batch = this.resolveBatchConfig();
+    log.warn(`memory embeddings: switched to fallback provider (${fallback})`, { reason });
+    return true;
+  }
+
+  private async runSafeReindex(params: {
+    reason?: string;
+    force?: boolean;
+    progress?: MemorySyncProgressState;
+  }): Promise<void> {
+    const dbPath = resolveUserPath(this.settings.store.path);
+    const tempDbPath = `${dbPath}.tmp-${randomUUID()}`;
+    const tempDb = this.openDatabaseAtPath(tempDbPath);
+
+    const originalDb = this.db;
+    let originalDbClosed = false;
+    const originalState = {
+      ftsAvailable: this.fts.available,
+      ftsError: this.fts.loadError,
+      vectorAvailable: this.vector.available,
+      vectorLoadError: this.vector.loadError,
+      vectorDims: this.vector.dims,
+      vectorReady: this.vectorReady,
+    };
+
+    const restoreOriginalState = () => {
+      if (originalDbClosed) {
+        this.db = this.openDatabaseAtPath(dbPath);
+      } else {
+        this.db = originalDb;
+      }
+      this.fts.available = originalState.ftsAvailable;
+      this.fts.loadError = originalState.ftsError;
+      this.vector.available = originalDbClosed ? null : originalState.vectorAvailable;
+      this.vector.loadError = originalState.vectorLoadError;
+      this.vector.dims = originalState.vectorDims;
+      this.vectorReady = originalDbClosed ? null : originalState.vectorReady;
+    };
+
+    this.db = tempDb;
+    this.vectorReady = null;
+    this.vector.available = null;
+    this.vector.loadError = undefined;
+    this.vector.dims = undefined;
+    this.fts.available = false;
+    this.fts.loadError = undefined;
+    this.ensureSchema();
+
+    let nextMeta: MemoryIndexMeta | null = null;
+
+    try {
+      this.seedEmbeddingCache(originalDb);
+      const shouldSyncMemory = this.sources.has("memory");
+      const shouldSyncSessions = this.shouldSyncSessions(
+        { reason: params.reason, force: params.force },
+        true,
+      );
+      const shouldSyncSkills = this.sources.has("skills");
+
+      if (shouldSyncMemory) {
+        await this.syncMemoryFiles({ needsFullReindex: true, progress: params.progress });
+        this.dirty = false;
+      }
+
+      if (shouldSyncSessions) {
+        await this.syncSessionFiles({ needsFullReindex: true, progress: params.progress });
+        this.sessionsDirty = false;
+        this.sessionsDirtyFiles.clear();
+        this.sessionInitialSyncDone = true;
+      } else if (this.sessionsDirtyFiles.size > 0) {
+        this.sessionsDirty = true;
+      } else {
+        this.sessionsDirty = false;
+      }
+
+      if (shouldSyncSkills) {
+        await this.syncSkillFiles({ needsFullReindex: true, progress: params.progress });
+        this.skillsDirty = false;
+      }
+
+      // A full reindex rebuilds from FILES only, so every chunk no file
+      // produces — fact crystals, scratch notes, dream insights, hygiene merge
+      // summaries — was silently destroyed by an API-key rotation or a model
+      // change. Carry across whatever the rebuild did not reproduce.
+      try {
+        const { carryOverNonFileChunks } = await import("./reindex-carryover.js");
+        carryOverNonFileChunks({
+          from: originalDb,
+          to: this.db,
+          ftsTable: this.fts.enabled && this.fts.available ? FTS_TABLE : null,
+        });
+      } catch (err) {
+        log.warn(`reindex carry-over unavailable: ${String(err)}`);
+      }
+
+      // Everything else in this database is not index data at all: canonical
+      // facts, the knowledge graph, dream history, user preferences, Circles
+      // keys, payment consume-once ledgers. The rebuild starts from an empty
+      // database, so without this the swap below silently drops all of it
+      // (2026-09-30: a provider change left a 113-table database with 9
+      // populated tables). Deliberately NOT best-effort: if the copy fails
+      // the swap must not happen, and the catch below restores the original.
+      const { carryOverAuxiliaryTables } = await import("./reindex-carryover.js");
+      carryOverAuxiliaryTables({
+        to: this.db,
+        fromPath: dbPath,
+        rebuiltTables: ["files", "chunks", EMBEDDING_CACHE_TABLE],
+        rebuiltVirtualTables: [FTS_TABLE, VECTOR_TABLE],
+        indexMetaKey: META_KEY,
+      });
+
+      this.lastSyncedAt = Date.now();
+
+      nextMeta = {
+        model: this.provider.model,
+        provider: this.provider.id,
+        providerKey: this.providerKey,
+        chunkTokens: this.settings.chunking.tokens,
+        chunkOverlap: this.settings.chunking.overlap,
+      };
+      if (this.vector.available && this.vector.dims) {
+        nextMeta.vectorDims = this.vector.dims;
+      }
+      const rebuiltProfile = this.currentEmbeddingProfile();
+      if (rebuiltProfile) {
+        nextMeta.profile = rebuiltProfile;
+      }
+
+      this.writeMeta(nextMeta);
+      this.pruneEmbeddingCacheIfNeeded();
+
+      this.db.close();
+      originalDb.close();
+      originalDbClosed = true;
+
+      await this.swapIndexFiles(dbPath, tempDbPath);
+
+      this.db = this.openDatabaseAtPath(dbPath);
+      this.vectorReady = null;
+      this.vector.available = null;
+      this.vector.loadError = undefined;
+      this.ensureSchema();
+      this.vector.dims = nextMeta.vectorDims;
+      // Propagate the new DB handle to subsystems (dream engine, etc.)
+      this.onDbSwapped?.();
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {}
+      await this.removeIndexFiles(tempDbPath);
+      restoreOriginalState();
+      throw err;
+    }
+  }
+
+  private async runUnsafeReindex(params: {
+    reason?: string;
+    force?: boolean;
+    progress?: MemorySyncProgressState;
+  }): Promise<void> {
+    // Perf: for test runs, skip atomic temp-db swapping. The index is isolated
+    // under the per-test HOME anyway, and this cuts substantial fs+sqlite churn.
+    //
+    // This path wipes the SAME database it rebuilds into, so the non-file
+    // chunks have to be snapshotted BEFORE the reset or there is nothing left
+    // to carry across (see reindex-carryover.ts).
+    const { readChunkSnapshot, carryOverNonFileChunks } = await import("./reindex-carryover.js");
+    const snapshot = readChunkSnapshot(this.db);
+    this.resetIndex();
+
+    const shouldSyncMemory = this.sources.has("memory");
+    const shouldSyncSessions = this.shouldSyncSessions(
+      { reason: params.reason, force: params.force },
+      true,
+    );
+    const shouldSyncSkills = this.sources.has("skills");
+
+    if (shouldSyncMemory) {
+      await this.syncMemoryFiles({ needsFullReindex: true, progress: params.progress });
+      this.dirty = false;
+    }
+
+    if (shouldSyncSessions) {
+      await this.syncSessionFiles({ needsFullReindex: true, progress: params.progress });
+      this.sessionsDirty = false;
+      this.sessionsDirtyFiles.clear();
+      this.sessionInitialSyncDone = true;
+    } else if (this.sessionsDirtyFiles.size > 0) {
+      this.sessionsDirty = true;
+    } else {
+      this.sessionsDirty = false;
+    }
+
+    if (shouldSyncSkills) {
+      await this.syncSkillFiles({ needsFullReindex: true, progress: params.progress });
+      this.skillsDirty = false;
+    }
+
+    try {
+      carryOverNonFileChunks({
+        snapshot,
+        to: this.db,
+        ftsTable: this.fts.enabled && this.fts.available ? FTS_TABLE : null,
+      });
+    } catch (err) {
+      log.warn(`reindex carry-over failed: ${String(err)}`);
+    }
+
+    this.lastSyncedAt = Date.now();
+
+    const nextMeta: MemoryIndexMeta = {
+      model: this.provider.model,
+      provider: this.provider.id,
+      providerKey: this.providerKey,
+      chunkTokens: this.settings.chunking.tokens,
+      chunkOverlap: this.settings.chunking.overlap,
+    };
+    if (this.vector.available && this.vector.dims) {
+      nextMeta.vectorDims = this.vector.dims;
+    }
+    const syncedProfile = this.currentEmbeddingProfile();
+    if (syncedProfile) {
+      nextMeta.profile = syncedProfile;
+    }
+
+    this.writeMeta(nextMeta);
+    this.pruneEmbeddingCacheIfNeeded();
+  }
+
+  private resetIndex() {
+    this.db.exec(`DELETE FROM files`);
+    this.db.exec(`DELETE FROM chunks`);
+    if (this.fts.enabled && this.fts.available) {
+      try {
+        this.db.exec(`DELETE FROM ${FTS_TABLE}`);
+      } catch {}
+    }
+    this.dropVectorTable();
+    this.vector.dims = undefined;
+    this.sessionsDirtyFiles.clear();
+  }
+
+  /**
+   * PLAN-57 §4.6. Resolve the live embedding profile once (the digest may
+   * hash a GGUF or ask Ollama) and compare it with the one on the index.
+   * A provider or model change keeps its existing automatic safe reindex;
+   * a change under the same model (digest, dimensions, processing, chunker)
+   * puts the index on hold until an explicit migration.
+   */
+  private async ensureEmbeddingProfile(
+    meta: MemoryIndexMeta | null,
+    opts?: { force?: boolean },
+  ): Promise<void> {
+    if (!this.embeddingProfile) {
+      const override = this.cfg.compute?.embeddings?.modelDigest?.trim();
+      let resolved: { digest: string; fingerprint?: string } | undefined = override
+        ? { digest: override }
+        : undefined;
+      if (!resolved && typeof this.provider.resolveDigest === "function") {
+        try {
+          resolved = await this.withTimeout(
+            this.provider.resolveDigest({
+              fingerprint: meta?.profile?.digestFingerprint,
+              digest: meta?.profile?.modelDigest,
+            }),
+            PROFILE_DIGEST_TIMEOUT_MS,
+            "embedding model digest resolution timed out",
+          );
+        } catch (err) {
+          log.warn(`embedding model digest unavailable: ${String(err)}`);
+        }
+      }
+      this.embeddingProfile = buildEmbeddingProfile({
+        provider: this.provider.id,
+        model: this.provider.model,
+        chunking: this.settings.chunking,
+        modelDigest: resolved?.digest,
+        digestFingerprint: resolved?.fingerprint,
+      });
+    }
+    if (opts?.force) {
+      // A forced sync (migration, or `memory index --force`) is the owner
+      // choosing to rebuild under the live profile; it is not a silent switch.
+      this.embeddingProfileHold = null;
+      return;
+    }
+    const current = this.currentEmbeddingProfile();
+    const cmp = compareEmbeddingProfiles(meta?.profile, current!);
+    if (!cmp.same && cmp.kind === "parity" && meta?.profile) {
+      if (!this.embeddingProfileHold) {
+        this.embeddingHoldLogged = false;
+      }
+      this.embeddingProfileHold = { conflicts: cmp.conflicts, stored: meta.profile };
+    } else {
+      this.embeddingProfileHold = null;
+    }
+  }
+
+  /** The live profile with the dimensions the vector table knows, or null before the first sync. */
+  currentEmbeddingProfile(): EmbeddingProfile | null {
+    if (!this.embeddingProfile) {
+      return null;
+    }
+    const dims = this.vector?.dims;
+    return dims && dims > 0
+      ? { ...this.embeddingProfile, dimensions: dims }
+      : this.embeddingProfile;
+  }
+
+  /** What `memory migrate-embeddings` shows before it rebuilds. */
+  embeddingMigrationPlan(): {
+    hold: { conflicts: string[]; stored: EmbeddingProfile } | null;
+    current: EmbeddingProfile | null;
+  } {
+    return { hold: this.embeddingProfileHold, current: this.currentEmbeddingProfile() };
+  }
+
+  /**
+   * Rebuild the index under the live profile: a new database, re-embedding
+   * on the normal path, carry-over of everything that is not a vector, then
+   * the swap. The old index serves until the swap. Clears the hold.
+   */
+  async migrateEmbeddingProfile(params?: {
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void> {
+    this.embeddingProfileHold = null;
+    this.embeddingHoldLogged = false;
+    await this.sync({
+      reason: "embedding-profile-migration",
+      force: true,
+      progress: params?.progress,
+    });
+  }
+
+  private readMeta(): MemoryIndexMeta | null {
+    const row = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(META_KEY) as
+      | { value: string }
+      | undefined;
+    if (!row?.value) {
+      return null;
+    }
+    try {
+      return JSON.parse(row.value) as MemoryIndexMeta;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeMeta(meta: MemoryIndexMeta) {
+    const value = JSON.stringify(meta);
+    this.db
+      .prepare(
+        `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      )
+      .run(META_KEY, value);
+  }
+}
+
+export const memoryManagerSyncOps = MemoryManagerSyncOps.prototype;
+
+/**
+ * Owner-only perms on the memory database (security pass M6). It holds every
+ * memory chunk plus the circles sender keys and roster, yet landed at the
+ * process umask (typically 0644) while `identity/box.json` was 0600. Chmod
+ * the main file BEFORE journal_mode=WAL creates -wal/-shm (SQLite gives those
+ * the main file's mode) and fix any that already exist. Best-effort; POSIX
+ * modes mean nothing on Windows, where the per-user profile ACL applies.
+ */
+export function restrictDbFilePermissions(dbPath: string): void {
+  if (process.platform === "win32" || dbPath === ":memory:") {
+    return;
+  }
+  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      fsSync.chmodSync(file, 0o600);
+    } catch {
+      // absent sidecar or a read-only mount: nothing to tighten
+    }
+  }
+}

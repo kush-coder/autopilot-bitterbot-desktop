@@ -1,0 +1,75 @@
+import { Bot } from "lucide-react";
+import { useState } from "react";
+import { formatCost } from "../../lib/format";
+import { useCirclesStore, type PendingOutbound } from "../../stores/circles-store";
+
+// PLAN-36 §5.3: THE approval card — the only path by which an agent tool write
+// (send / ask / log_expense) reaches the circle. The server holds the exact
+// params it will execute; this card shows the preview and the human decides.
+// No approval → it expires in 60 minutes and nothing ever left the node.
+
+function describe(p: PendingOutbound): string {
+  const v = p.preview;
+  switch (p.action) {
+    case "send":
+      return `send: “${String(v.text ?? "")}”`;
+    case "ask":
+      return `ask your people (${String(v.category ?? "general")}): “${String(v.question ?? "")}”`;
+    case "log_expense": {
+      // splitAmong is the NAMED participant list — the human must see exactly
+      // who is on the split, not a count that could hide a crafted list.
+      const who = Array.isArray(v.splitAmong)
+        ? (v.splitAmong as unknown[]).filter((x): x is string => typeof x === "string").join(", ")
+        : String(v.splitAmong ?? "?");
+      // formatCost: the approval preview and the resulting Shared-tab balance
+      // must render the same amount identically (8254135 review cleanup).
+      return `log ${formatCost(Number(v.amount ?? 0))} “${String(v.memo ?? "")}” split among: ${who}`;
+    }
+    default:
+      return p.action;
+  }
+}
+
+export function PendingOutboundCard({ pending }: { pending: PendingOutbound }) {
+  const approveOutbound = useCirclesStore((s) => s.approveOutbound);
+  const rejectOutbound = useCirclesStore((s) => s.rejectOutbound);
+  const [busy, setBusy] = useState(false);
+
+  const act = async (fn: () => Promise<boolean>) => {
+    if (busy) return;
+    setBusy(true);
+    await fn();
+    setBusy(false);
+  };
+
+  const mins = Math.max(0, Math.round((pending.expiresAt - Date.now()) / 60_000));
+
+  return (
+    <div className="mx-3 mb-1 rounded-lg border border-circle-consent/50 bg-circle-consent-soft/60 p-2.5 space-y-1.5">
+      <div className="flex items-center gap-1.5 text-xs">
+        <Bot className="w-3.5 h-3.5 text-circle-consent shrink-0" />
+        <span className="font-medium">Your agent wants to {pending.action.replace("_", " ")}</span>
+        <span className="ml-auto text-muted-foreground shrink-0">expires in {mins}m</span>
+      </div>
+      <div className="text-sm whitespace-pre-wrap break-words">{describe(pending)}</div>
+      <div className="flex items-center gap-2 justify-end">
+        <button
+          type="button"
+          onClick={() => void act(() => rejectOutbound(pending.circleId, pending.id))}
+          disabled={busy}
+          className="text-xs text-muted-foreground px-2 py-1"
+        >
+          Reject
+        </button>
+        <button
+          type="button"
+          onClick={() => void act(() => approveOutbound(pending.circleId, pending.id))}
+          disabled={busy}
+          className="text-xs font-medium px-3 py-1 rounded bg-circle-consent text-circle-consent-fg disabled:opacity-50"
+        >
+          Approve &amp; send
+        </button>
+      </div>
+    </div>
+  );
+}

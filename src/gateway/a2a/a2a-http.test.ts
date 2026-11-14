@@ -1,0 +1,757 @@
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Socket } from "node:net";
+import { DatabaseSync } from "node:sqlite";
+import { beforeEach, describe, expect, it } from "vitest";
+import { circleInboundKind, createA2aHttpHandler } from "./a2a-http.js";
+import { DEFAULT_MAX_TASKS_PER_MINUTE, resetTaskRateLimit } from "./task-rate-limit.js";
+
+// The task-spawn limiter is module-global; clear it so message/send tests in
+// other blocks don't accumulate into one client's window.
+beforeEach(() => resetTaskRateLimit());
+
+function mockReq(opts: {
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  body?: unknown;
+  remoteAddr?: string;
+}): IncomingMessage {
+  const sock = new Socket();
+  Object.defineProperty(sock, "remoteAddress", {
+    value: opts.remoteAddr ?? "127.0.0.1",
+    writable: true,
+  });
+  const req = new IncomingMessage(sock);
+  req.method = opts.method ?? "POST";
+  req.url = opts.url ?? "/a2a";
+  req.headers = { "content-type": "application/json", ...opts.headers };
+  if (opts.body !== undefined) {
+    const buf = Buffer.from(typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body));
+    req.push(buf);
+    req.push(null);
+    req.headers["content-length"] = String(buf.byteLength);
+  } else {
+    req.push(null);
+  }
+  return req;
+}
+
+function mockRes(): ServerResponse & { _body?: string; _headers: Record<string, string> } {
+  const sock = new Socket();
+  const res = new ServerResponse(new IncomingMessage(sock)) as ServerResponse & {
+    _body?: string;
+    _headers: Record<string, string>;
+  };
+  res._headers = {};
+  const origSetHeader = res.setHeader.bind(res);
+  res.setHeader = ((name: string, value: string | number | readonly string[]) => {
+    res._headers[name.toLowerCase()] = String(value);
+    return origSetHeader(name, value as string);
+  }) as typeof res.setHeader;
+  let buf = "";
+  res.write = ((chunk: string | Uint8Array) => {
+    buf += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8");
+    return true;
+  }) as typeof res.write;
+  res.end = ((chunk?: string | Uint8Array) => {
+    if (chunk) {
+      buf += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8");
+    }
+    res._body = buf;
+    return res;
+  }) as typeof res.end;
+  return res;
+}
+
+const baseConfig = () =>
+  ({
+    a2a: { enabled: true, authentication: { type: "none" as const } },
+  }) as never;
+
+const baseAuthOpts = () => ({
+  auth: {} as never,
+  trustedProxies: [],
+  rateLimiter: undefined,
+});
+
+function makeHandler() {
+  return createA2aHttpHandler({
+    getConfig: baseConfig,
+    getSkills: () => [],
+    getGatewayUrl: () => "http://127.0.0.1:19001",
+    getSkillsVersion: () => 0,
+    taskDb: new DatabaseSync(":memory:"),
+  });
+}
+
+describe("createA2aHttpHandler", () => {
+  it("serves the agent card at /.well-known/agent.json without auth", async () => {
+    const h = makeHandler();
+    const req = mockReq({ method: "GET", url: "/.well-known/agent.json" });
+    const res = mockRes();
+    const handled = await h.handle(req, res, baseAuthOpts());
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const card = JSON.parse(res._body ?? "{}");
+    expect(card.url).toBe("http://127.0.0.1:19001/a2a");
+    h.close();
+  });
+
+  it("returns 405 when /a2a is hit with non-POST", async () => {
+    const h = makeHandler();
+    const req = mockReq({ method: "GET", url: "/a2a" });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(405);
+    expect(res._headers.allow).toBe("POST");
+    h.close();
+  });
+
+  it("returns false (not handled) for paths that aren't A2A", async () => {
+    const h = makeHandler();
+    const req = mockReq({ method: "POST", url: "/something-else" });
+    const res = mockRes();
+    const handled = await h.handle(req, res, baseAuthOpts());
+    expect(handled).toBe(false);
+    h.close();
+  });
+
+  it("accepts a JSON-RPC request and returns a working task", async () => {
+    const h = makeHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "hi" }] } },
+        id: "abc",
+      },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res._body ?? "{}");
+    expect(body.id).toBe("abc");
+    expect(body.result.status.state).toBe("working");
+    h.close();
+  });
+
+  it("treats a JSON-RPC notification (no id) as fire-and-forget with 204", async () => {
+    const h = makeHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "notification/probe",
+        // intentionally no id
+      },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(204);
+    expect(res._body).toBe("");
+    h.close();
+  });
+
+  it("accepts numeric id 0 as a valid request id (regression for !id falsy bug)", async () => {
+    const h = makeHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "hi" }] } },
+        id: 0,
+      },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res._body ?? "{}");
+    expect(body.id).toBe(0);
+    h.close();
+  });
+
+  it("handler.close() releases its DB handle without throwing on subsequent calls", () => {
+    const h = makeHandler();
+    h.close();
+    expect(() => h.close()).not.toThrow();
+  });
+});
+
+describe("createA2aHttpHandler — auth", () => {
+  it("rejects non-loopback request with no token (401-equivalent)", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://example.com:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "x" }] } },
+        id: "1",
+      },
+      remoteAddr: "8.8.8.8",
+      headers: { "x-forwarded-for": "" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(401);
+    h.close();
+  });
+
+  it("accepts non-loopback request with the configured bearer token", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://example.com:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "x" }] } },
+        id: "1",
+      },
+      remoteAddr: "8.8.8.8",
+      headers: { authorization: "Bearer secret" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(200);
+    h.close();
+  });
+
+  // p0-9 regression: the waiver used to be isPrivateOrLoopbackAddress, which
+  // granted tokenless agent execution to ANY RFC1918/CGNAT source the moment
+  // the gateway was bound beyond loopback (docker-compose defaults bind=lan).
+  // Only loopback-direct requests may skip the token now.
+  it("rejects an RFC1918 LAN source without a token (p0-9)", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://example.com:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "x" }] } },
+        id: "1",
+      },
+      remoteAddr: "192.168.1.10",
+      headers: { host: "192.168.1.5:19001" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(401);
+    h.close();
+  });
+
+  it("rejects a CGNAT/tailnet source without a token (p0-9)", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://example.com:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "x" }] } },
+        id: "1",
+      },
+      remoteAddr: "100.64.0.5",
+      headers: { host: "100.64.0.9:19001" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(401);
+    h.close();
+  });
+
+  it("still waives the token for loopback-direct requests with a local Host", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://127.0.0.1:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "x" }] } },
+        id: "1",
+      },
+      remoteAddr: "127.0.0.1",
+      headers: { host: "127.0.0.1:19001" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(200);
+    h.close();
+  });
+
+  // PLAN-29: forage/* verbs are exempt from bearer auth BY DESIGN — hunters
+  // are anonymous peers gated on funding/caps/scanning, not identity. An
+  // unauthenticated remote call must get past auth and reach the forage
+  // dispatcher (503 bounty-directory-unavailable in this harness, since no
+  // memory manager exists — the point is it is NOT a 401).
+  it("serves forage/* verbs to unauthenticated non-loopback callers", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://example.com:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "forage/claim",
+        params: { bountyId: "nope", hunterPubkey: "pk", hunterWallet: "0x1" },
+        id: "1",
+      },
+      remoteAddr: "8.8.8.8",
+      headers: { "x-forwarded-for": "" },
+    });
+    const res = mockRes();
+    const handled = await h.handle(req, res, baseAuthOpts());
+    expect(handled).toBe(true);
+    expect(res.statusCode).not.toBe(401);
+    h.close();
+  });
+
+  it("still rejects non-forage verbs without a token after the forage exemption", async () => {
+    const h = createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://example.com:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: { jsonrpc: "2.0", method: "tasks/get", params: { id: "t1" }, id: "1" },
+      remoteAddr: "8.8.8.8",
+      headers: { "x-forwarded-for": "" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(401);
+    h.close();
+  });
+});
+
+describe("createA2aHttpHandler — browser Origin gate", () => {
+  function makeBearerHandler() {
+    return createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "bearer", bearerToken: "secret" },
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://127.0.0.1:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+  }
+  const sendBody = {
+    jsonrpc: "2.0",
+    method: "message/send",
+    params: { message: { role: "user", parts: [{ type: "text", text: "x" }] } },
+    id: "1",
+  };
+
+  it("403s a cross-site Origin even when the bearer token is valid", async () => {
+    const h = makeBearerHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: sendBody,
+      remoteAddr: "8.8.8.8",
+      headers: {
+        authorization: "Bearer secret",
+        host: "example.com:19001",
+        origin: "https://evil.example",
+      },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(403);
+    h.close();
+  });
+
+  it("403s a cross-site Origin on the token-exempt forage/* verbs (CSRF shield)", async () => {
+    const h = makeBearerHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: { jsonrpc: "2.0", method: "forage/claim", params: {}, id: "1" },
+      remoteAddr: "127.0.0.1",
+      headers: { host: "127.0.0.1:19001", origin: "https://evil.example" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(403);
+    h.close();
+  });
+
+  it("allows a same-host Origin (the served Control UI calling its own gateway)", async () => {
+    const h = makeBearerHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: sendBody,
+      remoteAddr: "127.0.0.1",
+      headers: { host: "127.0.0.1:19001", origin: "http://127.0.0.1:19001" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(200);
+    h.close();
+  });
+
+  it("allows Origin-less requests (CLI agents, daemons, curl)", async () => {
+    const h = makeBearerHandler();
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: sendBody,
+      remoteAddr: "8.8.8.8",
+      headers: { authorization: "Bearer secret", host: "example.com:19001" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).toBe(200);
+    h.close();
+  });
+});
+
+describe("createA2aHttpHandler — a2a/circles decoupling (adjudicated D-D)", () => {
+  function makeHandler2(cfg: unknown) {
+    return createA2aHttpHandler({
+      getConfig: () => cfg as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://127.0.0.1:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+  }
+  const post = (method: string, id: string | null = "1") =>
+    mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: { jsonrpc: "2.0", method, params: {}, ...(id === null ? {} : { id }) },
+      remoteAddr: "127.0.0.1",
+      headers: { host: "127.0.0.1:19001" },
+    });
+
+  it("serves circle/* while circles is enabled even with a2a disabled (HTTP fallback transport)", async () => {
+    const h = makeHandler2({ a2a: { enabled: false }, circles: { enabled: true } });
+    const res = mockRes();
+    const handled = await h.handle(post("circle/message"), res, baseAuthOpts());
+    expect(handled).toBe(true);
+    // 503 circles-unavailable in this harness (no memory manager) — the
+    // point is it reached the circle dispatcher instead of vanishing.
+    expect(res.statusCode).not.toBe(404);
+    h.close();
+  });
+
+  it("answers METHOD_NOT_FOUND for the agent-native surface when a2a is disabled", async () => {
+    const h = makeHandler2({ a2a: { enabled: false }, circles: { enabled: true } });
+    const res = mockRes();
+    await h.handle(post("message/send"), res, baseAuthOpts());
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res._body ?? "{}").error?.code).toBe(-32601);
+    h.close();
+  });
+
+  it("keeps forage/* off with a2a disabled", async () => {
+    const h = makeHandler2({ a2a: { enabled: false }, circles: { enabled: true } });
+    const res = mockRes();
+    await h.handle(post("forage/claim"), res, baseAuthOpts());
+    expect(res.statusCode).toBe(404);
+    h.close();
+  });
+
+  it("hides the agent card when a2a is disabled even with circles on", async () => {
+    const h = makeHandler2({ a2a: { enabled: false }, circles: { enabled: true } });
+    const res = mockRes();
+    const handled = await h.handle(
+      mockReq({ method: "GET", url: "/.well-known/agent.json" }),
+      res,
+      baseAuthOpts(),
+    );
+    expect(handled).toBe(false);
+    h.close();
+  });
+
+  it("stays fully invisible when both a2a and circles are disabled", async () => {
+    const h = makeHandler2({ a2a: { enabled: false }, circles: { enabled: false } });
+    const res = mockRes();
+    const handled = await h.handle(post("circle/message"), res, baseAuthOpts());
+    expect(handled).toBe(false);
+    h.close();
+  });
+
+  it("204-discards notifications to the disabled agent-native surface", async () => {
+    const h = makeHandler2({ a2a: { enabled: false }, circles: { enabled: true } });
+    const res = mockRes();
+    await h.handle(post("message/send", null), res, baseAuthOpts());
+    expect(res.statusCode).toBe(204);
+    h.close();
+  });
+});
+
+describe("circleInboundKind — the circles UI-event whitelist", () => {
+  it("covers the content verbs AND the shared-state ledger", () => {
+    expect(circleInboundKind("circle/message")).toBe("message");
+    expect(circleInboundKind("circle/ask")).toBe("ask");
+    expect(circleInboundKind("circle/answer")).toBe("answer");
+    // 8254135 review G1: expenses, canvas cards, reactions, pins, and
+    // sandbox moves ALL ride event.append — dropping it from this whitelist
+    // is exactly how those panes went silently stale on the direct-dial path.
+    expect(circleInboundKind("circle/event.append")).toBe("event");
+  });
+
+  it("stays silent for non-content verbs", () => {
+    for (const method of [
+      "circle/join",
+      "circle/roster",
+      "circle/presence",
+      "circle/events.since",
+      "mailbox/post",
+      "not-a-circle-verb",
+    ]) {
+      expect(circleInboundKind(method), method).toBeUndefined();
+    }
+  });
+});
+
+describe("createA2aHttpHandler — circle/mailbox kill switch (PLAN-31 §8)", () => {
+  function handlerWith(circles?: Record<string, unknown>) {
+    return createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: { enabled: true, authentication: { type: "none" as const } },
+          ...(circles ? { circles } : {}),
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://127.0.0.1:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+  }
+
+  async function call(h: ReturnType<typeof createA2aHttpHandler>, method: string) {
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: { jsonrpc: "2.0", method, params: {}, id: "1" },
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    return { status: res.statusCode, body: JSON.parse(res._body ?? "{}") };
+  }
+
+  it("answers METHOD_NOT_FOUND for every circle/* verb when circles are disabled", async () => {
+    // Default config has no circles block: the surface must be INVISIBLE,
+    // indistinguishable from a node without the feature.
+    const h = handlerWith();
+    for (const method of [
+      "circle/join",
+      "circle/roster",
+      "circle/message",
+      "circle/event.append",
+    ]) {
+      const { status, body } = await call(h, method);
+      expect(status, method).toBe(404);
+      expect(body.error?.message).toBe("Method not found");
+    }
+    h.close();
+  });
+
+  it("answers METHOD_NOT_FOUND for mailbox/* unless BOTH circles.enabled and mailbox.serve are true", async () => {
+    // circles on, serve off: still invisible.
+    const h = handlerWith({ enabled: true, mailbox: { serve: false } });
+    const { status } = await call(h, "mailbox/post");
+    expect(status).toBe(404);
+    h.close();
+
+    // circles off entirely: invisible.
+    const h2 = handlerWith({ enabled: false, mailbox: { serve: true } });
+    const { status: s2 } = await call(h2, "mailbox/poll");
+    expect(s2).toBe(404);
+    h2.close();
+  });
+
+  it("explicit circles.enabled=false matches the missing-config shape exactly", async () => {
+    const off = handlerWith({ enabled: false });
+    const missing = handlerWith();
+    const a = await call(off, "circle/roster");
+    const b = await call(missing, "circle/roster");
+    expect(a.status).toBe(b.status);
+    expect(a.body.error).toEqual(b.body.error);
+    off.close();
+    missing.close();
+  });
+});
+
+describe("createA2aHttpHandler — task-spawn rate limit", () => {
+  function handlerWith(maxTasksPerMinute?: number) {
+    return createA2aHttpHandler({
+      getConfig: () =>
+        ({
+          a2a: {
+            enabled: true,
+            authentication: { type: "none" as const },
+            ...(maxTasksPerMinute !== undefined ? { maxTasksPerMinute } : {}),
+          },
+        }) as never,
+      getSkills: () => [],
+      getGatewayUrl: () => "http://127.0.0.1:19001",
+      getSkillsVersion: () => 0,
+      taskDb: new DatabaseSync(":memory:"),
+    });
+  }
+
+  function sendHi(h: ReturnType<typeof createA2aHttpHandler>, remoteAddr: string) {
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: {
+        jsonrpc: "2.0",
+        method: "message/send",
+        params: { message: { role: "user", parts: [{ type: "text", text: "hi" }] } },
+        id: "x",
+      },
+      remoteAddr,
+    });
+    const res = mockRes();
+    return h.handle(req, res, baseAuthOpts()).then(() => res);
+  }
+
+  it("429s a burst of message/send past the default ceiling", async () => {
+    const h = handlerWith();
+    // The default number of spawns are accepted.
+    for (let i = 0; i < DEFAULT_MAX_TASKS_PER_MINUTE; i++) {
+      const res = await sendHi(h, "8.8.8.8");
+      expect(res.statusCode).toBe(200);
+    }
+    // The next one is throttled, and no task is created for it.
+    const blocked = await sendHi(h, "8.8.8.8");
+    expect(blocked.statusCode).toBe(429);
+    expect(JSON.parse(blocked._body ?? "{}").error.message).toMatch(/too many/i);
+    h.close();
+  });
+
+  it("keys per client — a flooder does not throttle a different peer", async () => {
+    const h = handlerWith(2);
+    await sendHi(h, "1.1.1.1");
+    await sendHi(h, "1.1.1.1");
+    expect((await sendHi(h, "1.1.1.1")).statusCode).toBe(429);
+    // A different peer is unaffected.
+    expect((await sendHi(h, "2.2.2.2")).statusCode).toBe(200);
+    h.close();
+  });
+
+  it("does not rate-limit read verbs (tasks/get)", async () => {
+    const h = handlerWith(1);
+    // Exhaust the task-spawn budget for this client.
+    await sendHi(h, "9.9.9.9");
+    expect((await sendHi(h, "9.9.9.9")).statusCode).toBe(429);
+    // tasks/get from the same client still works (not a spawn verb).
+    const req = mockReq({
+      method: "POST",
+      url: "/a2a",
+      body: { jsonrpc: "2.0", method: "tasks/get", params: { id: "nope" }, id: "g" },
+      remoteAddr: "9.9.9.9",
+    });
+    const res = mockRes();
+    await h.handle(req, res, baseAuthOpts());
+    expect(res.statusCode).not.toBe(429);
+    h.close();
+  });
+
+  it("maxTasksPerMinute=0 disables the ceiling", async () => {
+    const h = handlerWith(0);
+    for (let i = 0; i < DEFAULT_MAX_TASKS_PER_MINUTE + 5; i++) {
+      expect((await sendHi(h, "3.3.3.3")).statusCode).toBe(200);
+    }
+    h.close();
+  });
+});

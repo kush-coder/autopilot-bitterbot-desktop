@@ -1,0 +1,238 @@
+import { useEffect } from "react";
+import { useIsManagementNode } from "../../hooks/useIsManagementNode";
+import { type P2pIngestStats, useP2pStore } from "../../stores/p2p-store";
+import { MeshPanel } from "../compute/MeshPanel";
+import { CensusBreakdown } from "./CensusBreakdown";
+import { ContributionCard } from "./ContributionCard";
+import { NetworkGrowthSparkline } from "./NetworkGrowthSparkline";
+import { P2pEnabledSwitch } from "./P2pEnabledSwitch";
+import { PeerMap } from "./PeerMap";
+
+export function P2pDashboard() {
+  const {
+    stats,
+    contributions,
+    connected,
+    loading,
+    error,
+    bootstrapCensus,
+    networkCensus,
+    ingest,
+    censusHistory,
+    fetchStats,
+    fetchContributions,
+    fetchBootstrapCensus,
+    fetchNetworkCensus,
+    fetchCensusHistory,
+  } = useP2pStore();
+
+  useEffect(() => {
+    fetchStats();
+    fetchContributions();
+    fetchBootstrapCensus();
+    fetchNetworkCensus();
+    // Server downsamples to one point per (source, hour); 2000 buckets spans
+    // the full ~30-day retained history across multiple bootnodes.
+    fetchCensusHistory({ limit: 2000 });
+    const interval = setInterval(() => {
+      fetchStats();
+      fetchContributions();
+      fetchBootstrapCensus();
+      fetchNetworkCensus();
+      // Server downsamples to one point per (source, hour); 2000 buckets spans
+      // the full ~30-day retained history across multiple bootnodes.
+      fetchCensusHistory({ limit: 2000 });
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, [
+    fetchStats,
+    fetchContributions,
+    fetchBootstrapCensus,
+    fetchNetworkCensus,
+    fetchCensusHistory,
+  ]);
+
+  // Pick the freshest census source for the breakdown panel: live
+  // gossipsub-pushed snapshot wins, fall back to the local HTTP polled
+  // bootstrapCensus when this node is itself a bootnode.
+  const breakdownSource = networkCensus?.snapshot ?? bootstrapCensus ?? null;
+
+  // Fleet-operator surfaces (census/growth panels + the lifetime/routing
+  // metrics row) show only where an operator is looking: a management node
+  // (management.health succeeds) or a node whose own orchestrator runs
+  // --bootnode-mode. Edge nodes — census enabled:false, or no census endpoint
+  // at all on older released binaries — get a clean per-node dashboard.
+  const isManagementNode = useIsManagementNode();
+  const isCensusNode = isManagementNode || bootstrapCensus?.enabled === true;
+
+  return (
+    <div className="flex flex-col gap-6 p-6 h-full overflow-y-auto">
+      <div className="flex items-center gap-3">
+        <h1 className="text-2xl font-bold">P2P Network</h1>
+        <span
+          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+            connected
+              ? "bg-success/15 text-success dark:bg-success/15 dark:text-success"
+              : "bg-danger/15 text-danger dark:bg-danger/15 dark:text-danger"
+          }`}
+        >
+          {connected ? "Connected" : "Disconnected"}
+        </span>
+        <P2pEnabledSwitch />
+      </div>
+
+      {error && (
+        <div className="rounded-xl border border-danger/20 bg-danger/5 backdrop-blur-sm p-4 text-sm text-danger">
+          {error}
+        </div>
+      )}
+
+      {/* Disconnected empty state */}
+      {!connected && !loading && !error && (
+        <div className="rounded-xl border border-border/20 bg-card/60 backdrop-blur-sm p-6 text-center space-y-2">
+          <p className="text-sm text-muted-foreground">The P2P orchestrator is not running.</p>
+          <p className="text-xs text-muted-foreground/60">
+            Turn on the P2P mesh switch above (p2p.enabled) and restart the gateway to connect to
+            the network.
+          </p>
+        </div>
+      )}
+
+      {loading && !stats && (
+        <div className="text-sm text-muted-foreground">Loading network stats...</div>
+      )}
+
+      <MeshPanel />
+      {/* Contribution Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <ContributionCard
+          title="Connected Peers"
+          value={stats?.connected_peers ?? 0}
+          icon="users"
+        />
+        <ContributionCard
+          title="Skills Published"
+          value={stats?.skills_published ?? 0}
+          icon="upload"
+        />
+        <ContributionCard
+          title="Skills Received"
+          value={
+            // After a gateway-only restart the gateway has seen nothing yet
+            // while the orchestrator (a separate process) still has its count.
+            ingest && ingest.messages > 0 ? ingest.distinctSkills : (stats?.skills_received ?? 0)
+          }
+          icon="download"
+          detail={describeIngest(ingest)}
+        />
+        <ContributionCard
+          title="Contribution Score"
+          value={contributions?.score?.toFixed(1) ?? "0.0"}
+          icon="trophy"
+        />
+      </div>
+
+      {/* Network-wide and lifetime metrics — census nodes only. */}
+      {isCensusNode && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <ContributionCard
+            title={
+              bootstrapCensus?.enabled ? "Network Peers (lifetime)" : "Peer IDs (this session)"
+            }
+            value={
+              bootstrapCensus?.enabled
+                ? bootstrapCensus.lifetime_unique_peers
+                : (stats?.lifetime_unique_peer_ids ?? 0)
+            }
+            icon="users"
+          />
+          <ContributionCard
+            title="Peak Concurrent Peers"
+            value={stats?.peak_concurrent_peers ?? 0}
+            icon="users"
+          />
+          <ContributionCard
+            title="Routing Table Size"
+            value={stats?.routing_table_size ?? 0}
+            icon="users"
+          />
+          <ContributionCard
+            title="NAT Status"
+            value={stats?.nat_status ?? "unknown"}
+            icon="users"
+          />
+        </div>
+      )}
+
+      {/* Network-wide breakdown + growth history — census nodes only
+          (gossipsub-pushed snapshot wins, falls back to the local census). */}
+      {isCensusNode && (
+        <>
+          <CensusBreakdown
+            byTier={breakdownSource?.by_tier ?? null}
+            byAddressType={breakdownSource?.by_address_type ?? null}
+            source={networkCensus?.source_peer_id ?? null}
+            generatedAt={breakdownSource?.generated_at ?? null}
+          />
+          <NetworkGrowthSparkline rows={censusHistory} />
+        </>
+      )}
+
+      {/* Uptime & Peer Info */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="rounded-xl border border-border/20 bg-card/60 backdrop-blur-sm p-4">
+          <h3 className="text-sm font-medium text-muted-foreground mb-2">Node Info</h3>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Peer ID</span>
+              <span className="font-mono text-xs truncate max-w-[300px]">
+                {stats?.peer_id ?? "\u2014"}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Uptime</span>
+              <span>{formatUptime(stats?.uptime_secs ?? 0)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Skills Published</span>
+              <span>{contributions?.skills_published ?? 0}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Peer Map */}
+        <PeerMap connectedPeers={stats?.connected_peers ?? 0} />
+      </div>
+    </div>
+  );
+}
+
+function formatUptime(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  const hours = Math.floor(secs / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  return `${hours}h ${mins}m`;
+}
+
+/**
+ * One line under "Skills Received": what this node decided about the skills
+ * it got, so a re-broadcasting peer can't pass as a busy network.
+ */
+export function describeIngest(ingest: P2pIngestStats | null): string | undefined {
+  if (!ingest || ingest.messages === 0) {
+    return undefined;
+  }
+  const parts = [
+    `${ingest.accepted} accepted`,
+    `${ingest.heldForReview} in review`,
+    `${ingest.rejected} rejected`,
+  ];
+  if (ingest.repeatsIgnored > 0) {
+    parts.push(`${ingest.repeatsIgnored} repeats ignored`);
+  }
+  if ((ingest.ownEchoesIgnored ?? 0) > 0) {
+    parts.push(`${ingest.ownEchoesIgnored} own echoes ignored`);
+  }
+  return parts.join(" · ");
+}

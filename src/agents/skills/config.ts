@@ -1,0 +1,153 @@
+import type { BitterbotConfig, SkillConfig } from "../../config/config.js";
+import {
+  hasBinary,
+  isConfigPathTruthyWithDefaults,
+  resolveConfigPath,
+  resolveRuntimePlatform,
+} from "../../shared/config-eval.js";
+import { resolveSkillKey } from "./frontmatter.js";
+import type { SkillEligibilityContext, SkillEntry } from "./types.js";
+
+const DEFAULT_CONFIG_VALUES: Record<string, boolean> = {
+  "browser.enabled": true,
+  "browser.evaluateEnabled": true,
+};
+
+export { hasBinary, resolveConfigPath, resolveRuntimePlatform };
+
+export function isConfigPathTruthy(config: BitterbotConfig | undefined, pathStr: string): boolean {
+  return isConfigPathTruthyWithDefaults(config, pathStr, DEFAULT_CONFIG_VALUES);
+}
+
+export function resolveSkillConfig(
+  config: BitterbotConfig | undefined,
+  skillKey: string,
+): SkillConfig | undefined {
+  const skills = config?.skills?.entries;
+  if (!skills || typeof skills !== "object") {
+    return undefined;
+  }
+  const entry = (skills as Record<string, SkillConfig | undefined>)[skillKey];
+  if (!entry || typeof entry !== "object") {
+    return undefined;
+  }
+  return entry;
+}
+
+function normalizeAllowlist(input: unknown): string[] | undefined {
+  if (!input) {
+    return undefined;
+  }
+  if (!Array.isArray(input)) {
+    return undefined;
+  }
+  const normalized = input.map((entry) => String(entry).trim()).filter(Boolean);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+const BUNDLED_SOURCES = new Set(["bitterbot-bundled"]);
+
+function isBundledSkill(entry: SkillEntry): boolean {
+  return BUNDLED_SOURCES.has(entry.skill.sourceInfo.source);
+}
+
+export function resolveBundledAllowlist(config?: BitterbotConfig): string[] | undefined {
+  return normalizeAllowlist(config?.skills?.allowBundled);
+}
+
+export function isBundledSkillAllowed(entry: SkillEntry, allowlist?: string[]): boolean {
+  if (!allowlist || allowlist.length === 0) {
+    return true;
+  }
+  if (!isBundledSkill(entry)) {
+    return true;
+  }
+  const key = resolveSkillKey(entry.skill, entry);
+  return allowlist.includes(key) || allowlist.includes(entry.skill.name);
+}
+
+export function shouldIncludeSkill(params: {
+  entry: SkillEntry;
+  config?: BitterbotConfig;
+  eligibility?: SkillEligibilityContext;
+  /**
+   * When true, ignore the user's `enabled: false` toggle while still applying
+   * physical/policy gates (OS, allowlist, missing requirements). Used to
+   * compute the "soft-disabled but otherwise eligible" tier surfaced to the
+   * agent as suggestable.
+   */
+  ignoreUserDisable?: boolean;
+}): boolean {
+  const { entry, config, eligibility, ignoreUserDisable } = params;
+  const skillKey = resolveSkillKey(entry.skill, entry);
+  const skillConfig = resolveSkillConfig(config, skillKey);
+  const allowBundled = normalizeAllowlist(config?.skills?.allowBundled);
+  const osList = entry.metadata?.os ?? [];
+  const remotePlatforms = eligibility?.remote?.platforms ?? [];
+
+  if (skillConfig?.enabled === false && !ignoreUserDisable) {
+    return false;
+  }
+  if (!isBundledSkillAllowed(entry, allowBundled)) {
+    return false;
+  }
+  if (
+    osList.length > 0 &&
+    !osList.includes(resolveRuntimePlatform()) &&
+    !remotePlatforms.some((platform) => osList.includes(platform))
+  ) {
+    return false;
+  }
+  if (entry.metadata?.always === true) {
+    return true;
+  }
+
+  const requiredBins = entry.metadata?.requires?.bins ?? [];
+  if (requiredBins.length > 0) {
+    for (const bin of requiredBins) {
+      if (hasBinary(bin)) {
+        continue;
+      }
+      if (eligibility?.remote?.hasBin?.(bin)) {
+        continue;
+      }
+      return false;
+    }
+  }
+  const requiredAnyBins = entry.metadata?.requires?.anyBins ?? [];
+  if (requiredAnyBins.length > 0) {
+    const anyFound =
+      requiredAnyBins.some((bin) => hasBinary(bin)) ||
+      eligibility?.remote?.hasAnyBin?.(requiredAnyBins);
+    if (!anyFound) {
+      return false;
+    }
+  }
+
+  const requiredEnv = entry.metadata?.requires?.env ?? [];
+  if (requiredEnv.length > 0) {
+    for (const envName of requiredEnv) {
+      if (process.env[envName]) {
+        continue;
+      }
+      if (skillConfig?.env?.[envName]) {
+        continue;
+      }
+      if (skillConfig?.apiKey && entry.metadata?.primaryEnv === envName) {
+        continue;
+      }
+      return false;
+    }
+  }
+
+  const requiredConfig = entry.metadata?.requires?.config ?? [];
+  if (requiredConfig.length > 0) {
+    for (const configPath of requiredConfig) {
+      if (!isConfigPathTruthy(config, configPath)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

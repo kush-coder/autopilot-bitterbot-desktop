@@ -1,0 +1,464 @@
+import { withSpan } from "../observability/otel.js";
+import { ErrorCodes, errorShape } from "./protocol/index.js";
+import { agentRuntimeHandlers } from "./server-methods/agent-runtime.js";
+import { agentHandlers } from "./server-methods/agent.js";
+import { agentsHandlers } from "./server-methods/agents.js";
+import { browserLiveHandlers } from "./server-methods/browser-live.js";
+import { browserReplayHandlers } from "./server-methods/browser-replay.js";
+import { browserTeachingHandlers } from "./server-methods/browser-teaching.js";
+import { browserHandlers } from "./server-methods/browser.js";
+import { channelsHandlers } from "./server-methods/channels.js";
+import { chatHandlers } from "./server-methods/chat.js";
+import { circlesHandlers } from "./server-methods/circles.js";
+import { computeMeshHandlers } from "./server-methods/compute-mesh.js";
+import { computeHandlers } from "./server-methods/compute.js";
+import { configHandlers } from "./server-methods/config.js";
+import { connectHandlers } from "./server-methods/connect.js";
+import { cronHandlers } from "./server-methods/cron.js";
+import { curiosityHandlers } from "./server-methods/curiosity.js";
+import { deviceHandlers } from "./server-methods/devices.js";
+import { doctorHandlers } from "./server-methods/doctor.js";
+import { dreamHandlers } from "./server-methods/dream.js";
+import { execApprovalsHandlers } from "./server-methods/exec-approvals.js";
+import { forageHandlers } from "./server-methods/forage.js";
+import { genomeHandlers } from "./server-methods/genome.js";
+import { guardsHandlers } from "./server-methods/guards.js";
+import { healthHandlers } from "./server-methods/health.js";
+import { logsHandlers } from "./server-methods/logs.js";
+import { managementHandlers } from "./server-methods/management.js";
+import { memoryHandlers } from "./server-methods/memory.js";
+import { modelsAuthHandlers } from "./server-methods/models-auth.js";
+import { modelsHandlers } from "./server-methods/models.js";
+import { monitorHandlers } from "./server-methods/monitors.js";
+import { nodeHandlers } from "./server-methods/nodes.js";
+import { projectsHandlers } from "./server-methods/projects.js";
+import { reviewHandlers } from "./server-methods/review.js";
+import { sendHandlers } from "./server-methods/send.js";
+import { sessionsHandlers } from "./server-methods/sessions.js";
+import { skillsHandlers } from "./server-methods/skills.js";
+import { spendGrantHandlers } from "./server-methods/spend-grants.js";
+import { systemHandlers } from "./server-methods/system.js";
+import { talkHandlers } from "./server-methods/talk.js";
+import { taskHandlers } from "./server-methods/tasks.js";
+import { toolOutputHandlers } from "./server-methods/tool-output.js";
+import { ttsHandlers } from "./server-methods/tts.js";
+import type { GatewayRequestHandlers, GatewayRequestOptions } from "./server-methods/types.js";
+import { updateHandlers } from "./server-methods/update.js";
+import { usageHandlers } from "./server-methods/usage.js";
+import { voicewakeHandlers } from "./server-methods/voicewake.js";
+import { walletHandlers } from "./server-methods/wallet.js";
+import { webHandlers } from "./server-methods/web.js";
+import { wizardHandlers } from "./server-methods/wizard.js";
+import { workspaceHandlers } from "./server-methods/workspace.js";
+import { isSetupOnlyScopes, SETUP_METHODS } from "./setup-token.js";
+
+const ADMIN_SCOPE = "operator.admin";
+const READ_SCOPE = "operator.read";
+const WRITE_SCOPE = "operator.write";
+const APPROVALS_SCOPE = "operator.approvals";
+const PAIRING_SCOPE = "operator.pairing";
+
+const APPROVAL_METHODS = new Set([
+  "exec.approval.request",
+  "exec.approval.waitDecision",
+  "exec.approval.resolve",
+  // PLAN-53 Track B: held spend / publish actions.
+  "review.list",
+  "review.get",
+  "review.resolve",
+  "review.spends",
+]);
+const NODE_ROLE_METHODS = new Set(["node.invoke.result", "node.event", "skills.bins"]);
+const PAIRING_METHODS = new Set([
+  "node.pair.request",
+  "node.pair.list",
+  "node.pair.approve",
+  "node.pair.reject",
+  "node.pair.verify",
+  "device.pair.list",
+  "device.pair.approve",
+  "device.pair.reject",
+  "device.token.rotate",
+  "device.token.revoke",
+  "node.rename",
+]);
+const ADMIN_METHOD_PREFIXES = ["exec.approvals.", "soapbox.setup."];
+const READ_METHODS = new Set([
+  "soapbox.wallet",
+  "soapbox.status",
+  "soapbox.jobs",
+  "soapbox.job",
+  "soapbox.artifact.get",
+  "health",
+  // PLAN-57: reading compute state; compute.approve, compute.pause and
+  // compute.trust stay admin-only.
+  "compute.status",
+  "compute.jobs",
+  "compute.quote",
+  "curiosity.status",
+  "genome.temperament.status",
+  "curiosity.list",
+  "doctor.findings",
+  "logs.tail",
+  "channels.status",
+  "status",
+  "usage.status",
+  "usage.cost",
+  "sessions.usage",
+  "sessions.usage.timeseries",
+  "sessions.usage.logs",
+  "usage.ledger.summary",
+  "usage.ledger.events",
+  "usage.ledger.whatif",
+  "usage.ledger.explain",
+  "tts.status",
+  "tts.providers",
+  "models.list",
+  "agents.list",
+  "agent.identity.get",
+  "agent.runtime.health",
+  "skills.status",
+  "skills.network",
+  "skills.networkHistory",
+  "voicewake.get",
+  "sessions.list",
+  "sessions.preview",
+  "system-presence",
+  "last-heartbeat",
+  "node.list",
+  "node.describe",
+  "chat.history",
+  "config.get",
+  "talk.config",
+  "projects.list",
+  "projects.get",
+  "projects.files.list",
+  "projects.context",
+  "workspace.tree",
+  "workspace.read",
+  "workspace.stat",
+  "workspace.search",
+  "wallet.getAddress",
+  "wallet.getBalance",
+  "wallet.getHistory",
+  "wallet.getConfig",
+  "wallet.listTopUps",
+  "wallet.fund",
+  "dream.status",
+  "dream.history",
+  "dream.insights",
+  "dream.emotional",
+  "dream.analytics",
+  "dream.journal",
+  "dream.marketplaceStatus",
+  "dream.utility",
+  "dream.utility.review",
+  "marketplace.search",
+  "marketplace.trending",
+  "marketplace.recommendations",
+  "marketplace.detail",
+  "marketplace.commerce",
+  "marketplace.bonds",
+  "marketplace.contributors",
+  "dream.curiosityReward",
+  "dream.suggestSkills",
+  "dream.trigger",
+  "memory.retrievalHealth",
+  "memory.list",
+  "memory.get",
+  "memory.preferences",
+  "memory.audit",
+  "memory.facts",
+  // PLAN-55 Phase 3: the cascade preview changes nothing.
+  "memory.forgetPreview",
+  "forage.tape",
+  "forage.stats",
+  "forage.post",
+  "circles.status",
+  "circles.list",
+  "circles.messages",
+  "circles.tab.balances",
+  "circles.disclosure.list",
+  "circles.briefing",
+  "circles.inviteInfo",
+  "circles.canvas.list",
+  "circles.outbound.list",
+  "circles.drafts.list",
+  "circles.study.state",
+  "circles.sandbox.state",
+  "management.census",
+  "management.anomalies",
+  "management.health",
+  "management.economics",
+  "management.censusHistory",
+  "cron.list",
+  "cron.status",
+  "cron.runs",
+  "monitors.list",
+  "tasks.list",
+  "guards.status",
+]);
+const WRITE_METHODS = new Set([
+  "soapbox.submit",
+  "soapbox.requote",
+  "soapbox.cancel",
+  "soapbox.artifact.put",
+  "send",
+  "curiosity.pause",
+  "curiosity.resume",
+  "curiosity.dismiss",
+  "curiosity.ask",
+  "curiosity.runNow",
+  "agent",
+  "agent.wait",
+  "wake",
+  "talk.mode",
+  // Each call spends speech provider credit.
+  "talk.transcribe",
+  "talk.speak",
+  "tts.enable",
+  "tts.disable",
+  "tts.convert",
+  "tts.setProvider",
+  "voicewake.set",
+  "node.invoke",
+  "chat.send",
+  "chat.abort",
+  "browser.request",
+  // The live view shows whatever the agent's browser shows, logged-in pages
+  // included, so it sits with browser.request, not with the read methods.
+  "browser.live.start",
+  "browser.live.stop",
+  "browser.live.control",
+  "browser.live.input",
+  "browser.replay.list",
+  "browser.replay.frames",
+  "browser.replay.frame",
+  "browser.replay.delete",
+  "projects.create",
+  "projects.update",
+  "projects.delete",
+  "projects.files.upload",
+  "projects.files.delete",
+  "workspace.write",
+  "dream.trigger",
+  "dream.utility.rate",
+  "marketplace.listForSale",
+  "marketplace.delist",
+  "marketplace.postBond",
+  "marketplace.contributorClearFlag",
+  "management.propagateBan",
+  "circles.create",
+  "circles.invite",
+  "circles.join",
+  "circles.send",
+  "circles.tab.add",
+  "circles.sync",
+  "circles.ask",
+  "circles.disclosure.set",
+  "circles.rename",
+  "circles.archive",
+  "circles.unarchive",
+  "circles.delete",
+  "circles.unfreeze",
+  "circles.self.setName",
+  "circles.petname.set",
+  "circles.petname.clear",
+  "circles.member.remove",
+  "circles.markRead",
+  "circles.react",
+  "circles.pin",
+  "circles.message.delete",
+  "circles.canvas.put",
+  "circles.canvas.remove",
+  "circles.canvas.clear",
+  "circles.canvas.slice",
+  "circles.outbound.approve",
+  "circles.outbound.reject",
+  "circles.drafts.request",
+  "circles.drafts.publish",
+  "circles.drafts.discard",
+  "circles.agentDrafts.set",
+  "circles.study.record",
+  "circles.sandbox.participation",
+  "circles.sandbox.steer",
+  "circles.sandbox.move",
+  "circles.sandbox.pause",
+  "circles.sandbox.resume",
+  "circles.sandbox.close",
+  "cron.add",
+  "cron.update",
+  "cron.remove",
+  "cron.run",
+  "monitors.add",
+  "monitors.update",
+  "monitors.remove",
+  "monitors.check",
+  "tasks.stop",
+]);
+
+/** Exported for tests: the scope gate every gateway RPC passes through. */
+export function authorizeGatewayMethod(method: string, client: GatewayRequestOptions["client"]) {
+  if (!client?.connect) {
+    return null;
+  }
+  const role = client.connect.role ?? "operator";
+  const scopes = client.connect.scopes ?? [];
+  if (NODE_ROLE_METHODS.has(method)) {
+    if (role === "node") {
+      return null;
+    }
+    return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${role}`);
+  }
+  if (role === "node") {
+    return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${role}`);
+  }
+  if (role !== "operator") {
+    return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${role}`);
+  }
+  // PLAN-56 Phase 4: a setup-token connection may drive the wizard and
+  // nothing else (src/gateway/setup-token.ts).
+  if (isSetupOnlyScopes(scopes)) {
+    return SETUP_METHODS.has(method)
+      ? null
+      : errorShape(ErrorCodes.INVALID_REQUEST, "setup token grants wizard access only");
+  }
+  if (scopes.includes(ADMIN_SCOPE)) {
+    return null;
+  }
+  if (APPROVAL_METHODS.has(method) && !scopes.includes(APPROVALS_SCOPE)) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.approvals");
+  }
+  if (PAIRING_METHODS.has(method) && !scopes.includes(PAIRING_SCOPE)) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.pairing");
+  }
+  if (READ_METHODS.has(method) && !(scopes.includes(READ_SCOPE) || scopes.includes(WRITE_SCOPE))) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.read");
+  }
+  if (WRITE_METHODS.has(method) && !scopes.includes(WRITE_SCOPE)) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.write");
+  }
+  if (APPROVAL_METHODS.has(method)) {
+    return null;
+  }
+  if (PAIRING_METHODS.has(method)) {
+    return null;
+  }
+  if (READ_METHODS.has(method)) {
+    return null;
+  }
+  if (WRITE_METHODS.has(method)) {
+    return null;
+  }
+  if (ADMIN_METHOD_PREFIXES.some((prefix) => method.startsWith(prefix))) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.admin");
+  }
+  if (
+    method.startsWith("config.") ||
+    method.startsWith("wizard.") ||
+    method.startsWith("update.") ||
+    method === "channels.logout" ||
+    method === "agents.create" ||
+    method === "agents.update" ||
+    method === "agents.delete" ||
+    method === "skills.install" ||
+    method === "skills.update" ||
+    method === "skills.create" ||
+    method === "guards.promote_candidate" ||
+    method === "guards.clear_strikes" ||
+    method === "sessions.patch" ||
+    method === "sessions.reset" ||
+    method === "sessions.delete" ||
+    method === "sessions.compact" ||
+    method === "wallet.setConfig"
+  ) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.admin");
+  }
+  return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.admin");
+}
+
+export const coreGatewayHandlers: GatewayRequestHandlers = {
+  ...computeMeshHandlers,
+  ...connectHandlers,
+  ...logsHandlers,
+  ...voicewakeHandlers,
+  ...healthHandlers,
+  ...channelsHandlers,
+  ...chatHandlers,
+  ...deviceHandlers,
+  ...execApprovalsHandlers,
+  ...guardsHandlers,
+  ...webHandlers,
+  ...modelsHandlers,
+  ...modelsAuthHandlers,
+  ...configHandlers,
+  ...doctorHandlers,
+  ...wizardHandlers,
+  ...talkHandlers,
+  ...ttsHandlers,
+  ...skillsHandlers,
+  ...sessionsHandlers,
+  ...systemHandlers,
+  ...updateHandlers,
+  ...nodeHandlers,
+  ...sendHandlers,
+  ...usageHandlers,
+  ...agentHandlers,
+  ...agentRuntimeHandlers,
+  ...agentsHandlers,
+  ...browserHandlers,
+  ...browserLiveHandlers,
+  ...browserTeachingHandlers,
+  ...browserReplayHandlers,
+  ...toolOutputHandlers,
+  ...reviewHandlers,
+  ...computeHandlers,
+  ...projectsHandlers,
+  ...walletHandlers,
+  ...workspaceHandlers,
+  ...dreamHandlers,
+  ...memoryHandlers,
+  ...curiosityHandlers,
+  ...genomeHandlers,
+  ...circlesHandlers,
+  ...forageHandlers,
+  ...spendGrantHandlers,
+  ...managementHandlers,
+  ...cronHandlers,
+  ...monitorHandlers,
+  ...taskHandlers,
+};
+
+export async function handleGatewayRequest(
+  opts: GatewayRequestOptions & { extraHandlers?: GatewayRequestHandlers },
+): Promise<void> {
+  const { req, respond, client, isWebchatConnect, context } = opts;
+  const authError = authorizeGatewayMethod(req.method, client);
+  if (authError) {
+    respond(false, undefined, authError);
+    return;
+  }
+  const handler = opts.extraHandlers?.[req.method] ?? coreGatewayHandlers[req.method];
+  if (!handler) {
+    respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.INVALID_REQUEST, `unknown method: ${req.method}`),
+    );
+    return;
+  }
+  await withSpan(
+    `gateway.rpc.${req.method}`,
+    async () => {
+      await handler({
+        req,
+        params: (req.params ?? {}) as Record<string, unknown>,
+        client,
+        isWebchatConnect,
+        respond,
+        context,
+      });
+    },
+    { "rpc.method": req.method, "rpc.system": "bitterbot-gateway" },
+  );
+}

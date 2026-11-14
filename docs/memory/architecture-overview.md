@@ -1,0 +1,716 @@
+# Memory System Architecture Overview
+
+The Bitterbot memory system is a self-organizing knowledge store that indexes user interactions into **Knowledge Crystals**, consolidates them through Ebbinghaus-inspired decay, generates insights via offline **Dream Cycles**, and propagates skills across a P2P swarm network with a two-tiered topology of **Management** and **Edge** nodes. It runs entirely inside the Node.js application using SQLite for storage and sqlite-vec for vector search.
+
+---
+
+## Why SQLite?
+
+The memory system stores everything — crystals, embeddings, dream insights, peer reputation, execution metrics — in a single SQLite database. This is deliberate:
+
+1. **Zero infrastructure** — No external database server to install, configure, or keep running. The memory system works on a laptop with `node index.js`.
+2. **Edge-native** — Each node carries its own brain. In a P2P swarm, every peer is fully self-contained. No shared Postgres cluster, no Pinecone account, no cloud dependency.
+3. **Transactional consistency** — Consolidation engine applies decay, merges, and lifecycle transitions in a single ACID transaction. No eventual-consistency bugs.
+4. **sqlite-vec** — The `sqlite-vec` extension provides real vector search (cosine similarity) inside SQLite, combined with FTS5 for BM25 keyword search. Hybrid retrieval with zero network hops.
+5. **Portability** — The entire memory is one `.sqlite` file. Back it up, move it between machines, or inspect it with any SQLite viewer.
+
+For deployments that need distributed vector search at scale, the embedding and retrieval layers are abstracted behind provider interfaces — but for the primary use case (a single bot's memory), SQLite is the optimal choice.
+
+---
+
+## Quick Start (Day 1 Guide)
+
+Get a working memory system in 3 steps:
+
+### 1. Create and Index a Crystal
+
+```typescript
+import { MemoryIndexManager } from "./memory/manager.js";
+
+// Returns null when memory search is not configured for the agent
+const manager = await MemoryIndexManager.get({
+  cfg: loadConfig(),
+  agentId: "my-agent",
+});
+
+// Crystals are created by indexing files, not by a direct insert API.
+// Write a note under the agent workspace's memory/ folder, then sync:
+//   <workspace>/memory/notes/typescript.md
+await manager?.sync({ reason: "quick-start", force: true });
+```
+
+The file watcher also picks up `memory/**/*.md` changes on its own, and session transcripts are indexed as they grow.
+
+### 2. Force Consolidation
+
+```typescript
+// Run one consolidation cycle immediately (normally timer-driven every 30 min)
+const result = await manager?.consolidate();
+// result: { totalChunks, scoredChunks, mergedChunks, forgottenChunks, durationMs } | null
+```
+
+### 3. Search
+
+```typescript
+const results = await manager?.search("typescript runtime types");
+// results: [{ id, text, score, importanceScore, ... }]
+```
+
+### Inspect State
+
+```bash
+# Open the database directly (one file per agent)
+sqlite3 ~/.bitterbot/memory/<agentId>.sqlite
+
+# Count crystals
+SELECT COUNT(*) FROM chunks;
+
+# See lifecycle distribution
+SELECT lifecycle, COUNT(*) FROM chunks GROUP BY lifecycle;
+
+# Check hormonal state (read-only, decays in-memory)
+# Use MemoryIndexManager.getHormonalState() from code
+
+# View the audit log
+SELECT * FROM memory_audit_log ORDER BY timestamp DESC LIMIT 10;
+
+# Check dream history
+SELECT cycle_id, started_at, insights_generated, modes_used FROM dream_cycles ORDER BY started_at DESC LIMIT 5;
+```
+
+Retrieval fuses three ranked lists (vector, keyword, graph) with Reciprocal Rank Fusion at `k = 60`. Each channel carries a weight from `agents.defaults.memorySearch.query.rrfWeights` (default `1/1/1`, unweighted). Keyword terms are OR-joined before FTS5. Post-fusion boosts (recency, emotional valence, mood congruence, temporal intent) are scaled by `agents.defaults.memorySearch.query.postFusionBoostScale` (default `0.1`) so they break ties without reordering the fused list.
+
+---
+
+## Data Flow
+
+```mermaid
+flowchart TB
+    subgraph Input
+        A[User Message / File Change] --> B[MemoryIndexManager.sync]
+    end
+
+    subgraph Indexing
+        B --> C[Chunk Text]
+        C --> D[Embed via Provider]
+        D --> E[Store in chunks table]
+        E --> F[FTS5 Index]
+        E --> G[sqlite-vec Index]
+    end
+
+    subgraph Assessment
+        E --> H[HormonalSystem.computeCrystalInfluence]
+        E --> I[CuriosityEngine.assessChunk]
+        E --> J[Governance.tagSensitivity]
+    end
+
+    subgraph Retrieval
+        K[Search Query] --> L[Hybrid BM25 + Vector]
+        L --> MCR[Mood-Congruent Retrieval - hormonal bias]
+        MCR --> M[Retrieval Modulation - hormones bias ranking]
+        M --> TMP[Temporal Scoring - query intent × epistemic half-lives]
+        TMP --> SOM{Somatic Marker Check}
+        SOM -->|proceed/trusted| N[Results]
+        SOM -->|caution| WARN[Warning injected]
+        N --> LB[Limbic Bridge - results affect hormones]
+        N --> RECON[Reconsolidation - mark labile]
+        N --> SPACE[Spacing Effect - record access]
+    end
+
+    subgraph "Proactive Recall (every turn, zero LLM cost)"
+        UM[User Message] --> PR[Proactive Recall]
+        PR --> ID[Identity prefs - always surface]
+        PR --> VEC[Vector-match directive/world_fact crystals]
+        PR --> ZEI[Zeigarnik - surface open loops]
+        PR --> PROSP[Prospective Memory - check triggers]
+        PR --> EPIST[Epistemic Directives - inject questions]
+        ID --> SP[System Prompt injection]
+        VEC --> SP
+        ZEI --> SP
+        PROSP --> SP
+        EPIST --> SP
+        COH[Session Coherence Tracker] --> SP
+    end
+
+    subgraph "Context Efficiency"
+        TC[Tool Cache - LRU in-memory] --> PC[Progressive Compression]
+        PC --> EM[Expand Message - truncated content retrieval]
+    end
+
+    subgraph "Deep Recall (on-demand)"
+        DR[deep_recall tool] --> SS[Smart Shortcut - 3+ results with score ≥ 0.8]
+        SS -->|miss| SUB[Sub-LLM REPL in VM Sandbox]
+        SUB --> DB2[(Memory DB + Session JSONL)]
+    end
+
+    subgraph "Offline Processing (timer + emotional triggers)"
+        O[ConsolidationEngine.run] --> P[Ebbinghaus Decay + Merge]
+        O --> SNN[SNN Near-Merge Discovery]
+        SNN --> NMH[(near_merge_hints table)]
+        O --> ORF[Orphan Cluster Detection]
+        ORF --> ORQ[(orphan_replay_queue)]
+        O --> OAUTO[Auto-scratch from hormonal spikes]
+        Q[DreamEngine.run] --> RDY{Readiness Check}
+        RDY -->|ready| FSHO[FSHO Mode Selector]
+        RDY -->|skip| SKIP[Save LLM tokens]
+        MI[Marketplace Intelligence] --> FSHO
+        FSHO --> R[Dream Modes - ripple-enhanced replay]
+        R --> S[New Insights]
+        S --> T[CuriosityEngine.assessDreamInsight]
+        S --> RLM[RLM Working Memory Rewrite]
+        RLM --> WMMD[MEMORY.md state update]
+        Q --> SE[Session Extraction - per changed session]
+        SE --> UPR[(user_preferences table)]
+        SE --> HB[Handover Briefs]
+        HB --> NEXT[Next session system prompt]
+        EMT[Emotional Spike] -->|hormone rises 0.15+ since last check, 90 min cooldown| MINI[Mini-Dream - immediate]
+    end
+
+    subgraph "P2P Network (Two-Tiered)"
+        W[SkillNetworkBridge.publish] --> X[Rust Orchestrator / libp2p]
+        X --> Y[Peer Swarm]
+        Y --> Z[SkillNetworkBridge.ingest]
+        Z --> ZA{Cortisol gate}
+        ZA -->|trusted or no spike| ZB[Verify management sig]
+        ZA -->|untrusted + spike| ZC[Reject]
+        ZB --> AA[PeerReputationManager]
+        Y --> AB[Weather Broadcast]
+        AB --> AC[HormonalStateManager.applyNetworkCortisolSpike]
+        Y --> AD[Bounty Broadcast]
+        AD --> AE[CuriosityEngine.ingestBounty]
+    end
+
+    subgraph "Management Nodes"
+        MN[Management Node] -->|signed weather| AB
+        MN -->|signed bounties| AD
+        MN -->|skill endorsement| ZB
+    end
+```
+
+---
+
+## File Map
+
+### Core
+
+| File                                  | Purpose                                                                       |
+| ------------------------------------- | ----------------------------------------------------------------------------- |
+| `src/memory/manager.ts`               | Central orchestrator. Creates all subsystems, runs search, exposes public API |
+| `src/memory/manager-sync-ops.ts`      | File-watching sync logic (mixin)                                              |
+| `src/memory/manager-embedding-ops.ts` | Embedding batch operations (mixin)                                            |
+| `src/memory/migrations.ts`            | Schema versioning: 80 migration versions (v1 to v80)                          |
+| `src/memory/memory-schema.ts`         | Base table creation, `ensureColumn()` helper                                  |
+| `src/memory/crystal-types.ts`         | All type definitions: `KnowledgeCrystal`, lifecycle, governance, etc.         |
+| `src/memory/crystal.ts`               | `CrystalStore` — CRUD operations on knowledge crystals                        |
+| `src/memory/importance.ts`            | `calculateImportance()` — Ebbinghaus decay formula                            |
+| `src/memory/internal.ts`              | Shared math: `cosineSimilarity()`, `computeCentroid()`, `parseEmbedding()`    |
+| `src/memory/hybrid.ts`                | `mergeHybridResultsRRF()`, `buildFtsQuery()` (OR-joined), `bm25RankToScore()` |
+| `src/memory/rrf.ts`                   | Weighted Reciprocal Rank Fusion (`rrfFuse`, `k = 60`, per-list weight)        |
+| `src/memory/maintenance-mutex.ts`     | `MaintenanceMutex`: serializes consolidation, dream, sweeps and digest        |
+
+### Dream System
+
+| File                                   | Purpose                                                                                 |
+| -------------------------------------- | --------------------------------------------------------------------------------------- |
+| `src/memory/dream-engine.ts`           | `DreamEngine` — state machine, 13 mode runners, FSHO integration, emotional triggering  |
+| `src/memory/dream-oscillator.ts`       | FSHO oscillator — Kuramoto coupling, order parameter for mode selection                 |
+| `src/memory/dream-types.ts`            | Dream types: modes, tiers, configs, `DreamInsight`                                      |
+| `src/memory/dream-schema.ts`           | `dream_insights` + `dream_cycles` + `dream_telemetry` + `dream_outcomes` table creation |
+| `src/memory/dream-evaluator.ts`        | Dream outcome evaluation — DQS scoring, FSHO correlation, adaptive feedback             |
+| `src/memory/dream-synthesis-prompt.ts` | LLM prompt building, heuristic synthesis, response parsing                              |
+| `src/memory/dream-search.ts`           | Vector search over dream insights                                                       |
+
+### Skill Mutation Validation Gate (PLAN-21)
+
+**Retired in PLAN-45 Phase 1 (2026-09-05).** `skill-mutation-pareto.ts`, `dream-slow-update.ts`, and `prompt-optimization.ts` were deleted with the `mutation` / `research` dream modes. Two files survive with narrower jobs:
+
+| File                                      | Purpose                                                                                      |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `src/memory/experiment-sandbox.ts`        | Paired LLM judge + `bootstrapPairedCI` used only by harness-evolve (PLAN-25); gates no skill |
+| `src/memory/skill-execution-selection.ts` | Deterministic SHA-1 held-out partition (`isHeldOut`, `hashBucket`) shared by harness-evolve  |
+
+`skill_text_history` was orphaned (no reader, no writer) and is dropped in v67 (PLAN-46 dead-code pass). `mutation_queue` was dropped in v58.
+
+### Working Memory (RLM)
+
+| File                                      | Purpose                                                                           |
+| ----------------------------------------- | --------------------------------------------------------------------------------- |
+| `src/memory/working-memory-prompt.ts`     | RLM synthesis prompt, user preferences input, Bond drift guard, schema validation |
+| `src/memory/seed-crystal-migration.ts`    | One-time migration of existing MEMORY.md into consolidated crystals               |
+| `src/agents/tools/working-memory-tool.ts` | `working_memory_note` tool — epistemic type parameter, scratch buffer WAL         |
+
+### Deep Recall
+
+| File                                   | Purpose                                                             |
+| -------------------------------------- | ------------------------------------------------------------------- |
+| `src/agents/rlm/executor.ts`           | RLM executor — REPL loop, model routing, iteration control          |
+| `src/agents/rlm/sandbox.ts`            | VM sandbox — isolated execution context with search/transcript APIs |
+| `src/agents/rlm/prompts.ts`            | REPL system prompts and diverse query generation                    |
+| `src/agents/rlm/cost-tracker.ts`       | Per-query token usage and cost monitoring                           |
+| `src/agents/rlm/context-builder.ts`    | Conversation history and session context assembly                   |
+| `src/agents/tools/deep-recall-tool.ts` | Agent tool — smart shortcut, REPL dispatch, owner-only sessions     |
+
+### Session & User Knowledge
+
+| File                              | Purpose                                                                                           |
+| --------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `src/memory/session-extractor.ts` | Extract structured facts from session transcripts during dream cycles                             |
+| `src/memory/session-handover.ts`  | Generate/load compact session handover briefs for cross-session continuity, quality gate scoring  |
+| `src/memory/continuity-gate.ts`   | Cosine gate (`0.25`) that decides whether the handover brief is injected into a new session       |
+| `src/memory/user-model.ts`        | `UserModelManager` — preference storage, `upsertFromDirective()`, Bayesian confidence calibration |
+
+### Cognitive Coherence (Plan 7)
+
+| File                              | Purpose                                                                                                     |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `src/memory/proactive-recall.ts`  | Involuntary memory surfacing — identity/directive facts, open loops, entity anaphora auto-inject every turn |
+| `src/memory/session-coherence.ts` | Intra-session thread tracking, decision detection, intent classification                                    |
+| `src/memory/temporal-scoring.ts`  | Query-intent-sensitive temporal decay with epistemic half-lives                                             |
+| `src/memory/dream-evaluator.ts`   | Dream Quality Score (DQS), FSHO correlation analysis, outcome persistence                                   |
+
+### Agent Economy (Plan 8)
+
+| File                                     | Purpose                                                                         |
+| ---------------------------------------- | ------------------------------------------------------------------------------- |
+| `src/services/erc8004-identity.ts`       | ERC-8004 onchain agent identity — register, reputation feedback, traction check |
+| `src/memory/marketplace-intelligence.ts` | Demand-driven dream targeting — market signals as 4th dream mode signal         |
+
+### Context Efficiency
+
+| File                                        | Purpose                                           |
+| ------------------------------------------- | ------------------------------------------------- |
+| `src/agents/tool-cache.ts`                  | In-memory LRU cache for tool results              |
+| `src/agents/agent-tools.cache.ts`           | Cache integration layer for Pi coding tools       |
+| `src/agents/progressive-compression.ts`     | Deterministic truncation before LLM summarization |
+| `src/agents/tools/expand-message-tool.ts`   | Retrieve full content of truncated messages       |
+| `src/agents/tools/emotional-anchor-tool.ts` | Create/recall persistent emotional bookmarks      |
+
+See [Working Memory](./working-memory.md) for full documentation.
+
+### Curiosity & Emotional
+
+| File                             | Purpose                                                                                      |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| `src/memory/curiosity-engine.ts` | `CuriosityEngine` — unified GCCRF scoring, gap detection, region tracking, target management |
+| `src/memory/curiosity-types.ts`  | Curiosity types: regions, targets, surprise assessment, evidence config                      |
+| `src/memory/gccrf-reward.ts`     | `GCCRFRewardFunction` — five-component reward computation (internal to CuriosityEngine)      |
+| `src/memory/hormonal.ts`         | `HormonalStateManager` — dopamine/cortisol/oxytocin with exponential decay                   |
+| `src/memory/consolidation.ts`    | `ConsolidationEngine` — Ebbinghaus decay, merge, lifecycle transitions                       |
+| `src/memory/user-model.ts`       | `UserModelManager` — preference extraction, pattern detection                                |
+| `src/memory/task-memory.ts`      | `TaskMemoryManager` — goal tracking, progress, stall detection                               |
+
+### Curiosity Research & Evidence (PLAN-54, PLAN-59)
+
+| File                                 | Purpose                                                                                           |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `src/memory/curiosity-researcher.ts` | Autonomous web research on the maintenance tick (`memory.curiosity.research`)                     |
+| `src/memory/evidence-telemetry.ts`   | Observational layer: retrieval hits, surfacing events, shadow decision traces                     |
+| `src/memory/surfacing-trial.ts`      | Shadow eligibility/assignment for proactive surfaces (`memory.curiosity.evidence.surfacingTrial`) |
+
+### PLAN-9: Neuroscience Memory Mechanisms
+
+| File                                 | Purpose                                                                                |
+| ------------------------------------ | -------------------------------------------------------------------------------------- |
+| `src/memory/knowledge-graph.ts`      | `KnowledgeGraphManager` — entity-relationship graph with temporal validity (GAP-1/2)   |
+| `src/memory/reconsolidation.ts`      | `ReconsolidationEngine` — labile states on recall, strengthen/flag/restabilize (GAP-5) |
+| `src/memory/mood-congruent-boost.ts` | Mood-congruent retrieval — hormonal state biases search results (GAP-6)                |
+| `src/memory/spacing-effect.ts`       | Spacing effect — spaced repetition importance multiplier (GAP-7)                       |
+| `src/memory/zeigarnik-effect.ts`     | Zeigarnik effect — open loop detection, decay resistance for unfinished tasks (GAP-8)  |
+| `src/memory/prospective-memory.ts`   | `ProspectiveMemoryEngine` — event-triggered future recall (GAP-9)                      |
+| `src/memory/synaptic-tagging.ts`     | Synaptic tagging & capture — strong events boost nearby weak memories (GAP-10)         |
+| `src/memory/epistemic-directives.ts` | `EpistemicDirectiveEngine` — active inference, live knowledge gap questions (GAP-11)   |
+| `src/memory/somatic-markers.ts`      | Somatic marker fast-pathing — pre-retrieval emotional filtering (GAP-12)               |
+
+### PLAN-18: SAGE-style Self-Evolving Graph Memory
+
+| File                                    | Purpose                                                                                        |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `src/memory/query-planner.ts`           | Structured query planning — entities, aliases, hard constraints, pseudo-queries (Phase 1)      |
+| `src/memory/graph-reader.ts`            | L-hop message-passing graph reader with injectable per-edge gates (Phase 2)                    |
+| `src/memory/graph-topology.ts`          | Per-edge topology features (8-Float32 BLOB) stored on `relationships.gate_features` (Phase 3)  |
+| `src/memory/structural-gate.ts`         | Tiny 8→16→1 MLP implementing `g = 1 + δ·tanh(MLP)`, with hormonal δ modulation (Phase 3+5)     |
+| `src/memory/graph-optimizer.ts`         | Gradient-free CMA-ES-lite over gate parameters; recall/precision/deducibility reward (Phase 3) |
+| `src/memory/graph-optimization-hook.ts` | Dream-engine hook: runs the optimizer, rejects validation regressions, materializes gate_value |
+| `src/memory/graph-bridge-target.ts`     | Writer-reader coupling: emits `graph_bridge` curiosity targets from retrieval misses (Phase 4) |
+| `src/memory/sage-memory.ts`             | Public façade composing all phases — `sageRetrieve(db, kg, query, config)`                     |
+| `src/memory/graph-abstraction.ts`       | Community detection and summary nodes over the entity graph (`memory.graphAbstraction`)        |
+
+### Skills & P2P
+
+| File                                    | Purpose                                                                                |
+| --------------------------------------- | -------------------------------------------------------------------------------------- |
+| `src/memory/skill-verifier.ts`          | `SkillVerifier` — 3-check safety gate (dangerous patterns, structural, semantic drift) |
+| `src/memory/skill-execution-tracker.ts` | `SkillExecutionTracker` — outcome recording, empirical metrics                         |
+| `src/memory/skill-network-bridge.ts`    | Skill publish/ingest, version conflict resolution, governance, P2P ingest safety gate  |
+| `src/memory/peer-reputation.ts`         | `PeerReputationManager` — trust levels, EigenTrust, anomaly detection                  |
+| `src/memory/discovery-agent.ts`         | `DiscoveryAgent` — skill edge discovery, proactive suggestions                         |
+| `src/memory/skill-marketplace.ts`       | Marketplace listing, search, trending, recommendations (wired via gateway RPC)         |
+| `src/memory/skill-hierarchy.ts`         | Parent-child skill tree relationships                                                  |
+
+### Search & Embeddings
+
+| File                           | Purpose                                             |
+| ------------------------------ | --------------------------------------------------- |
+| `src/memory/manager-search.ts` | `searchVector()`, `searchKeyword()` implementations |
+| `src/memory/mem-store.ts`      | `MemStore` — publish/subscribe, version history     |
+| `src/memory/embeddings.ts`     | Provider abstraction: OpenAI, Gemini, Voyage, local |
+
+### Infrastructure
+
+| File                       | Purpose                                                                  |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `src/memory/governance.ts` | `MemoryGovernance` — access control, sensitivity tagging, provenance DAG |
+| `src/memory/scheduler.ts`  | `MemoryScheduler` — per-hour LLM/embedding budgets                       |
+| `src/memory/pipeline.ts`   | `MemoryPipeline` — fluent retrieve-filter-augment-store API              |
+
+### Owner Controls & Canonical Ledger
+
+| File                                  | Purpose                                                                           |
+| ------------------------------------- | --------------------------------------------------------------------------------- |
+| `src/memory/canonical-facts.ts`       | Canonical facts ledger: tiers, 48-fact cap, 90-day decay, rapid-supersede window  |
+| `src/memory/canonical-propagation.ts` | `canonical:changed` queue, outbox, followers (search, preferences, graph, briefs) |
+| `src/memory/canonical-supersede-*.ts` | The individual followers that mark, close or flag what repeated an old value      |
+| `src/memory/correction-capture.ts`    | Per-turn correction capture into the canonical ledger (12 s model-call cap)       |
+| `src/memory/owner-controls.ts`        | Memory page operations: list, get, edit, forget, export writer (0600 file)        |
+| `src/memory/forget-cascade.ts`        | Forget/edit cascade planning and batched apply (`planHash`)                       |
+| `src/memory/memory-suppressions.ts`   | `memory_suppressions` table: what the owner removed stays removed                 |
+| `src/memory/memory-export.ts`         | Export version 2 (paged, redacted)                                                |
+| `src/memory/memory-import.ts`         | Import rules: suppressions win, tier capping, owner-tier confirmation hash        |
+
+See [Your memory controls](./controls.md) for the user-facing behaviour.
+
+---
+
+## Initialization Chain
+
+`MemoryIndexManager` is the central orchestrator. It is obtained via the static async factory `MemoryIndexManager.get({ cfg, agentId })`, which caches instances by agent+workspace+settings key.
+
+The private constructor runs this initialization sequence:
+
+```
+1.  openDatabase()              — open/create SQLite DB
+2.  ensureSchema()              — base tables + runMigrations()
+3.  ensureWatcher()             — file-system change watcher (chokidar)
+4.  ensureSessionListener()     — session transcript change listener
+5.  ensureSkillsListener()      — skills directory change listener
+6.  ensureIntervalSync()        — periodic re-index timer
+7.  ensureConsolidationInterval() — periodic consolidation + curiosity + hormonal decay
+8.  ensureDreamEngine()         — DreamEngine + interval timer
+9.  ensureDigestInterval()      -- scheduled memory digest (memory.digest)
+10. ensureHealthSweepInterval() -- scheduled health sweep (memory.healthSweep)
+11. ensureTrendingSweepInterval() -- marketplace trending sweep
+12. ensureCuriosityEngine()     — CuriosityEngine
+13. ensureHormonalManager()     — HormonalStateManager
+14. ensureUserModelManager()    — UserModelManager
+15. ensureCanonicalFacts()      -- canonical facts ledger store
+16. ensureExecutionTracker()    — SkillExecutionTracker (SkillRefiner retired, PLAN-45 Phase 1)
+17. ensureGovernance()          — MemoryGovernance
+18. ensureTaskMemory()          — TaskMemoryManager
+19. ensureScheduler()           — MemoryScheduler
+20. ensureMemStore()            — MemStore (publish/subscribe)
+21. ensurePeerReputationManager() -- PeerReputationManager
+22. ensureSkillNetworkBridge()  — SkillNetworkBridge (null orchestrator, wired later)
+```
+
+The P2P orchestrator bridge is wired later at gateway startup via `wireOrchestratorBridge()`.
+
+---
+
+## Database
+
+**Engine:** Node.js built-in `node:sqlite` (`DatabaseSync`) + `sqlite-vec` extension for vector search + FTS5 for full-text search.
+
+**Schema versions:** 80 migrations (v1 to v80) in `migrations.ts`; `LATEST_SCHEMA_VERSION` is derived from the last entry. The first thirteen:
+
+| Version | Description                                                                                                                                                                                                             |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1      | Knowledge Crystal columns on `chunks`: `semantic_type`, `lifecycle`, hormonal fields, `governance_json`, `provenance_chain`, `created_at`                                                                               |
+| v2      | Skills pipeline tables: `skill_executions`, `peer_reputation`, `peer_skill_ratings`, `mutation_queue`, `skill_edges` + versioning/marketplace/hierarchy columns on `chunks`                                             |
+| v3      | Trust hardening: `peer_trust_edges`, `peer_activity_log` tables + `is_banned`, `eigentrust_score`, `anomaly_flag` on `peer_reputation`                                                                                  |
+| v4      | Management node verification: `is_verified`, `verified_by` columns on `chunks` + bounty tracking: `bounty_match_id`, `bounty_priority_boost` columns on `chunks`                                                        |
+| v5      | Skill version conflict resolution — `lineage_hash`, `peer_origin` columns on `chunks`                                                                                                                                   |
+| v6      | Bitemporal columns — `valid_time_start`, `valid_time_end`, `transaction_time` on `chunks`                                                                                                                               |
+| v7      | Session extraction tracking — `session_extractions` table + `epistemic_layer` on `chunks`                                                                                                                               |
+| v8      | Persistent emotional anchors — `emotional_anchors` table                                                                                                                                                                |
+| v9      | **PLAN-9 Memory Supremacy** — `entities` + `relationships` tables (Knowledge Graph), `prospective_memories` table, `epistemic_directives` table, reconsolidation/spacing/Zeigarnik/synaptic-tagging columns on `chunks` |
+| v10     | PLAN-9 follow-ups — `regions_meta`, `curiosity_queries`, `epistemic_directives` table tweaks                                                                                                                            |
+| v11     | Skill curator follow-ups (PLAN-15 staging gate columns)                                                                                                                                                                 |
+| v12     | PLAN-15 procedural-memory curator — `skill_lifecycle` table backfilled from `skill_executions`                                                                                                                          |
+| v13     | **PLAN-18 SAGE graph memory** — `gate_value` + `gate_features` BLOB columns on `relationships`, `graph_gate_training_pairs` table, `graph_reward_delta` column on `dream_cycles`                                        |
+| v14–v80 | Later migrations (lifecycle columns, canonical facts, skill evolution, review and usage tables, evidence telemetry, and more); see `src/memory/migrations.ts`                                                           |
+
+**Key tables:**
+
+| Table                       | Purpose                                                                            |
+| --------------------------- | ---------------------------------------------------------------------------------- |
+| `chunks`                    | Knowledge crystals (memory units) — ~50 columns                                    |
+| `chunks_vec`                | sqlite-vec virtual table for vector search                                         |
+| `chunks_fts`                | FTS5 virtual table for keyword search                                              |
+| `files`                     | Tracked source files with hashes                                                   |
+| `meta`                      | Key-value store (schema version, provider key)                                     |
+| `dream_insights`            | Dream-generated insights with embeddings                                           |
+| `dream_cycles`              | Dream cycle execution metadata                                                     |
+| `skill_executions`          | Skill execution outcomes                                                           |
+| `peer_reputation`           | Per-peer trust scores                                                              |
+| `peer_skill_ratings`        | Individual skill ratings by peer                                                   |
+| `peer_trust_edges`          | EigenTrust web-of-trust edges                                                      |
+| `peer_activity_log`         | Peer activity timestamps for anomaly detection                                     |
+| `mutation_queue`            | Dropped in v58 (PLAN-40); the mutation flow itself was retired in PLAN-45 Phase 1  |
+| `skill_edges`               | Discovered skill relationships (prerequisite, enables, etc.)                       |
+| `embedding_cache`           | Cached embedding vectors by text hash; every write trims it to `cache.maxEntries`  |
+| `memory_audit_log`          | Governance audit trail                                                             |
+| `entities`                  | Knowledge graph entities (person, project, concept, etc.)                          |
+| `relationships`             | Temporal entity relationships + SAGE per-edge gate (`gate_value`, `gate_features`) |
+| `graph_gate_training_pairs` | (query, ground-truth chunk) tuples used by the SAGE optimizer                      |
+| `prospective_memories`      | Event-triggered future recall ("remind me when X")                                 |
+| `epistemic_directives`      | Active inference questions to resolve knowledge gaps                               |
+| `emotional_anchors`         | Persistent emotional bookmarks                                                     |
+| `session_extractions`       | Session processing tracking                                                        |
+
+---
+
+## Config Hierarchy
+
+All memory configuration flows from `BitterbotConfig.memory`:
+
+```typescript
+cfg.memory?.consolidation  → ConsolidationEngine config (decayRate, thresholds, forgottenRetentionDays)
+cfg.memory?.proceduralLearning → lazy host evidence service (mode: off | shadow | active; default shadow)
+  .experienceMemory        → verified acquisition capture (enabled by default; host extractor required)
+cfg.memory?.dream          → DreamEngineConfig (modes, tiers, intervals, readiness gates, LLM calls)
+cfg.memory?.curiosity      → CuriosityConfig (weights, thresholds, max regions)
+  .research                → autonomous research on the maintenance tick (interval, pages, attempts)
+  .autoResearch            → research egress budget (enabled, maxPerDay)
+  .evidence                → evidence telemetry (mode: off | observe | shadow; default shadow)
+    .surfacingTrial        → shadow eligibility/assignment for proactive surfaces (mode: off | shadow)
+cfg.memory?.gccrf          → GCCRFConfig (component weights, alpha schedule)
+cfg.memory?.emotional      → EmotionalConfig (decayResistance)
+  .hormonal                → HormonalConfig (halflife values, homeostasis)
+  .userModel               → UserModelConfig (preference/pattern extraction)
+cfg.memory?.scheduler      → BudgetConfig (per-hour API limits)
+cfg.memory?.rlm            → RLMConfig (deep recall iterations, model routing)
+cfg.memory?.canonicalLedger → canonical facts ledger (enabled, maxFacts 48, budgetTokens)
+cfg.memory?.extraction     → session fact extraction (model, minSessionDelta, maxFactsPerSession)
+cfg.memory?.correction     → per-turn correction capture (enabled, confirm)
+cfg.memory?.batch          → Message Batches lanes (enabled, lanes, maxWaitMinutes)
+cfg.memory?.provenance     → evidence pointers on extracted facts
+cfg.memory?.architectEvolution → learned construction rules (opt-in)
+cfg.memory?.graphAbstraction → community summary nodes over the entity graph
+cfg.memory?.coverageDiagnostics → recall-miss blame router
+cfg.memory?.healthSweep / .digest / .dreamBrief → scheduled reports
+```
+
+Most subsystems have sensible defaults and are enabled by default; disable one by setting `enabled: false` in its config block. The opt-in exceptions: the `exploration` dream mode (`memory.dream.modes.exploration.enabled`), learned construction rules (`memory.architectEvolution.enabled`), the dream engine's Skill Seekers research step (`memory.curiosity.autoResearch.enabled` must be `true`), and harness evolution (`agents.defaults.harnessEvolve.enabled`).
+
+**Procedural learning uses a mode switch:** `memory.proceduralLearning.mode` defaults to `shadow`; `off` disables this service. Its separate per-agent database opens lazily and records automatic failure experiments as well as host-requested research. Idle dream ticks coordinate the existing production [skill-evolution loop](skills-pipeline.md), with durable dispatch limits, task validation, canary exposure and rollback. `automation.enabled: false` disables the idle coordinator while retaining the legacy full-cycle hook. The manual strategy lab and adapter-based verified-experience extraction remain shadow-only; research candidates do not become live skills. See [Learning Strategy Lab](learning-strategy-lab.md) for configuration and evidence boundaries.
+
+**Message Batches lanes.** `memory.batch` (kill switch `enabled`, default `true`) routes latency-tolerant background lanes through the Anthropic Message Batches API: a lane call submits one batch, polls with backoff, and falls back to the live call on timeout (`maxWaitMinutes`, default 20) or any error. Default `lanes`: `memory/dream`, `memory/extraction`, `memory/discovery`, `skills/evolution` (the judge and maintainer; the proposer loop and on-demand RPC lanes always run live). Only Anthropic API-key models qualify; other providers take the live path.
+
+---
+
+## Embedding Resilience & Tombstone GC
+
+Embeddings are generated **best-effort and out of band** from chunk storage: a
+chunk is always persisted (and stays FTS-searchable) even if its vector can't be
+produced. Two mechanisms keep the store clean and stop blank embeddings from
+accumulating:
+
+- **Graceful degradation (`manager-embedding-ops.ts`).** When an embedding batch
+  fails with a degradable error (timeout, dropped socket, rate limit, 5xx), the
+  batch is **bisected and retried** down to `EMBEDDING_BISECT_MIN_BATCH`. Items
+  that still fail are persisted with `model='pending'` and an empty vector rather
+  than aborting the whole sync. A non-degradable error (auth/4xx) is rethrown so
+  the provider-fallback path can activate. Each pass logs a structured summary:
+  `memory embeddings: N/M embedded, K cache hit(s), S split(s) in Xms`, escalating
+  to `WARN` with a pending count when any item is deferred.
+- **Pending backfill drainer.** `backfillPendingEmbeddings()` runs at the end of
+  every sync cycle (bounded per pass), again in small bounded passes right after a
+  curiosity finding is stored, an owner edit or an import, and is also exposed as
+  `bitterbot memory backfill-embeddings` to clear a backlog manually. It vectorizes
+  `model='pending'` chunks and indexes them into `chunks_vec` + `chunks_fts`.
+- **Recall stays off the hot path.** Hybrid recall fuses vector, keyword and graph
+  results by weighted Reciprocal Rank Fusion (`mergeHybridResultsRRF`, `k = 60`,
+  default weights `1/1/1`); vector search is a
+  `chunks_vec` (sqlite-vec) KNN over float32 BLOB vectors, not a JS scan of the
+  row store. Embeddings are stored as compact float32 BLOBs (~6 KB), never dragged
+  through a sort — the 2026-09-07 audit's freeze came from scan queries that
+  selected the old ~29 KB JSON embedding column, now fixed (id-first fetch).
+- **Serialized maintenance (`MaintenanceMutex`).** Consolidation, dream,
+  health-sweep, trending and digest run one at a time under a mutex so they cannot
+  interleave chunk writes or pile onto the event loop together (PLAN-46 Phase 4).
+- **Tombstone GC (`ConsolidationEngine.purgeExpired`).** Forgotten/expired chunks
+  are physically deleted (row + vector + FTS) once older than
+  `consolidation.forgottenRetentionDays` (default **14**; `0` purges immediately,
+  negative disables). This runs right after the forget pass each consolidation
+  cycle and logs `memory GC: purged N forgotten/expired chunk(s)`. Note that row
+  deletion frees pages but does not shrink the file — run `VACUUM` for that.
+- **Two lifecycle columns.** `lifecycle` (generated, activated, frozen,
+  consolidated, archived, expired) is the fine-grained state machine;
+  `lifecycle_state` (active, archived, consolidated, forgotten) is the coarse
+  retrieval gate. They are not one-to-one (a merge loser is `archived` +
+  `forgotten`), so "is this chunk live?" checks both, each with its own values:
+  `liveChunkPredicate()` in `chunk-writer.ts`. `expired` derives to `forgotten`,
+  and `lifecycle-vocabulary.test.ts` fails on SQL that compares a column with the
+  other column's values.
+
+Health check from the DB directly:
+
+```bash
+# Should be ~0 in steady state — a growing count means embeddings are failing
+SELECT COUNT(*) FROM chunks WHERE model='pending' OR embedding IS NULL OR length(embedding) < 8;
+
+# Tombstones awaiting GC (drained on the consolidation cycle)
+SELECT COUNT(*) FROM chunks WHERE lifecycle_state='forgotten' OR lifecycle='expired';
+```
+
+### Evidence telemetry (shadow mode)
+
+`memory.curiosity.evidence.mode` defaults to `shadow`. This is an observational layer that changes no behaviour: GCCRF still scores every indexed chunk and still feeds the hormonal system. Shadow mode additionally records, under HMAC digests of the query (the text is never stored):
+
+- `retrieval_hits`: the top-K of each owner search with per-channel ranks and fused score;
+- `surfacing_events`: what was proactively surfaced (a curiosity finding, a proactive-recall fact, a dream brief). `delivered` means the item was included in the prompt for a run, keyed by that run's id; usefulness becomes `explicit` only when the owner acts on it, otherwise it stays `unknown`;
+- `decision_traces`: what a "GCCRF as diagnostic only" dream routing would have decided next to the legacy routing. The legacy decision is always the one used.
+
+`memory.curiosity.evidence.surfacingTrial.mode` (default `shadow`) adds eligibility and assignment rows for the optional proactive surfaces; in shadow nothing is withheld. Retention is bounded (`retentionDays`, default 90) and pruned with event-loop yields. `off` disables both; `observe` keeps hits and surfacing events without decision traces.
+
+---
+
+## Observability & Debugging
+
+The memory system is non-deterministic — hormones decay, dreams fire on timers, peers send skills asynchronously. Here's how to inspect what's happening.
+
+### Hormonal State
+
+The hormonal system runs in-memory with exponential decay. To inspect current levels:
+
+```typescript
+// From MemoryIndexManager instance
+const state = manager.getHormonalState();
+// { dopamine: 0.12, cortisol: 0.45, oxytocin: 0.03, lastDecay: 1709... }
+
+// Check if a network cortisol override is active
+const modulation = manager.getConsolidationModulation();
+// { decayResistance: 0.15, mergeThreshold: 0.93, haltUntrustedIngestion: true }
+```
+
+During a network cortisol spike (broadcast by a management node), `haltUntrustedIngestion` will be `true` — meaning untrusted/provisional peers cannot publish skills to this node. The spike auto-expires after its configured `duration_ms`.
+
+### Audit Log
+
+Every lifecycle transition (crystal promoted, merged, expired, ingested from peer) is recorded in `memory_audit_log`:
+
+```sql
+-- Recent audit events
+SELECT event, chunk_id, actor, metadata, timestamp
+FROM memory_audit_log
+ORDER BY timestamp DESC LIMIT 20;
+
+-- Everything the P2P skill bridge wrote (publish and ingest events)
+SELECT * FROM memory_audit_log WHERE actor = 'skill_network_bridge';
+
+-- Events whose metadata mentions cortisol (gated during a spike)
+SELECT * FROM memory_audit_log WHERE metadata LIKE '%cortisol%';
+```
+
+Columns: `id`, `chunk_id`, `event`, `timestamp`, `actor` (default `system`), `metadata` (JSON), plus `operation` and `context_json` on newer rows.
+
+### Dream Cycles
+
+```sql
+-- Recent dream cycles with mode breakdown
+SELECT cycle_id, started_at, duration_ms, insights_generated,
+       modes_used, llm_calls_used, error
+FROM dream_cycles
+ORDER BY started_at DESC LIMIT 10;
+
+-- Dream insights sorted by confidence
+SELECT content, confidence, mode, importance_score
+FROM dream_insights
+ORDER BY confidence DESC LIMIT 10;
+```
+
+### P2P Network
+
+```sql
+-- Peer trust levels
+SELECT peer_pubkey, trust_level, reputation_score, skills_accepted, skills_rejected,
+       is_banned, eigentrust_score, anomaly_flag
+FROM peer_reputation
+ORDER BY reputation_score DESC;
+
+-- Verified skills (endorsed by management nodes)
+SELECT id, text, verified_by, importance_score
+FROM chunks
+WHERE is_verified = 1;
+
+-- Bounty-matched crystals
+SELECT id, text, bounty_match_id, bounty_priority_boost
+FROM chunks
+WHERE bounty_match_id IS NOT NULL;
+```
+
+### Curiosity Engine
+
+```sql
+-- Active exploration targets (including bounties)
+SELECT id, type, description, priority, metadata, expires_at
+FROM curiosity_targets
+WHERE resolved_at IS NULL AND expires_at > (strftime('%s','now') * 1000);
+
+-- Knowledge regions
+SELECT id, label, chunk_count, mean_importance, prediction_error
+FROM curiosity_regions
+ORDER BY chunk_count DESC;
+```
+
+### Consolidation
+
+```sql
+-- Crystal lifecycle distribution
+SELECT lifecycle, COUNT(*) as count FROM chunks GROUP BY lifecycle;
+
+-- Importance score distribution
+SELECT
+  CASE
+    WHEN importance_score >= 0.8 THEN 'high (0.8+)'
+    WHEN importance_score >= 0.4 THEN 'medium (0.4-0.8)'
+    WHEN importance_score >= 0.1 THEN 'low (0.1-0.4)'
+    ELSE 'expiring (<0.1)'
+  END as tier,
+  COUNT(*) as count
+FROM chunks
+WHERE lifecycle NOT IN ('expired', 'archived')
+GROUP BY tier;
+```
+
+---
+
+## Running Tests
+
+```bash
+# Full knowledge crystal test suite (about 115 tests)
+npx vitest run src/memory/knowledge-crystal-system.test.ts
+
+# P2P skill propagation tests (about 86 tests)
+npx vitest run src/memory/p2p-skill-propagation.test.ts
+
+# All memory tests
+npx vitest run src/memory/
+```
+
+---
+
+## Related Documentation
+
+- [How the Memory Works](./how-the-memory-works.md) — plain-language guide to the complete memory system
+- [Knowledge Crystals](./knowledge-crystals.md) — core data model, lifecycle, epistemic layers
+- [Dream Engine](./dream-engine.md) — 13 modes (some off by default), FSHO selector, ripple replay, emotional triggering
+- [Emotional System](./emotional-system.md) — hormones, anchors, limbic bridge
+- [Deep Recall](./deep-recall.md) — RLM infinite memory via sub-LLM REPL
+- [User Knowledge](./user-knowledge.md) — session extraction, Bond drift guard, handover briefs
+- [Working Memory](./working-memory.md) — MEMORY.md as recursive state vector
+- [Biological Identity](./biological-identity.md) — Genome/Phenotype model
+- [Skills Pipeline](./skills-pipeline.md) — skill lifecycle, verification, and P2P network
+- [Curiosity & Search](./curiosity-and-search.md) — curiosity engine and retrieval system
+- [PLAN-9 Memory Supremacy](./plan9-memory-supremacy.md) — knowledge graph, reconsolidation, neuroscience mechanisms
+- [Core Network Systems](../network/core-systems.md) — A2A, wallet, marketplace, P2P

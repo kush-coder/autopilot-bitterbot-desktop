@@ -1,0 +1,162 @@
+/**
+ * Top-level Runtime doctor section.
+ *
+ * Everything else in this doctor assumes the runtime itself is viable.
+ * This check runs first (logically, even if listed later) — it validates:
+ *
+ *   1. Node version meets the minimum (we depend on structuredClone,
+ *      node:test, modern AbortSignal behaviour, and node --watch)
+ *   2. pnpm is on PATH, for source checkouts only (monorepo dev workflow +
+ *      `pnpm dev:all`); container, installer and package installs never
+ *      need it
+ *   3. Platform-specific caveats:
+ *        - Linux + public bind → recommend Tailscale / loopback
+ *        - WSL2 → flag known symlink + filesystem-performance gotchas
+ *
+ * Doctor checks below this one may rely on features from newer Node
+ * (e.g. dream-engine DB uses node:sqlite on 22+), so if runtime fails
+ * here the user will see the cascade downstream too.
+ */
+
+import { spawnSync } from "node:child_process";
+import os from "node:os";
+import type { BitterbotConfig } from "../config/config.js";
+import { type InstallKind, installKindLabel } from "../infra/install-kind.js";
+import {
+  renderSection as renderDoctorSection,
+  type CheckResult,
+  ok,
+  warn,
+  error,
+  info,
+} from "./doctor-check.js";
+
+// Kept in sync with package.json#engines.node. Node 22 LTS is the floor
+// because the dream-engine DB uses the stable node:sqlite that ships there,
+// and several crypto / AbortController behaviours we rely on stabilised in
+// 22.x. Downgrade = silent native-module failures.
+const MIN_NODE_MAJOR = 22;
+
+function parseNodeMajor(version: string): number | null {
+  const m = /^v?(\d+)/.exec(version);
+  return m ? Number(m[1]) : null;
+}
+
+function isWsl2(): boolean {
+  if (process.platform !== "linux") {
+    return false;
+  }
+  try {
+    const rel = os.release().toLowerCase();
+    return rel.includes("microsoft") || rel.includes("wsl");
+  } catch {
+    return false;
+  }
+}
+
+function whichPnpm(): { found: boolean; version?: string } {
+  try {
+    const result = spawnSync("pnpm", ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (result.status === 0 && result.stdout?.trim()) {
+      return { found: true, version: result.stdout.trim() };
+    }
+  } catch {
+    // fall through
+  }
+  return { found: false };
+}
+
+export function runRuntimeChecks(params: {
+  config: BitterbotConfig;
+  /** How this Bitterbot is installed (detectInstallKind). */
+  installKind?: InstallKind;
+  /** Test seam for the pnpm probe. */
+  whichPnpm?: () => { found: boolean; version?: string };
+}): void {
+  const { config } = params;
+  const installKind = params.installKind ?? "unknown";
+  const results: CheckResult[] = [];
+  results.push(info(`Install: ${installKindLabel(installKind)}`));
+
+  // ── Node version ──
+  const major = parseNodeMajor(process.version);
+  if (major === null) {
+    results.push(warn(`Couldn't parse Node version "${process.version}"`));
+  } else if (major < MIN_NODE_MAJOR) {
+    results.push(
+      error(
+        `Node ${process.version} is below the supported floor (v${MIN_NODE_MAJOR} LTS). ` +
+          `Dream engine, sqlite vector ops, and native modules may fail silently.`,
+      ),
+    );
+  } else {
+    results.push(ok(`Node ${process.version}`));
+  }
+
+  // ── pnpm (source checkouts only: nothing else runs pnpm) ──
+  const pnpm =
+    installKind === "git" ? (params.whichPnpm ?? whichPnpm)() : { found: false, skipped: true };
+  if ("skipped" in pnpm) {
+    // Container, installer and package installs start with `bitterbot` (or
+    // compose); a missing pnpm is not a problem there.
+  } else if (pnpm.found) {
+    results.push(ok(`pnpm ${pnpm.version} on PATH`));
+  } else {
+    results.push(
+      warn(
+        "pnpm not found on PATH — `pnpm dev:all`, `pnpm start gateway`, and the " +
+          "wizard's auto-spawn will fail. Install: `npm i -g pnpm`.",
+      ),
+    );
+  }
+
+  // ── Platform + bind posture ──
+  const platform = process.platform;
+  const bind = config.gateway?.bind ?? "loopback";
+  const tailscaleMode = config.gateway?.tailscale?.mode ?? "off";
+
+  if (platform === "linux" && (bind === "lan" || bind === "auto" || bind === "custom")) {
+    if (installKind === "container") {
+      // Inside the image the gateway must bind 0.0.0.0; whether that reaches
+      // the LAN is decided on the host by the port mapping, which doctor
+      // cannot see from inside the container.
+      results.push(
+        warn(
+          `Container: gateway bind=${bind} inside the container. LAN exposure depends on the ` +
+            "host port mapping: `-p 19001:19001` or BITTERBOT_BIND_HOST=0.0.0.0 exposes it on " +
+            "your LAN. Check on the Docker host with `docker compose port bitterbot-gateway 19001` " +
+            "(127.0.0.1:... means loopback only).",
+        ),
+      );
+    } else if (tailscaleMode === "off") {
+      results.push(
+        warn(
+          `Linux + gateway bind=${bind} with Tailscale off. The gateway is reachable ` +
+            "on your LAN without mesh-level auth. Run Tailscale or switch bind=loopback.",
+        ),
+      );
+    } else {
+      results.push(ok(`Linux + Tailscale ${tailscaleMode} (bind=${bind})`));
+    }
+  }
+
+  // ── WSL2 caveats ──
+  if (isWsl2()) {
+    results.push(
+      info(
+        "Running under WSL2. Two things to know:\n" +
+          "  - File I/O across /mnt/c is ~10× slower than native ext4 — keep the workspace under ~/ if possible.\n" +
+          "  - Symlinks into /mnt/c can break skill ingestion. Use copies or keep skills on the Linux side.",
+      ),
+    );
+  }
+
+  renderSection(results);
+}
+
+function renderSection(results: CheckResult[]): void {
+  renderDoctorSection("Runtime", results);
+}

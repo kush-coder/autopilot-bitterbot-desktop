@@ -1,0 +1,536 @@
+import {
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  execFileSync,
+  spawn,
+} from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import WebSocket from "ws";
+import { ensurePortAvailable } from "../infra/ports.js";
+import { isWSLSync } from "../infra/wsl.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { CONFIG_DIR } from "../utils.js";
+import { appendCdpPath } from "./cdp.helpers.js";
+import { getHeadersWithAuth, normalizeCdpWsUrl } from "./cdp.js";
+import {
+  type BrowserExecutable,
+  resolveBrowserExecutableForPlatform,
+} from "./chrome.executables.js";
+import {
+  decorateBitterbotProfile,
+  ensureProfileCleanExit,
+  isProfileDecorated,
+} from "./chrome.profile-decoration.js";
+import type { ResolvedBrowserConfig, ResolvedBrowserProfile } from "./config.js";
+import {
+  DEFAULT_BITTERBOT_BROWSER_COLOR,
+  DEFAULT_BITTERBOT_BROWSER_PROFILE_NAME,
+} from "./constants.js";
+import { trackBrowserLaunch } from "./launch-activity.js";
+import { resolvePlaywrightInstallCommand } from "./playwright-browsers.js";
+
+const log = createSubsystemLogger("browser").child("chrome");
+
+export type { BrowserExecutable } from "./chrome.executables.js";
+export {
+  findChromeExecutableLinux,
+  findChromeExecutableMac,
+  findChromeExecutableWindows,
+  resolveBrowserExecutableForPlatform,
+} from "./chrome.executables.js";
+export {
+  decorateBitterbotProfile,
+  ensureProfileCleanExit,
+  isProfileDecorated,
+} from "./chrome.profile-decoration.js";
+
+function exists(filePath: string) {
+  try {
+    return fs.existsSync(filePath);
+  } catch {
+    return false;
+  }
+}
+
+export type RunningChrome = {
+  pid: number;
+  exe: BrowserExecutable;
+  userDataDir: string;
+  cdpPort: number;
+  /** CDP URL reachable from this process (may differ from 127.0.0.1 in WSL). */
+  cdpUrl: string;
+  startedAt: number;
+  proc: ChildProcessWithoutNullStreams;
+};
+
+function resolveBrowserExecutable(resolved: ResolvedBrowserConfig): BrowserExecutable | null {
+  return resolveBrowserExecutableForPlatform(resolved, process.platform);
+}
+
+export function resolveBitterbotUserDataDir(profileName = DEFAULT_BITTERBOT_BROWSER_PROFILE_NAME) {
+  return path.join(CONFIG_DIR, "browser", profileName, "user-data");
+}
+
+function cdpUrlForPort(cdpPort: number) {
+  return `http://127.0.0.1:${cdpPort}`;
+}
+
+/**
+ * In WSL2, Chrome runs as a Windows process and binds CDP to the Windows
+ * network namespace. WSL's 127.0.0.1 is a different address, so we need
+ * to reach Chrome via the Windows host IP (the WSL default gateway).
+ */
+function resolveWSLHostIp(): string | null {
+  try {
+    const output = execFileSync("ip", ["route", "show", "default"], {
+      timeout: 2000,
+      encoding: "utf8",
+    });
+    const match = output.match(/via\s+(\S+)/);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isWindowsExe(exePath: string): boolean {
+  return exePath.toLowerCase().endsWith(".exe") && exePath.startsWith("/mnt/");
+}
+
+function wslPathToWindows(linuxPath: string): string | null {
+  try {
+    return (
+      execFileSync("wslpath", ["-w", linuxPath], {
+        timeout: 2000,
+        encoding: "utf8",
+      }).trim() || null
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * For Windows Chrome launched from WSL, use a native Windows path for the
+ * user-data-dir. UNC paths (\\wsl.localhost\...) cause file locking and
+ * performance issues over the 9P bridge.
+ */
+function resolveWSLWindowsUserDataDir(profileName: string): string | null {
+  try {
+    const username = execFileSync("cmd.exe", ["/C", "echo", "%USERNAME%"], {
+      timeout: 2000,
+      encoding: "utf8",
+    }).trim();
+    if (username && !username.includes("%")) {
+      const dir = `/mnt/c/Users/${username}/AppData/Local/bitterbot/browser/${profileName}`;
+      fs.mkdirSync(dir, { recursive: true });
+      // Return the Windows-style path for Chrome.exe
+      return `C:\\Users\\${username}\\AppData\\Local\\bitterbot\\browser\\${profileName}`;
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+export async function isChromeReachable(cdpUrl: string, timeoutMs = 500): Promise<boolean> {
+  const version = await fetchChromeVersion(cdpUrl, timeoutMs);
+  return Boolean(version);
+}
+
+type ChromeVersion = {
+  webSocketDebuggerUrl?: string;
+  Browser?: string;
+  "User-Agent"?: string;
+};
+
+async function fetchChromeVersion(cdpUrl: string, timeoutMs = 500): Promise<ChromeVersion | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(ctrl.abort.bind(ctrl), timeoutMs);
+  try {
+    const versionUrl = appendCdpPath(cdpUrl, "/json/version");
+    const res = await fetch(versionUrl, {
+      signal: ctrl.signal,
+      headers: getHeadersWithAuth(versionUrl),
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const data = (await res.json()) as ChromeVersion;
+    if (!data || typeof data !== "object") {
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+export async function getChromeWebSocketUrl(
+  cdpUrl: string,
+  timeoutMs = 500,
+): Promise<string | null> {
+  const version = await fetchChromeVersion(cdpUrl, timeoutMs);
+  const wsUrl = String(version?.webSocketDebuggerUrl ?? "").trim();
+  if (!wsUrl) {
+    return null;
+  }
+  return normalizeCdpWsUrl(wsUrl, cdpUrl);
+}
+
+async function canOpenWebSocket(wsUrl: string, timeoutMs = 800): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const headers = getHeadersWithAuth(wsUrl);
+    const ws = new WebSocket(wsUrl, {
+      handshakeTimeout: timeoutMs,
+      ...(Object.keys(headers).length ? { headers } : {}),
+    });
+    const timer = setTimeout(
+      () => {
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        resolve(false);
+      },
+      Math.max(50, timeoutMs + 25),
+    );
+    ws.once("open", () => {
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      resolve(true);
+    });
+    ws.once("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+export async function isChromeCdpReady(
+  cdpUrl: string,
+  timeoutMs = 500,
+  handshakeTimeoutMs = 800,
+): Promise<boolean> {
+  const wsUrl = await getChromeWebSocketUrl(cdpUrl, timeoutMs);
+  if (!wsUrl) {
+    return false;
+  }
+  return await canOpenWebSocket(wsUrl, handshakeTimeoutMs);
+}
+
+export async function launchBitterbotChrome(
+  resolved: ResolvedBrowserConfig,
+  profile: ResolvedBrowserProfile,
+): Promise<RunningChrome> {
+  return await trackBrowserLaunch(() => launchChrome(resolved, profile));
+}
+
+async function launchChrome(
+  resolved: ResolvedBrowserConfig,
+  profile: ResolvedBrowserProfile,
+): Promise<RunningChrome> {
+  if (!profile.cdpIsLoopback) {
+    throw new Error(`Profile "${profile.name}" is remote; cannot launch local Chrome.`);
+  }
+  await ensurePortAvailable(profile.cdpPort);
+
+  const exe = resolveBrowserExecutable(resolved);
+  if (!exe) {
+    throw new Error(
+      "No supported browser found (Chrome/Brave/Edge/Chromium on macOS, Linux, or Windows).\n\n" +
+        "Quick fixes:\n" +
+        `  1. Download Playwright's Chromium:  ${resolvePlaywrightInstallCommand()}\n` +
+        "  2. Or install a system browser:  sudo apt install chromium-browser  (Linux)\n" +
+        "  3. Or set a custom path:         browser.executablePath in your config\n\n" +
+        "Docs: https://github.com/Bitterbot-AI/bitterbot-desktop/blob/main/docs/tools/browser.md",
+    );
+  }
+
+  const userDataDir = resolveBitterbotUserDataDir(profile.name);
+  fs.mkdirSync(userDataDir, { recursive: true });
+
+  const needsDecorate = !isProfileDecorated(
+    userDataDir,
+    profile.name,
+    (profile.color ?? DEFAULT_BITTERBOT_BROWSER_COLOR).toUpperCase(),
+  );
+
+  // WSL: when launching a Windows .exe from WSL, Chrome binds CDP to the
+  // Windows network namespace. We need to bind to 0.0.0.0 and connect via
+  // the Windows host IP instead of 127.0.0.1.
+  const wslWindowsBrowser = isWSLSync() && isWindowsExe(exe.path);
+  const wslHostIp = wslWindowsBrowser ? resolveWSLHostIp() : null;
+  const cdpReachableUrl = wslHostIp ? `http://${wslHostIp}:${profile.cdpPort}` : profile.cdpUrl;
+
+  // First launch to create preference files if missing, then decorate and relaunch.
+  const spawnOnce = () => {
+    // Windows Chrome needs a Windows-native path for --user-data-dir.
+    // UNC paths (\\wsl.localhost\...) are unreliable due to 9P file locking
+    // and perf issues, so use a path under /mnt/c/ instead.
+    const effectiveDataDir = wslWindowsBrowser
+      ? (resolveWSLWindowsUserDataDir(profile.name) ?? wslPathToWindows(userDataDir) ?? userDataDir)
+      : userDataDir;
+
+    const args: string[] = [
+      `--remote-debugging-port=${profile.cdpPort}`,
+      `--user-data-dir=${effectiveDataDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-sync",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-features=Translate,MediaRouter",
+      "--disable-session-crashed-bubble",
+      "--hide-crash-restore-bubble",
+      "--password-store=basic",
+    ];
+
+    // WSL: bind CDP to all interfaces so it's reachable from WSL's namespace
+    if (wslWindowsBrowser) {
+      args.push("--remote-debugging-address=0.0.0.0");
+    }
+
+    if (resolved.headless) {
+      // Best-effort; older Chromes may ignore.
+      args.push("--headless=new");
+      args.push("--disable-gpu");
+    }
+    // WSL: native Linux Chromium typically needs --no-sandbox in the WSL2 VM
+    if (resolved.noSandbox || (isWSLSync() && !wslWindowsBrowser)) {
+      args.push("--no-sandbox");
+      args.push("--disable-setuid-sandbox");
+    }
+    if (process.platform === "linux") {
+      args.push("--disable-dev-shm-usage");
+    }
+
+    // Stealth: hide navigator.webdriver from automation detection (#80)
+    args.push("--disable-blink-features=AutomationControlled");
+
+    // Always open a blank tab to ensure a target exists.
+    args.push("about:blank");
+
+    return spawn(exe.path, args, {
+      stdio: "pipe",
+      env: {
+        ...process.env,
+        // Reduce accidental sharing with the user's env.
+        HOME: os.homedir(),
+      },
+    });
+  };
+
+  const startedAt = Date.now();
+
+  const localStatePath = path.join(userDataDir, "Local State");
+  const preferencesPath = path.join(userDataDir, "Default", "Preferences");
+  const needsBootstrap = !exists(localStatePath) || !exists(preferencesPath);
+
+  // If the profile doesn't exist yet, bootstrap it once so Chrome creates defaults.
+  // Then decorate (if needed) before the "real" run.
+  if (needsBootstrap) {
+    const bootstrap = spawnOnce();
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (exists(localStatePath) && exists(preferencesPath)) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    try {
+      bootstrap.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+    const exitDeadline = Date.now() + 5000;
+    while (Date.now() < exitDeadline) {
+      if (bootstrap.exitCode != null) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  if (needsDecorate) {
+    try {
+      decorateBitterbotProfile(userDataDir, {
+        name: profile.name,
+        color: profile.color,
+      });
+      log.info(`🤖 bitterbot browser profile decorated (${profile.color})`);
+    } catch (err) {
+      log.warn(`bitterbot browser profile decoration failed: ${String(err)}`);
+    }
+  }
+
+  try {
+    ensureProfileCleanExit(userDataDir);
+  } catch (err) {
+    log.warn(`bitterbot browser clean-exit prefs failed: ${String(err)}`);
+  }
+
+  const proc = spawnOnce();
+  const launch = watchBrowserLaunch(proc);
+  // Wait for CDP to come up. Kept under the browser client's launching-call
+  // timeout (BROWSER_LAUNCHING_CALL_TIMEOUT_MS), so a failed start is reported
+  // as what it is and not as a timeout.
+  let readyDeadline = Date.now() + CDP_READY_WAIT_MS;
+  while (Date.now() < readyDeadline) {
+    if (await isChromeReachable(cdpReachableUrl, CDP_PROBE_TIMEOUT_MS)) {
+      break;
+    }
+    const ended = launch.ended();
+    if (ended) {
+      // A launcher can exit after handing off to the real browser, so an exit
+      // is not proof of failure. It is a reason to stop waiting soon.
+      readyDeadline = Math.min(readyDeadline, ended.at + EXITED_LAUNCHER_GRACE_MS);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (!(await isChromeReachable(cdpReachableUrl, CDP_PROBE_TIMEOUT_MS))) {
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+    throw new Error(
+      describeBrowserLaunchFailure({
+        port: profile.cdpPort,
+        profile: profile.name,
+        executable: exe.path,
+        ended: launch.ended(),
+        output: launch.outputTail(),
+        waitedMs: CDP_READY_WAIT_MS,
+      }),
+    );
+  }
+
+  const pid = proc.pid ?? -1;
+  const cdpHost = wslHostIp ?? "127.0.0.1";
+  log.info(
+    `🤖 bitterbot browser started (${exe.kind}) profile "${profile.name}" on ${cdpHost}:${profile.cdpPort} (pid ${pid})`,
+  );
+
+  return {
+    pid,
+    exe,
+    userDataDir,
+    cdpPort: profile.cdpPort,
+    cdpUrl: cdpReachableUrl,
+    startedAt,
+    proc,
+  };
+}
+
+/**
+ * How long to wait for a started browser to open its debugging port. The
+ * first start after a reboot reads a cold ~400 MB browser from disk; on WSL
+ * that took longer than the old 12 s (2026-10-16), while a warm start takes
+ * under 2 s.
+ */
+export const CDP_READY_WAIT_MS = 25_000;
+/** One readiness probe. A cold browser can take over 500 ms to answer /json/version. */
+const CDP_PROBE_TIMEOUT_MS = 1_500;
+/** After the launched process exits, how much longer a handed-off browser gets. */
+const EXITED_LAUNCHER_GRACE_MS = 3_000;
+const OUTPUT_TAIL_CHARS = 1_500;
+
+type LaunchEnd = { at: number; code: number | null; signal: string | null; error?: string };
+
+/**
+ * Follow a just-spawned browser: when it exits, and the last thing it said.
+ * It also drains both pipes. Chrome writes to stderr for as long as it runs
+ * (D-Bus and GPU complaints), and a pipe nobody reads fills up and blocks it.
+ */
+export function watchBrowserLaunch(proc: Pick<ChildProcess, "stdout" | "stderr" | "once">) {
+  let ended: LaunchEnd | null = null;
+  let tail = "";
+  const keep = (chunk: unknown) => {
+    tail = (tail + String(chunk)).slice(-OUTPUT_TAIL_CHARS);
+  };
+  proc.stdout?.on("data", keep);
+  proc.stderr?.on("data", keep);
+  proc.once("exit", (code, signal) => {
+    ended ??= { at: Date.now(), code, signal };
+  });
+  proc.once("error", (err) => {
+    ended ??= { at: Date.now(), code: null, signal: null, error: err.message };
+  });
+  return {
+    ended: (): LaunchEnd | null => ended,
+    outputTail: (): string => tail.trim(),
+  };
+}
+
+export function describeBrowserLaunchFailure(params: {
+  port: number;
+  profile: string;
+  executable: string;
+  ended: LaunchEnd | null;
+  output: string;
+  waitedMs: number;
+}): string {
+  const { ended } = params;
+  const what = ended?.error
+    ? `The browser could not be started: ${ended.error}.`
+    : ended
+      ? `The browser process exited (${
+          ended.signal ? `signal ${ended.signal}` : `code ${ended.code ?? "unknown"}`
+        }) before opening its debugging port.`
+      : `The browser did not open its debugging port within ${Math.round(params.waitedMs / 1000)}s.`;
+  // D-Bus noise (bus.cc, object_proxy.cc, ...) is on every Linux and WSL
+  // launch and explains nothing; an agent reading it blames D-Bus.
+  const lines = params.output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(
+      (line) => line && !/dbus\/|org\.freedesktop\.DBus|Failed to connect to the bus/.test(line),
+    );
+  const said = lines.length > 0 ? ` It said: ${lines.slice(-4).join(" | ").slice(0, 600)}` : "";
+  return (
+    `Failed to start Chrome CDP on port ${params.port} for profile "${params.profile}". ` +
+    `${what} Executable: ${params.executable}.${said} ` +
+    `If the executable is wrong, set browser.executablePath; if the profile is damaged, ` +
+    `run "bitterbot browser reset-profile".`
+  );
+}
+
+export async function stopBitterbotChrome(running: RunningChrome, timeoutMs = 2500) {
+  const proc = running.proc;
+  if (proc.killed) {
+    return;
+  }
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!proc.exitCode && proc.killed) {
+      break;
+    }
+    if (!(await isChromeReachable(cdpUrlForPort(running.cdpPort), 200))) {
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    // ignore
+  }
+}

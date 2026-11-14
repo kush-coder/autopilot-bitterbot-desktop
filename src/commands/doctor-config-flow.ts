@@ -1,0 +1,721 @@
+import type { ZodIssue } from "zod";
+import {
+  isNumericTelegramUserId,
+  normalizeTelegramAllowFromEntry,
+} from "../channels/telegram/allow-from.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import type { BitterbotConfig } from "../config/config.js";
+import {
+  BitterbotSchema,
+  CONFIG_PATH,
+  migrateLegacyConfig,
+  readConfigFileSnapshot,
+} from "../config/config.js";
+import { isFrozenFallbackPeerList } from "../config/defaults.js";
+import { findDeprecatedConfigKeys, markDeprecatedConfigKeysWarned } from "../config/io.js";
+import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import { getChildLogger } from "../logging/logger.js";
+import { listTelegramAccountIds, resolveTelegramAccount } from "../telegram/accounts.js";
+import { note } from "../terminal/note.js";
+import { isRecord } from "../utils.js";
+import { renderSection, warn } from "./doctor-check.js";
+import {
+  configUsesInclude,
+  json5HasComments,
+  locateConfigKey,
+  removeDeprecatedConfigKeys,
+} from "./doctor-deprecated-config.js";
+import { normalizeLegacyConfigValues } from "./doctor-legacy-config.js";
+import type { DoctorOptions } from "./doctor-prompter.js";
+
+type UnrecognizedKeysIssue = ZodIssue & {
+  code: "unrecognized_keys";
+  keys: PropertyKey[];
+};
+
+function normalizeIssuePath(path: PropertyKey[]): Array<string | number> {
+  return path.filter((part): part is string | number => typeof part !== "symbol");
+}
+
+function isUnrecognizedKeysIssue(issue: ZodIssue): issue is UnrecognizedKeysIssue {
+  return issue.code === "unrecognized_keys";
+}
+
+function formatPath(parts: Array<string | number>): string {
+  if (parts.length === 0) {
+    return "<root>";
+  }
+  let out = "";
+  for (const part of parts) {
+    if (typeof part === "number") {
+      out += `[${part}]`;
+      continue;
+    }
+    out = out ? `${out}.${part}` : part;
+  }
+  return out || "<root>";
+}
+
+function resolvePathTarget(root: unknown, path: Array<string | number>): unknown {
+  let current: unknown = root;
+  for (const part of path) {
+    if (typeof part === "number") {
+      if (!Array.isArray(current)) {
+        return null;
+      }
+      if (part < 0 || part >= current.length) {
+        return null;
+      }
+      current = current[part];
+      continue;
+    }
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      return null;
+    }
+    const record = current as Record<string, unknown>;
+    if (!(part in record)) {
+      return null;
+    }
+    current = record[part];
+  }
+  return current;
+}
+
+function stripUnknownConfigKeys(config: BitterbotConfig): {
+  config: BitterbotConfig;
+  removed: string[];
+} {
+  const parsed = BitterbotSchema.safeParse(config);
+  if (parsed.success) {
+    return { config, removed: [] };
+  }
+
+  const next = structuredClone(config);
+  const removed: string[] = [];
+  for (const issue of parsed.error.issues) {
+    if (!isUnrecognizedKeysIssue(issue)) {
+      continue;
+    }
+    const path = normalizeIssuePath(issue.path);
+    const target = resolvePathTarget(next, path);
+    if (!target || typeof target !== "object" || Array.isArray(target)) {
+      continue;
+    }
+    const record = target as Record<string, unknown>;
+    for (const key of issue.keys) {
+      if (typeof key !== "string") {
+        continue;
+      }
+      if (!(key in record)) {
+        continue;
+      }
+      delete record[key];
+      removed.push(formatPath([...path, key]));
+    }
+  }
+
+  return { config: next, removed };
+}
+
+function noteOpencodeProviderOverrides(cfg: BitterbotConfig) {
+  const providers = cfg.models?.providers;
+  if (!providers) {
+    return;
+  }
+
+  // 2026-01-10: warn when OpenCode Zen overrides mask built-in routing/costs (8a194b4abc360c6098f157956bb9322576b44d51, 2d105d16f8a099276114173836d46b46cdfbdbae).
+  const overrides: string[] = [];
+  if (providers.opencode) {
+    overrides.push("opencode");
+  }
+  if (providers["opencode-zen"]) {
+    overrides.push("opencode-zen");
+  }
+  if (overrides.length === 0) {
+    return;
+  }
+
+  const lines = overrides.flatMap((id) => {
+    const providerEntry = providers[id];
+    const api =
+      isRecord(providerEntry) && typeof providerEntry.api === "string"
+        ? providerEntry.api
+        : undefined;
+    return [
+      `- models.providers.${id} is set; this overrides the built-in OpenCode Zen catalog.`,
+      api ? `- models.providers.${id}.api=${api}` : null,
+    ].filter((line): line is string => Boolean(line));
+  });
+
+  lines.push(
+    "- Remove these entries to restore per-model API routing + costs (then re-run onboarding if needed).",
+  );
+
+  note(lines.join("\n"), "OpenCode Zen");
+}
+
+type TelegramAllowFromUsernameHit = { path: string; entry: string };
+
+function scanTelegramAllowFromUsernameEntries(
+  cfg: BitterbotConfig,
+): TelegramAllowFromUsernameHit[] {
+  const hits: TelegramAllowFromUsernameHit[] = [];
+  const telegram = cfg.channels?.telegram;
+  if (!telegram) {
+    return hits;
+  }
+
+  const scanList = (pathLabel: string, list: unknown) => {
+    if (!Array.isArray(list)) {
+      return;
+    }
+    for (const entry of list) {
+      const normalized = normalizeTelegramAllowFromEntry(entry);
+      if (!normalized || normalized === "*") {
+        continue;
+      }
+      if (isNumericTelegramUserId(normalized)) {
+        continue;
+      }
+      hits.push({ path: pathLabel, entry: String(entry).trim() });
+    }
+  };
+
+  const scanAccount = (prefix: string, account: Record<string, unknown>) => {
+    scanList(`${prefix}.allowFrom`, account.allowFrom);
+    scanList(`${prefix}.groupAllowFrom`, account.groupAllowFrom);
+    const groups = account.groups;
+    if (!groups || typeof groups !== "object" || Array.isArray(groups)) {
+      return;
+    }
+    const groupsRecord = groups as Record<string, unknown>;
+    for (const groupId of Object.keys(groupsRecord)) {
+      const group = groupsRecord[groupId];
+      if (!group || typeof group !== "object" || Array.isArray(group)) {
+        continue;
+      }
+      const groupRec = group as Record<string, unknown>;
+      scanList(`${prefix}.groups.${groupId}.allowFrom`, groupRec.allowFrom);
+      const topics = groupRec.topics;
+      if (!topics || typeof topics !== "object" || Array.isArray(topics)) {
+        continue;
+      }
+      const topicsRecord = topics as Record<string, unknown>;
+      for (const topicId of Object.keys(topicsRecord)) {
+        const topic = topicsRecord[topicId];
+        if (!topic || typeof topic !== "object" || Array.isArray(topic)) {
+          continue;
+        }
+        scanList(
+          `${prefix}.groups.${groupId}.topics.${topicId}.allowFrom`,
+          (topic as Record<string, unknown>).allowFrom,
+        );
+      }
+    }
+  };
+
+  scanAccount("channels.telegram", telegram as unknown as Record<string, unknown>);
+
+  const accounts = telegram.accounts;
+  if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) {
+    return hits;
+  }
+  for (const key of Object.keys(accounts)) {
+    const account = accounts[key];
+    if (!account || typeof account !== "object" || Array.isArray(account)) {
+      continue;
+    }
+    scanAccount(`channels.telegram.accounts.${key}`, account as Record<string, unknown>);
+  }
+
+  return hits;
+}
+
+async function maybeRepairTelegramAllowFromUsernames(cfg: BitterbotConfig): Promise<{
+  config: BitterbotConfig;
+  changes: string[];
+}> {
+  const hits = scanTelegramAllowFromUsernameEntries(cfg);
+  if (hits.length === 0) {
+    return { config: cfg, changes: [] };
+  }
+
+  const tokens = Array.from(
+    new Set(
+      listTelegramAccountIds(cfg)
+        .map((accountId) => resolveTelegramAccount({ cfg, accountId }))
+        .map((account) => (account.tokenSource === "none" ? "" : account.token))
+        .map((token) => token.trim())
+        .filter(Boolean),
+    ),
+  );
+
+  if (tokens.length === 0) {
+    return {
+      config: cfg,
+      changes: [
+        `- Telegram allowFrom contains @username entries, but no Telegram bot token is configured; cannot auto-resolve (run onboarding or replace with numeric sender IDs).`,
+      ],
+    };
+  }
+
+  const resolveUserId = async (raw: string): Promise<string | null> => {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const stripped = normalizeTelegramAllowFromEntry(trimmed);
+    if (!stripped || stripped === "*") {
+      return null;
+    }
+    if (isNumericTelegramUserId(stripped)) {
+      return stripped;
+    }
+    if (/\s/.test(stripped)) {
+      return null;
+    }
+    const username = stripped.startsWith("@") ? stripped : `@${stripped}`;
+    for (const token of tokens) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      try {
+        const url = `https://api.telegram.org/bot${token}/getChat?chat_id=${encodeURIComponent(username)}`;
+        const res = await fetch(url, { signal: controller.signal }).catch(() => null);
+        if (!res || !res.ok) {
+          continue;
+        }
+        const data = (await res.json().catch(() => null)) as {
+          ok?: boolean;
+          result?: { id?: number | string };
+        } | null;
+        const id = data?.ok ? data?.result?.id : undefined;
+        if (typeof id === "number" || typeof id === "string") {
+          return String(id);
+        }
+      } catch {
+        // ignore and try next token
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    return null;
+  };
+
+  const changes: string[] = [];
+  const next = structuredClone(cfg);
+
+  const repairList = async (pathLabel: string, holder: Record<string, unknown>, key: string) => {
+    const raw = holder[key];
+    if (!Array.isArray(raw)) {
+      return;
+    }
+    const out: Array<string | number> = [];
+    const replaced: Array<{ from: string; to: string }> = [];
+    for (const entry of raw) {
+      const normalized = normalizeTelegramAllowFromEntry(entry);
+      if (!normalized) {
+        continue;
+      }
+      if (normalized === "*") {
+        out.push("*");
+        continue;
+      }
+      if (isNumericTelegramUserId(normalized)) {
+        out.push(normalized);
+        continue;
+      }
+      const resolved = await resolveUserId(String(entry));
+      if (resolved) {
+        out.push(resolved);
+        replaced.push({ from: String(entry).trim(), to: resolved });
+      } else {
+        out.push(String(entry).trim());
+      }
+    }
+    const deduped: Array<string | number> = [];
+    const seen = new Set<string>();
+    for (const entry of out) {
+      const k = String(entry).trim();
+      if (!k || seen.has(k)) {
+        continue;
+      }
+      seen.add(k);
+      deduped.push(entry);
+    }
+    holder[key] = deduped;
+    if (replaced.length > 0) {
+      for (const rep of replaced.slice(0, 5)) {
+        changes.push(`- ${pathLabel}: resolved ${rep.from} -> ${rep.to}`);
+      }
+      if (replaced.length > 5) {
+        changes.push(`- ${pathLabel}: resolved ${replaced.length - 5} more @username entries`);
+      }
+    }
+  };
+
+  const repairAccount = async (prefix: string, account: Record<string, unknown>) => {
+    await repairList(`${prefix}.allowFrom`, account, "allowFrom");
+    await repairList(`${prefix}.groupAllowFrom`, account, "groupAllowFrom");
+    const groups = account.groups;
+    if (!groups || typeof groups !== "object" || Array.isArray(groups)) {
+      return;
+    }
+    const groupsRecord = groups as Record<string, unknown>;
+    for (const groupId of Object.keys(groupsRecord)) {
+      const group = groupsRecord[groupId];
+      if (!group || typeof group !== "object" || Array.isArray(group)) {
+        continue;
+      }
+      const groupRec = group as Record<string, unknown>;
+      await repairList(`${prefix}.groups.${groupId}.allowFrom`, groupRec, "allowFrom");
+      const topics = groupRec.topics;
+      if (!topics || typeof topics !== "object" || Array.isArray(topics)) {
+        continue;
+      }
+      const topicsRecord = topics as Record<string, unknown>;
+      for (const topicId of Object.keys(topicsRecord)) {
+        const topic = topicsRecord[topicId];
+        if (!topic || typeof topic !== "object" || Array.isArray(topic)) {
+          continue;
+        }
+        await repairList(
+          `${prefix}.groups.${groupId}.topics.${topicId}.allowFrom`,
+          topic as Record<string, unknown>,
+          "allowFrom",
+        );
+      }
+    }
+  };
+
+  const telegram = next.channels?.telegram;
+  if (telegram && typeof telegram === "object" && !Array.isArray(telegram)) {
+    await repairAccount("channels.telegram", telegram as unknown as Record<string, unknown>);
+    const accounts = (telegram as Record<string, unknown>).accounts;
+    if (accounts && typeof accounts === "object" && !Array.isArray(accounts)) {
+      for (const key of Object.keys(accounts as Record<string, unknown>)) {
+        const account = (accounts as Record<string, unknown>)[key];
+        if (!account || typeof account !== "object" || Array.isArray(account)) {
+          continue;
+        }
+        await repairAccount(
+          `channels.telegram.accounts.${key}`,
+          account as Record<string, unknown>,
+        );
+      }
+    }
+  }
+
+  if (changes.length === 0) {
+    return { config: cfg, changes: [] };
+  }
+  return { config: next, changes };
+}
+
+export type DoctorConfigOutput = "doctor" | "guard" | "summary" | "silent";
+
+/** "5 settings in your config are deprecated (still accepted this release, ...)". */
+export function deprecatedConfigSummaryLine(count: number): string {
+  return `${count} setting${count === 1 ? " in your config is" : "s in your config are"} deprecated (still accepted this release, removed next release). Tidy ${count === 1 ? "it" : "them"} with: ${formatCliCommand("bitterbot doctor --fix")}`;
+}
+
+export async function loadAndMaybeMigrateDoctorConfig(params: {
+  options: DoctorOptions;
+  confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
+  /**
+   * How much to print. "doctor" (default): everything. "guard" (the config
+   * check before other commands): deprecated keys as one line instead of a
+   * box. "summary" (the installer's first command): one line in total.
+   * "silent" (the installer's later commands): nothing. Errors that stop a
+   * command are printed by the caller either way.
+   */
+  output?: DoctorConfigOutput;
+  /** Where the one-line summaries go (default: console.log). */
+  log?: (line: string) => void;
+}) {
+  const shouldRepair = params.options.repair === true || params.options.yes === true;
+  const output = params.output ?? "doctor";
+  const quiet = output === "summary" || output === "silent";
+  const logLine = params.log ?? ((line: string) => console.log(line));
+  /** Titles of the notes a quiet run did not print (summarised at the end). */
+  const suppressed: string[] = [];
+  const show: typeof note = (message, title) => {
+    if (quiet) {
+      suppressed.push(title ?? "");
+      return;
+    }
+    note(message, title);
+  };
+  const section: typeof renderSection = (...args) => {
+    if (quiet) {
+      suppressed.push("Config");
+      return;
+    }
+    renderSection(...args);
+  };
+  /** "Doctor changes" notes about deprecated keys (summarised by their own line). */
+  let deprecatedNotes = 0;
+
+  let snapshot = await readConfigFileSnapshot();
+  const baseCfg = snapshot.config ?? {};
+  let cfg: BitterbotConfig = baseCfg;
+  let candidate = structuredClone(baseCfg);
+  let pendingChanges = false;
+  let shouldWriteConfig = false;
+  const fixHints: string[] = [];
+  if (snapshot.exists && !snapshot.valid && snapshot.legacyIssues.length === 0) {
+    show("Config invalid; doctor will run with best-effort config.", "Config");
+  }
+  const warnings = snapshot.warnings ?? [];
+  if (warnings.length > 0) {
+    const lines = warnings.map((issue) => `- ${issue.path}: ${issue.message}`).join("\n");
+    show(lines, "Config warnings");
+  }
+
+  if (snapshot.legacyIssues.length > 0) {
+    show(
+      snapshot.legacyIssues.map((issue) => `- ${issue.path}: ${issue.message}`).join("\n"),
+      "Legacy config keys detected",
+    );
+    const { config: migrated, changes } = migrateLegacyConfig(snapshot.parsed);
+    if (changes.length > 0) {
+      show(changes.join("\n"), "Doctor changes");
+    }
+    if (migrated) {
+      candidate = migrated;
+      pendingChanges = pendingChanges || changes.length > 0;
+    }
+    if (shouldRepair) {
+      // Legacy migration (2026-01-02, commit: 16420e5b) — normalize per-provider allowlists; move WhatsApp gating into channels.whatsapp.allowFrom.
+      if (migrated) {
+        cfg = migrated;
+      }
+    } else {
+      fixHints.push(
+        `Run "${formatCliCommand("bitterbot doctor --fix")}" to apply legacy migrations.`,
+      );
+    }
+  }
+
+  const normalized = normalizeLegacyConfigValues(candidate);
+  if (normalized.changes.length > 0) {
+    show(normalized.changes.join("\n"), "Doctor changes");
+    candidate = normalized.config;
+    pendingChanges = true;
+    if (shouldRepair) {
+      cfg = normalized.config;
+    } else {
+      fixHints.push(`Run "${formatCliCommand("bitterbot doctor --fix")}" to apply these changes.`);
+    }
+  }
+
+  // PLAN-56: deprecated keys, by exact path, as a finding (so `doctor --json`
+  // and the update gate see them); the inert ones are removed on repair.
+  // Never auto-written when the config uses $include: a write re-serialises
+  // the root file with the included content inlined (drift-pass HIGH-1).
+  let deprecatedOnlyChanges = false;
+  const deprecatedHits = findDeprecatedConfigKeys(snapshot.resolved);
+  if (deprecatedHits.length > 0 && output !== "doctor") {
+    // The key names still go to the log file; the terminal gets one line.
+    getChildLogger({ subsystem: "config" }).warn(
+      `deprecated config keys: ${deprecatedHits.map((hit) => `${hit.path} (${hit.reason})`).join("; ")}`,
+    );
+  }
+  if (deprecatedHits.length > 0 && output === "guard") {
+    // One line before any command; the keys are not repeated when the
+    // config loads (doctor lists them).
+    markDeprecatedConfigKeysWarned(deprecatedHits.map((hit) => hit.path));
+    logLine(deprecatedConfigSummaryLine(deprecatedHits.length));
+  } else if (deprecatedHits.length > 0) {
+    const usesInclude = configUsesInclude(snapshot.parsed);
+    section("Config", [
+      warn(
+        [
+          "Deprecated config keys (accepted this release, removed next release):",
+          ...deprecatedHits.map((hit) => {
+            const file = usesInclude ? locateConfigKey(snapshot.parsed, hit.path) : null;
+            return `- ${hit.path}${file ? ` (in ${file})` : ""}: ${hit.reason}`;
+          }),
+          ...(usesInclude
+            ? [
+                "This config uses $include, so doctor will not rewrite it: remove these keys by hand.",
+              ]
+            : []),
+        ].join("\n"),
+      ),
+    ]);
+    const removal = usesInclude
+      ? { config: candidate, changes: [] }
+      : removeDeprecatedConfigKeys(candidate, deprecatedHits, { applied: shouldRepair });
+    if (removal.changes.length > 0) {
+      const changeLines = [...removal.changes];
+      if (json5HasComments(snapshot.raw)) {
+        changeLines.push(
+          `- Note: ${snapshot.path ?? CONFIG_PATH} has comments; applying this rewrites the file without them (the previous file is kept as .bak).`,
+        );
+      }
+      show(changeLines.join("\n"), "Doctor changes");
+      deprecatedNotes += 1;
+      candidate = removal.config;
+      deprecatedOnlyChanges = !pendingChanges;
+      pendingChanges = true;
+      if (shouldRepair) {
+        cfg = removal.config;
+      } else {
+        fixHints.push(
+          `Run "${formatCliCommand("bitterbot doctor --fix")}" to remove the deprecated keys.`,
+        );
+      }
+    }
+  }
+
+  // Drift-pass HIGH-2: an older config write could freeze the built-in
+  // fallback bootstrap peers into the file. They load as unset now; --fix
+  // removes them so the file no longer pins the list.
+  const filePeers = (snapshot.resolved as { p2p?: { bootstrapPeers?: unknown } } | undefined)?.p2p
+    ?.bootstrapPeers;
+  if (isFrozenFallbackPeerList(filePeers)) {
+    const usesInclude = configUsesInclude(snapshot.parsed);
+    const where = usesInclude ? locateConfigKey(snapshot.parsed, "p2p.bootstrapPeers") : null;
+    section("Config", [
+      warn(
+        [
+          `p2p.bootstrapPeers${where ? ` (in ${where})` : ""} holds exactly the built-in fallback peers, frozen into the file by an older config write. It loads as unset, but the file should not pin the list.`,
+          usesInclude
+            ? "This config uses $include, so doctor will not rewrite it: remove the key by hand."
+            : `Run "${formatCliCommand("bitterbot doctor --fix")}" to remove it.`,
+        ].join("\n"),
+      ),
+    ]);
+    if (!usesInclude) {
+      const next = structuredClone(candidate) as BitterbotConfig & {
+        p2p?: Record<string, unknown>;
+      };
+      if (next.p2p) {
+        delete next.p2p.bootstrapPeers;
+      }
+      show(
+        `- ${shouldRepair ? "Removed" : "Would remove"} p2p.bootstrapPeers (the frozen built-in fallback list).`,
+        "Doctor changes",
+      );
+      candidate = next;
+      deprecatedOnlyChanges = !pendingChanges || deprecatedOnlyChanges;
+      pendingChanges = true;
+      if (shouldRepair) {
+        cfg = next;
+      }
+    }
+  }
+
+  const autoEnable = applyPluginAutoEnable({ config: candidate, env: process.env });
+  if (autoEnable.changes.length > 0) {
+    show(autoEnable.changes.join("\n"), "Doctor changes");
+    candidate = autoEnable.config;
+    pendingChanges = true;
+    deprecatedOnlyChanges = false;
+    if (shouldRepair) {
+      cfg = autoEnable.config;
+    } else {
+      fixHints.push(`Run "${formatCliCommand("bitterbot doctor --fix")}" to apply these changes.`);
+    }
+  }
+
+  if (shouldRepair) {
+    const repair = await maybeRepairTelegramAllowFromUsernames(candidate);
+    if (repair.changes.length > 0) {
+      show(repair.changes.join("\n"), "Doctor changes");
+      candidate = repair.config;
+      pendingChanges = true;
+      deprecatedOnlyChanges = false;
+      cfg = repair.config;
+    }
+  } else {
+    const hits = scanTelegramAllowFromUsernameEntries(candidate);
+    if (hits.length > 0) {
+      show(
+        [
+          `- Telegram allowFrom contains ${hits.length} non-numeric entries (e.g. ${hits[0]?.entry ?? "@"}); Telegram authorization requires numeric sender IDs.`,
+          `- Run "${formatCliCommand("bitterbot doctor --fix")}" to auto-resolve @username entries to numeric IDs (requires a Telegram bot token).`,
+        ].join("\n"),
+        "Doctor warnings",
+      );
+    }
+  }
+
+  const unknown = stripUnknownConfigKeys(candidate);
+  if (unknown.removed.length > 0) {
+    const lines = unknown.removed.map((path) => `- ${path}`).join("\n");
+    candidate = unknown.config;
+    pendingChanges = true;
+    deprecatedOnlyChanges = false;
+    if (shouldRepair) {
+      cfg = unknown.config;
+      show(lines, "Doctor changes");
+    } else {
+      show(lines, "Unknown config keys");
+      fixHints.push('Run "bitterbot doctor --fix" to remove these keys.');
+    }
+  }
+
+  if (!shouldRepair && pendingChanges) {
+    // Removing deprecated keys alone is never urgent (they still load this
+    // release), so that prompt defaults to no; --fix applies it.
+    const shouldApply = await params.confirm({
+      message: deprecatedOnlyChanges
+        ? "Remove the deprecated config keys now?"
+        : "Apply recommended config repairs now?",
+      initialValue: !deprecatedOnlyChanges,
+    });
+    if (shouldApply) {
+      cfg = candidate;
+      shouldWriteConfig = true;
+    } else if (fixHints.length > 0) {
+      show(fixHints.join("\n"), "Doctor");
+    }
+  }
+
+  if (output === "summary") {
+    // One short line per kind of finding, so the deprecated-keys line never
+    // hides a warning that matters.
+    if (deprecatedHits.length > 0) {
+      markDeprecatedConfigKeysWarned(deprecatedHits.map((hit) => hit.path));
+      logLine(deprecatedConfigSummaryLine(deprecatedHits.length));
+    }
+    const count = (title: string) => suppressed.filter((t) => t === title).length;
+    if (count("Config warnings") > 0) {
+      logLine(`Your config has warnings. See them with: ${formatCliCommand("bitterbot doctor")}`);
+    }
+    if (count("Doctor warnings") > 0) {
+      logLine(
+        `A channel setting needs attention (for example Telegram allowFrom entries that authorize no one). See: ${formatCliCommand("bitterbot doctor")}`,
+      );
+    }
+    if (count("Unknown config keys") > 0) {
+      logLine(
+        `Your config has keys Bitterbot does not know (ignored). Remove them with: ${formatCliCommand("bitterbot doctor --fix")}`,
+      );
+    }
+    const other =
+      suppressed.filter(
+        (t) =>
+          t !== "Config warnings" &&
+          t !== "Doctor warnings" &&
+          t !== "Unknown config keys" &&
+          // An invalid config is reported by the caller; findings with a
+          // "Config" box also add their own fix note (counted here).
+          t !== "Config" &&
+          t !== "Doctor",
+      ).length - deprecatedNotes;
+    if (other > 0) {
+      logLine(
+        `Your config has suggested fixes. Apply them with: ${formatCliCommand("bitterbot doctor --fix")}`,
+      );
+    }
+  } else if (output === "silent") {
+    markDeprecatedConfigKeysWarned(deprecatedHits.map((hit) => hit.path));
+  }
+  if (!quiet) {
+    noteOpencodeProviderOverrides(cfg);
+  }
+
+  return { cfg, path: snapshot.path ?? CONFIG_PATH, shouldWriteConfig };
+}

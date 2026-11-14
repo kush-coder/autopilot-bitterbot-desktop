@@ -1,0 +1,185 @@
+import { formatCliCommand } from "../../cli/command-format.js";
+import type { BitterbotConfig } from "../../config/config.js";
+import { resolveGatewayPort, writeConfigFile } from "../../config/config.js";
+import { logConfigUpdated } from "../../config/logging.js";
+import type { TemperamentLevel } from "../../memory/genome-parser.js";
+import type { RuntimeEnv } from "../../runtime.js";
+import { DEFAULT_GATEWAY_DAEMON_RUNTIME } from "../daemon-runtime.js";
+import { healthCommand } from "../health.js";
+import { applyOnboardingLocalWorkspaceConfig } from "../onboard-config.js";
+import {
+  applyWizardMetadata,
+  DEFAULT_WORKSPACE,
+  ensureWorkspaceAndSessions,
+  resolveControlUiLinks,
+  waitForGatewayReachable,
+} from "../onboard-helpers.js";
+import type { OnboardOptions } from "../onboard-types.js";
+import { inferAuthChoiceFromFlags } from "./local/auth-choice-inference.js";
+import { applyNonInteractiveAuthChoice } from "./local/auth-choice.js";
+import { installGatewayDaemonNonInteractive } from "./local/daemon-install.js";
+import { applyNonInteractiveGatewayConfig } from "./local/gateway-config.js";
+import { logNonInteractiveOnboardingJson } from "./local/output.js";
+import { applyNonInteractiveSkillsConfig } from "./local/skills-config.js";
+import { resolveNonInteractiveWorkspaceDir } from "./local/workspace.js";
+
+export async function runNonInteractiveOnboardingLocal(params: {
+  opts: OnboardOptions;
+  runtime: RuntimeEnv;
+  baseConfig: BitterbotConfig;
+}) {
+  const { opts, runtime, baseConfig } = params;
+  const mode = "local" as const;
+
+  const workspaceDir = resolveNonInteractiveWorkspaceDir({
+    opts,
+    baseConfig,
+    defaultWorkspaceDir: DEFAULT_WORKSPACE,
+  });
+
+  let nextConfig: BitterbotConfig = applyOnboardingLocalWorkspaceConfig(baseConfig, workspaceDir);
+
+  const inferredAuthChoice = inferAuthChoiceFromFlags(opts);
+  if (!opts.authChoice && inferredAuthChoice.matches.length > 1) {
+    runtime.error(
+      [
+        "Multiple API key flags were provided for non-interactive onboarding.",
+        "Use a single provider flag or pass --auth-choice explicitly.",
+        `Flags: ${inferredAuthChoice.matches.map((match) => match.label).join(", ")}`,
+      ].join("\n"),
+    );
+    runtime.exit(1);
+    return;
+  }
+  const authChoice = opts.authChoice ?? inferredAuthChoice.choice ?? "skip";
+  const nextConfigAfterAuth = await applyNonInteractiveAuthChoice({
+    nextConfig,
+    authChoice,
+    opts,
+    runtime,
+    baseConfig,
+  });
+  if (!nextConfigAfterAuth) {
+    return;
+  }
+  nextConfig = nextConfigAfterAuth;
+
+  // The vibe (GENOME.md Temperament level): --vibe, else the recommended one.
+  let vibe: TemperamentLevel | undefined;
+  // PLAN-56 Phase 4: the rest of setup is the shared step model with every
+  // recommended answer (what the "recommended defaults" fork accepts). With
+  // no auth flag, the model credential is one already found (a saved sign-in
+  // or key for the configured model's provider first); flags keep the
+  // provider they chose. A configured primary model is always kept, and a
+  // key found only in the process environment is used in place, never
+  // copied into a file.
+  {
+    const { commitSetupKey, createSetupDraft, runSetupSteps, vibeLevelOf } =
+      await import("../../wizard/setup-steps.js");
+    const { detectSetupKeys, detectSignedInProfiles } = await import("../../wizard/setup-keys.js");
+    const ctx = {
+      effective: baseConfig,
+      keys: detectSetupKeys(),
+      profiles: detectSignedInProfiles(),
+      keyEnv: {},
+      installKind: "unknown" as const,
+      env: process.env,
+    };
+    const draft = createSetupDraft(nextConfig);
+    const authFromFlags = authChoice !== "skip";
+    await runSetupSteps({
+      ctx,
+      draft,
+      presets: {
+        ...(authFromFlags ? { auth: "skip", model: "keep" } : {}),
+        ...(opts.vibe ? { vibe: opts.vibe } : {}),
+      },
+    });
+    vibe = vibeLevelOf(draft.answers.vibe);
+    await commitSetupKey(draft, ctx, { persistEnvironmentKey: false });
+    nextConfig = draft.config;
+    if (!authFromFlags && draft.answers.auth && draft.answers.auth !== "skip" && !opts.json) {
+      runtime.log(
+        draft.answers.auth.startsWith("env:")
+          ? `Model key: ${draft.answers.auth.slice(4)} from the environment (used in place, not saved)`
+          : `Model key: ${draft.answers.auth}`,
+      );
+    }
+    for (const notice of draft.notices) {
+      runtime.log(notice);
+    }
+  }
+
+  const gatewayBasePort = resolveGatewayPort(baseConfig);
+  const gatewayResult = applyNonInteractiveGatewayConfig({
+    nextConfig,
+    opts,
+    runtime,
+    defaultPort: gatewayBasePort,
+  });
+  if (!gatewayResult) {
+    return;
+  }
+  nextConfig = gatewayResult.nextConfig;
+
+  nextConfig = applyNonInteractiveSkillsConfig({ nextConfig, opts, runtime });
+
+  nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
+  await writeConfigFile(nextConfig);
+  // A browser setup abandoned halfway is finished now.
+  (await import("../../gateway/setup-token.js")).clearSetupInProgress();
+  logConfigUpdated(runtime);
+
+  await ensureWorkspaceAndSessions(workspaceDir, runtime, {
+    skipBootstrap: Boolean(nextConfig.agents?.defaults?.skipBootstrap),
+    vibe,
+  });
+
+  await installGatewayDaemonNonInteractive({
+    nextConfig,
+    opts,
+    runtime,
+    port: gatewayResult.port,
+    gatewayToken: gatewayResult.gatewayToken,
+  });
+
+  const daemonRuntimeRaw = opts.daemonRuntime ?? DEFAULT_GATEWAY_DAEMON_RUNTIME;
+  if (!opts.skipHealth) {
+    const links = resolveControlUiLinks({
+      bind: gatewayResult.bind as "auto" | "lan" | "loopback" | "custom" | "tailnet",
+      port: gatewayResult.port,
+      customBindHost: nextConfig.gateway?.customBindHost,
+      basePath: undefined,
+    });
+    await waitForGatewayReachable({
+      url: links.wsUrl,
+      token: gatewayResult.gatewayToken,
+      deadlineMs: 15_000,
+    });
+    await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
+  }
+
+  logNonInteractiveOnboardingJson({
+    opts,
+    runtime,
+    mode,
+    workspaceDir,
+    authChoice,
+    gateway: {
+      port: gatewayResult.port,
+      bind: gatewayResult.bind,
+      authMode: gatewayResult.authMode,
+      tailscaleMode: gatewayResult.tailscaleMode,
+    },
+    installDaemon: Boolean(opts.installDaemon),
+    daemonRuntime: opts.installDaemon ? daemonRuntimeRaw : undefined,
+    skipSkills: Boolean(opts.skipSkills),
+    skipHealth: Boolean(opts.skipHealth),
+  });
+
+  if (!opts.json) {
+    runtime.log(
+      `Tip: run \`${formatCliCommand("bitterbot configure --section web")}\` to store your Brave API key for web_search. Docs: https://docs.bitterbot.ai/tools/web`,
+    );
+  }
+}

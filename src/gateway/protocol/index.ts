@@ -1,0 +1,759 @@
+import AjvPkg, { type ErrorObject } from "ajv";
+import type { SessionsPatchResult } from "../session-utils.types.js";
+import {
+  type AgentEvent,
+  AgentEventSchema,
+  type AgentIdentityParams,
+  AgentIdentityParamsSchema,
+  type AgentIdentityResult,
+  AgentIdentityResultSchema,
+  AgentParamsSchema,
+  type AgentSummary,
+  AgentSummarySchema,
+  type AgentsFileEntry,
+  AgentsFileEntrySchema,
+  type AgentsCreateParams,
+  AgentsCreateParamsSchema,
+  type AgentsCreateResult,
+  AgentsCreateResultSchema,
+  type AgentsUpdateParams,
+  AgentsUpdateParamsSchema,
+  type AgentsUpdateResult,
+  AgentsUpdateResultSchema,
+  type AgentsDeleteParams,
+  AgentsDeleteParamsSchema,
+  type AgentsDeleteResult,
+  AgentsDeleteResultSchema,
+  type AgentsFilesGetParams,
+  AgentsFilesGetParamsSchema,
+  type AgentsFilesGetResult,
+  AgentsFilesGetResultSchema,
+  type AgentsFilesListParams,
+  AgentsFilesListParamsSchema,
+  type AgentsFilesListResult,
+  AgentsFilesListResultSchema,
+  type AgentsFilesSetParams,
+  AgentsFilesSetParamsSchema,
+  type AgentsFilesSetResult,
+  AgentsFilesSetResultSchema,
+  type AgentsListParams,
+  AgentsListParamsSchema,
+  type AgentsListResult,
+  AgentsListResultSchema,
+  type AgentWaitParams,
+  AgentWaitParamsSchema,
+  type ChannelsLogoutParams,
+  ChannelsLogoutParamsSchema,
+  type ChannelsUpdateParams,
+  ChannelsUpdateParamsSchema,
+  type ChannelsValidateParams,
+  ChannelsValidateParamsSchema,
+  type ChannelsConfigureParams,
+  ChannelsConfigureParamsSchema,
+  type TalkConfigParams,
+  TalkConfigParamsSchema,
+  type TalkConfigResult,
+  TalkConfigResultSchema,
+  type ChannelsStatusParams,
+  ChannelsStatusParamsSchema,
+  type ChannelsStatusResult,
+  ChannelsStatusResultSchema,
+  type ChatAbortParams,
+  ChatAbortParamsSchema,
+  type ChatEvent,
+  ChatEventSchema,
+  ChatHistoryParamsSchema,
+  type ChatInjectParams,
+  ChatInjectParamsSchema,
+  ChatSendParamsSchema,
+  type ConfigApplyParams,
+  ConfigApplyParamsSchema,
+  type ConfigGetParams,
+  ConfigGetParamsSchema,
+  type ConfigPatchParams,
+  ConfigPatchParamsSchema,
+  type ConfigSchemaParams,
+  ConfigSchemaParamsSchema,
+  type ConfigSchemaResponse,
+  ConfigSchemaResponseSchema,
+  type ConfigSetParams,
+  ConfigSetParamsSchema,
+  type ConnectParams,
+  ConnectParamsSchema,
+  type DevicePairApproveParams,
+  DevicePairApproveParamsSchema,
+  type DevicePairListParams,
+  DevicePairListParamsSchema,
+  type DevicePairRejectParams,
+  DevicePairRejectParamsSchema,
+  type DeviceTokenRevokeParams,
+  DeviceTokenRevokeParamsSchema,
+  type DeviceTokenRotateParams,
+  DeviceTokenRotateParamsSchema,
+  type ExecApprovalsGetParams,
+  ExecApprovalsGetParamsSchema,
+  type ExecApprovalsNodeGetParams,
+  ExecApprovalsNodeGetParamsSchema,
+  type ExecApprovalsNodeSetParams,
+  ExecApprovalsNodeSetParamsSchema,
+  type ExecApprovalsSetParams,
+  ExecApprovalsSetParamsSchema,
+  type ExecApprovalsSnapshot,
+  type ExecApprovalRequestParams,
+  ExecApprovalRequestParamsSchema,
+  type ExecApprovalResolveParams,
+  ExecApprovalResolveParamsSchema,
+  ErrorCodes,
+  type ErrorShape,
+  ErrorShapeSchema,
+  type EventFrame,
+  EventFrameSchema,
+  errorShape,
+  type GatewayFrame,
+  GatewayFrameSchema,
+  type HelloOk,
+  HelloOkSchema,
+  type LogsTailParams,
+  LogsTailParamsSchema,
+  type LogsTailResult,
+  LogsTailResultSchema,
+  type ModelsAuthDeleteParams,
+  ModelsAuthDeleteParamsSchema,
+  type ModelsAuthListParams,
+  ModelsAuthListParamsSchema,
+  type ModelsAuthSetParams,
+  ModelsAuthSetParamsSchema,
+  type ModelsAuthTestParams,
+  ModelsAuthTestParamsSchema,
+  type ModelsListParams,
+  ModelsListParamsSchema,
+  type ModelsSetDefaultParams,
+  ModelsSetDefaultParamsSchema,
+  type NodeDescribeParams,
+  NodeDescribeParamsSchema,
+  type NodeEventParams,
+  NodeEventParamsSchema,
+  type NodeInvokeParams,
+  NodeInvokeParamsSchema,
+  type NodeInvokeResultParams,
+  NodeInvokeResultParamsSchema,
+  type NodeListParams,
+  NodeListParamsSchema,
+  type NodePairApproveParams,
+  NodePairApproveParamsSchema,
+  type NodePairListParams,
+  NodePairListParamsSchema,
+  type NodePairRejectParams,
+  NodePairRejectParamsSchema,
+  type NodePairRequestParams,
+  NodePairRequestParamsSchema,
+  type NodePairVerifyParams,
+  NodePairVerifyParamsSchema,
+  type NodeRenameParams,
+  NodeRenameParamsSchema,
+  type PollParams,
+  PollParamsSchema,
+  PROTOCOL_VERSION,
+  type PresenceEntry,
+  PresenceEntrySchema,
+  ProtocolSchemas,
+  type RequestFrame,
+  RequestFrameSchema,
+  type ResponseFrame,
+  ResponseFrameSchema,
+  SendParamsSchema,
+  type SessionsCompactParams,
+  SessionsCompactParamsSchema,
+  type SessionsDeleteParams,
+  SessionsDeleteParamsSchema,
+  type SessionsListParams,
+  SessionsListParamsSchema,
+  type SessionsPatchParams,
+  SessionsPatchParamsSchema,
+  type SessionsPreviewParams,
+  SessionsPreviewParamsSchema,
+  type SessionsResetParams,
+  SessionsResetParamsSchema,
+  type SessionsResolveParams,
+  SessionsResolveParamsSchema,
+  type SessionsUsageParams,
+  SessionsUsageParamsSchema,
+  type UsageLedgerEventsParams,
+  UsageLedgerEventsParamsSchema,
+  type UsageLedgerExplainParams,
+  UsageLedgerExplainParamsSchema,
+  type UsageLedgerSummaryParams,
+  UsageLedgerSummaryParamsSchema,
+  type UsageLedgerWhatIfParams,
+  UsageLedgerWhatIfParamsSchema,
+  type ShutdownEvent,
+  ShutdownEventSchema,
+  type SkillsBinsParams,
+  SkillsBinsParamsSchema,
+  type SkillsBinsResult,
+  type SkillsCreateParams,
+  SkillsCreateParamsSchema,
+  type SkillsInstallParams,
+  SkillsInstallParamsSchema,
+  type SkillsManageParams,
+  SkillsManageParamsSchema,
+  type SkillsManageResult,
+  SkillsManageResultSchema,
+  type SkillsMetricsParams,
+  SkillsMetricsParamsSchema,
+  type SkillsMetricsResult,
+  type SkillsEvolutionCorpusReviewParams,
+  SkillsEvolutionCorpusReviewParamsSchema,
+  type SkillsEvolutionFeedbackParams,
+  SkillsEvolutionFeedbackParamsSchema,
+  type SkillsEvolutionCalibrationExportParams,
+  SkillsEvolutionCalibrationExportParamsSchema,
+  type SkillsEvolutionCalibrationScoreParams,
+  SkillsEvolutionCalibrationScoreParamsSchema,
+  type SkillsPromoteParams,
+  SkillsPromoteParamsSchema,
+  type SkillsPromoteResult,
+  SkillsPromoteResultSchema,
+  type SkillsPublishParams,
+  SkillsPublishParamsSchema,
+  type SkillsPublishResult,
+  type SkillsRollbackParams,
+  SkillsRollbackParamsSchema,
+  type SkillsRollbackResult,
+  SkillsRollbackResultSchema,
+  type SkillsStatusParams,
+  SkillsStatusParamsSchema,
+  type SkillsUpdateAgentFilterParams,
+  SkillsUpdateAgentFilterParamsSchema,
+  type SkillsUpdateAgentFilterResult,
+  type SkillsUpdateParams,
+  SkillsUpdateParamsSchema,
+  type SkillsUpdateTrustSettingsParams,
+  SkillsUpdateTrustSettingsParamsSchema,
+  type SkillsUpdateTrustSettingsResult,
+  type SkillsUploadAgentskillsParams,
+  SkillsUploadAgentskillsParamsSchema,
+  type SkillsUploadAgentskillsResult,
+  type SkillsValidateParams,
+  SkillsValidateParamsSchema,
+  type SkillsValidateResult,
+  type Snapshot,
+  SnapshotSchema,
+  type GatewayRuntime,
+  GatewayRuntimeSchema,
+  type StateVersion,
+  StateVersionSchema,
+  type TalkModeParams,
+  TalkModeParamsSchema,
+  type TickEvent,
+  TickEventSchema,
+  type UpdateCheckParams,
+  UpdateCheckParamsSchema,
+  type UpdateRunParams,
+  UpdateRunParamsSchema,
+  type WakeParams,
+  WakeParamsSchema,
+  type WebLoginStartParams,
+  WebLoginStartParamsSchema,
+  type WebLoginWaitParams,
+  WebLoginWaitParamsSchema,
+  type WizardCancelParams,
+  WizardCancelParamsSchema,
+  type WizardNextParams,
+  WizardNextParamsSchema,
+  type WizardNextResult,
+  WizardNextResultSchema,
+  type WizardStartParams,
+  WizardStartParamsSchema,
+  type WizardStartResult,
+  WizardStartResultSchema,
+  type WizardStatusParams,
+  WizardStatusParamsSchema,
+  type WizardStatusResult,
+  WizardStatusResultSchema,
+  type WizardStep,
+  WizardStepSchema,
+} from "./schema.js";
+
+const ajv = new (AjvPkg as unknown as new (opts?: object) => import("ajv").default)({
+  allErrors: true,
+  strict: false,
+  removeAdditional: false,
+});
+
+export const validateConnectParams = ajv.compile<ConnectParams>(ConnectParamsSchema);
+export const validateRequestFrame = ajv.compile<RequestFrame>(RequestFrameSchema);
+export const validateResponseFrame = ajv.compile<ResponseFrame>(ResponseFrameSchema);
+export const validateEventFrame = ajv.compile<EventFrame>(EventFrameSchema);
+export const validateSendParams = ajv.compile(SendParamsSchema);
+export const validatePollParams = ajv.compile<PollParams>(PollParamsSchema);
+export const validateAgentParams = ajv.compile(AgentParamsSchema);
+export const validateAgentIdentityParams =
+  ajv.compile<AgentIdentityParams>(AgentIdentityParamsSchema);
+export const validateAgentWaitParams = ajv.compile<AgentWaitParams>(AgentWaitParamsSchema);
+export const validateWakeParams = ajv.compile<WakeParams>(WakeParamsSchema);
+export const validateAgentsListParams = ajv.compile<AgentsListParams>(AgentsListParamsSchema);
+export const validateAgentsCreateParams = ajv.compile<AgentsCreateParams>(AgentsCreateParamsSchema);
+export const validateAgentsUpdateParams = ajv.compile<AgentsUpdateParams>(AgentsUpdateParamsSchema);
+export const validateAgentsDeleteParams = ajv.compile<AgentsDeleteParams>(AgentsDeleteParamsSchema);
+export const validateAgentsFilesListParams = ajv.compile<AgentsFilesListParams>(
+  AgentsFilesListParamsSchema,
+);
+export const validateAgentsFilesGetParams = ajv.compile<AgentsFilesGetParams>(
+  AgentsFilesGetParamsSchema,
+);
+export const validateAgentsFilesSetParams = ajv.compile<AgentsFilesSetParams>(
+  AgentsFilesSetParamsSchema,
+);
+export const validateNodePairRequestParams = ajv.compile<NodePairRequestParams>(
+  NodePairRequestParamsSchema,
+);
+export const validateNodePairListParams = ajv.compile<NodePairListParams>(NodePairListParamsSchema);
+export const validateNodePairApproveParams = ajv.compile<NodePairApproveParams>(
+  NodePairApproveParamsSchema,
+);
+export const validateNodePairRejectParams = ajv.compile<NodePairRejectParams>(
+  NodePairRejectParamsSchema,
+);
+export const validateNodePairVerifyParams = ajv.compile<NodePairVerifyParams>(
+  NodePairVerifyParamsSchema,
+);
+export const validateNodeRenameParams = ajv.compile<NodeRenameParams>(NodeRenameParamsSchema);
+export const validateNodeListParams = ajv.compile<NodeListParams>(NodeListParamsSchema);
+export const validateNodeDescribeParams = ajv.compile<NodeDescribeParams>(NodeDescribeParamsSchema);
+export const validateNodeInvokeParams = ajv.compile<NodeInvokeParams>(NodeInvokeParamsSchema);
+export const validateNodeInvokeResultParams = ajv.compile<NodeInvokeResultParams>(
+  NodeInvokeResultParamsSchema,
+);
+export const validateNodeEventParams = ajv.compile<NodeEventParams>(NodeEventParamsSchema);
+export const validateSessionsListParams = ajv.compile<SessionsListParams>(SessionsListParamsSchema);
+export const validateSessionsPreviewParams = ajv.compile<SessionsPreviewParams>(
+  SessionsPreviewParamsSchema,
+);
+export const validateSessionsResolveParams = ajv.compile<SessionsResolveParams>(
+  SessionsResolveParamsSchema,
+);
+export const validateSessionsPatchParams =
+  ajv.compile<SessionsPatchParams>(SessionsPatchParamsSchema);
+export const validateSessionsResetParams =
+  ajv.compile<SessionsResetParams>(SessionsResetParamsSchema);
+export const validateSessionsDeleteParams = ajv.compile<SessionsDeleteParams>(
+  SessionsDeleteParamsSchema,
+);
+export const validateSessionsCompactParams = ajv.compile<SessionsCompactParams>(
+  SessionsCompactParamsSchema,
+);
+export const validateSessionsUsageParams =
+  ajv.compile<SessionsUsageParams>(SessionsUsageParamsSchema);
+export const validateUsageLedgerSummaryParams = ajv.compile<UsageLedgerSummaryParams>(
+  UsageLedgerSummaryParamsSchema,
+);
+export const validateUsageLedgerEventsParams = ajv.compile<UsageLedgerEventsParams>(
+  UsageLedgerEventsParamsSchema,
+);
+export const validateUsageLedgerWhatIfParams = ajv.compile<UsageLedgerWhatIfParams>(
+  UsageLedgerWhatIfParamsSchema,
+);
+export const validateUsageLedgerExplainParams = ajv.compile<UsageLedgerExplainParams>(
+  UsageLedgerExplainParamsSchema,
+);
+export const validateConfigGetParams = ajv.compile<ConfigGetParams>(ConfigGetParamsSchema);
+export const validateConfigSetParams = ajv.compile<ConfigSetParams>(ConfigSetParamsSchema);
+export const validateConfigApplyParams = ajv.compile<ConfigApplyParams>(ConfigApplyParamsSchema);
+export const validateConfigPatchParams = ajv.compile<ConfigPatchParams>(ConfigPatchParamsSchema);
+export const validateConfigSchemaParams = ajv.compile<ConfigSchemaParams>(ConfigSchemaParamsSchema);
+export const validateWizardStartParams = ajv.compile<WizardStartParams>(WizardStartParamsSchema);
+export const validateWizardNextParams = ajv.compile<WizardNextParams>(WizardNextParamsSchema);
+export const validateWizardCancelParams = ajv.compile<WizardCancelParams>(WizardCancelParamsSchema);
+export const validateWizardStatusParams = ajv.compile<WizardStatusParams>(WizardStatusParamsSchema);
+export const validateTalkModeParams = ajv.compile<TalkModeParams>(TalkModeParamsSchema);
+export const validateTalkConfigParams = ajv.compile<TalkConfigParams>(TalkConfigParamsSchema);
+export const validateChannelsStatusParams = ajv.compile<ChannelsStatusParams>(
+  ChannelsStatusParamsSchema,
+);
+export const validateChannelsLogoutParams = ajv.compile<ChannelsLogoutParams>(
+  ChannelsLogoutParamsSchema,
+);
+export const validateChannelsUpdateParams = ajv.compile<ChannelsUpdateParams>(
+  ChannelsUpdateParamsSchema,
+);
+export const validateChannelsValidateParams = ajv.compile<ChannelsValidateParams>(
+  ChannelsValidateParamsSchema,
+);
+export const validateChannelsConfigureParams = ajv.compile<ChannelsConfigureParams>(
+  ChannelsConfigureParamsSchema,
+);
+export const validateModelsListParams = ajv.compile<ModelsListParams>(ModelsListParamsSchema);
+export const validateModelsAuthListParams = ajv.compile<ModelsAuthListParams>(
+  ModelsAuthListParamsSchema,
+);
+export const validateModelsAuthTestParams = ajv.compile<ModelsAuthTestParams>(
+  ModelsAuthTestParamsSchema,
+);
+export const validateModelsAuthSetParams =
+  ajv.compile<ModelsAuthSetParams>(ModelsAuthSetParamsSchema);
+export const validateModelsAuthDeleteParams = ajv.compile<ModelsAuthDeleteParams>(
+  ModelsAuthDeleteParamsSchema,
+);
+export const validateModelsSetDefaultParams = ajv.compile<ModelsSetDefaultParams>(
+  ModelsSetDefaultParamsSchema,
+);
+export const validateSkillsStatusParams = ajv.compile<SkillsStatusParams>(SkillsStatusParamsSchema);
+export const validateSkillsBinsParams = ajv.compile<SkillsBinsParams>(SkillsBinsParamsSchema);
+export const validateSkillsInstallParams =
+  ajv.compile<SkillsInstallParams>(SkillsInstallParamsSchema);
+export const validateSkillsUpdateParams = ajv.compile<SkillsUpdateParams>(SkillsUpdateParamsSchema);
+export const validateSkillsCreateParams = ajv.compile<SkillsCreateParams>(SkillsCreateParamsSchema);
+export const validateSkillsMetricsParams =
+  ajv.compile<SkillsMetricsParams>(SkillsMetricsParamsSchema);
+export const validateSkillsUpdateAgentFilterParams = ajv.compile<SkillsUpdateAgentFilterParams>(
+  SkillsUpdateAgentFilterParamsSchema,
+);
+export const validateSkillsUpdateTrustSettingsParams = ajv.compile<SkillsUpdateTrustSettingsParams>(
+  SkillsUpdateTrustSettingsParamsSchema,
+);
+export const validateSkillsValidateParams = ajv.compile<SkillsValidateParams>(
+  SkillsValidateParamsSchema,
+);
+export const validateSkillsPublishParams =
+  ajv.compile<SkillsPublishParams>(SkillsPublishParamsSchema);
+export const validateSkillsManageParams = ajv.compile<SkillsManageParams>(SkillsManageParamsSchema);
+export const validateSkillsPromoteParams =
+  ajv.compile<SkillsPromoteParams>(SkillsPromoteParamsSchema);
+export const validateSkillsEvolutionCorpusReviewParams =
+  ajv.compile<SkillsEvolutionCorpusReviewParams>(SkillsEvolutionCorpusReviewParamsSchema);
+export const validateSkillsEvolutionFeedbackParams = ajv.compile<SkillsEvolutionFeedbackParams>(
+  SkillsEvolutionFeedbackParamsSchema,
+);
+export const validateSkillsEvolutionCalibrationExportParams =
+  ajv.compile<SkillsEvolutionCalibrationExportParams>(SkillsEvolutionCalibrationExportParamsSchema);
+export const validateSkillsEvolutionCalibrationScoreParams =
+  ajv.compile<SkillsEvolutionCalibrationScoreParams>(SkillsEvolutionCalibrationScoreParamsSchema);
+export const validateSkillsRollbackParams = ajv.compile<SkillsRollbackParams>(
+  SkillsRollbackParamsSchema,
+);
+export const validateSkillsUploadAgentskillsParams = ajv.compile<SkillsUploadAgentskillsParams>(
+  SkillsUploadAgentskillsParamsSchema,
+);
+export const validateDevicePairListParams = ajv.compile<DevicePairListParams>(
+  DevicePairListParamsSchema,
+);
+export const validateDevicePairApproveParams = ajv.compile<DevicePairApproveParams>(
+  DevicePairApproveParamsSchema,
+);
+export const validateDevicePairRejectParams = ajv.compile<DevicePairRejectParams>(
+  DevicePairRejectParamsSchema,
+);
+export const validateDeviceTokenRotateParams = ajv.compile<DeviceTokenRotateParams>(
+  DeviceTokenRotateParamsSchema,
+);
+export const validateDeviceTokenRevokeParams = ajv.compile<DeviceTokenRevokeParams>(
+  DeviceTokenRevokeParamsSchema,
+);
+export const validateExecApprovalsGetParams = ajv.compile<ExecApprovalsGetParams>(
+  ExecApprovalsGetParamsSchema,
+);
+export const validateExecApprovalsSetParams = ajv.compile<ExecApprovalsSetParams>(
+  ExecApprovalsSetParamsSchema,
+);
+export const validateExecApprovalRequestParams = ajv.compile<ExecApprovalRequestParams>(
+  ExecApprovalRequestParamsSchema,
+);
+export const validateExecApprovalResolveParams = ajv.compile<ExecApprovalResolveParams>(
+  ExecApprovalResolveParamsSchema,
+);
+export const validateExecApprovalsNodeGetParams = ajv.compile<ExecApprovalsNodeGetParams>(
+  ExecApprovalsNodeGetParamsSchema,
+);
+export const validateExecApprovalsNodeSetParams = ajv.compile<ExecApprovalsNodeSetParams>(
+  ExecApprovalsNodeSetParamsSchema,
+);
+export const validateLogsTailParams = ajv.compile<LogsTailParams>(LogsTailParamsSchema);
+export const validateChatHistoryParams = ajv.compile(ChatHistoryParamsSchema);
+export const validateChatSendParams = ajv.compile(ChatSendParamsSchema);
+export const validateChatAbortParams = ajv.compile<ChatAbortParams>(ChatAbortParamsSchema);
+export const validateChatInjectParams = ajv.compile<ChatInjectParams>(ChatInjectParamsSchema);
+export const validateChatEvent = ajv.compile(ChatEventSchema);
+export const validateUpdateRunParams = ajv.compile<UpdateRunParams>(UpdateRunParamsSchema);
+export const validateUpdateCheckParams = ajv.compile<UpdateCheckParams>(UpdateCheckParamsSchema);
+export const validateWebLoginStartParams =
+  ajv.compile<WebLoginStartParams>(WebLoginStartParamsSchema);
+export const validateWebLoginWaitParams = ajv.compile<WebLoginWaitParams>(WebLoginWaitParamsSchema);
+
+export function formatValidationErrors(errors: ErrorObject[] | null | undefined) {
+  if (!errors?.length) {
+    return "unknown validation error";
+  }
+
+  const parts: string[] = [];
+
+  for (const err of errors) {
+    const keyword = typeof err?.keyword === "string" ? err.keyword : "";
+    const instancePath = typeof err?.instancePath === "string" ? err.instancePath : "";
+
+    if (keyword === "additionalProperties") {
+      const params = err?.params as { additionalProperty?: unknown } | undefined;
+      const additionalProperty = params?.additionalProperty;
+      if (typeof additionalProperty === "string" && additionalProperty.trim()) {
+        const where = instancePath ? `at ${instancePath}` : "at root";
+        parts.push(`${where}: unexpected property '${additionalProperty}'`);
+        continue;
+      }
+    }
+
+    const message =
+      typeof err?.message === "string" && err.message.trim() ? err.message : "validation error";
+    const where = instancePath ? `at ${instancePath}: ` : "";
+    parts.push(`${where}${message}`);
+  }
+
+  // De-dupe while preserving order.
+  const unique = Array.from(new Set(parts.filter((part) => part.trim())));
+  if (!unique.length) {
+    const fallback = ajv.errorsText(errors, { separator: "; " });
+    return fallback || "unknown validation error";
+  }
+  return unique.join("; ");
+}
+
+export {
+  ConnectParamsSchema,
+  HelloOkSchema,
+  RequestFrameSchema,
+  ResponseFrameSchema,
+  EventFrameSchema,
+  GatewayFrameSchema,
+  PresenceEntrySchema,
+  SnapshotSchema,
+  GatewayRuntimeSchema,
+  ErrorShapeSchema,
+  StateVersionSchema,
+  AgentEventSchema,
+  ChatEventSchema,
+  SendParamsSchema,
+  PollParamsSchema,
+  AgentParamsSchema,
+  AgentIdentityParamsSchema,
+  AgentIdentityResultSchema,
+  WakeParamsSchema,
+  NodePairRequestParamsSchema,
+  NodePairListParamsSchema,
+  NodePairApproveParamsSchema,
+  NodePairRejectParamsSchema,
+  NodePairVerifyParamsSchema,
+  NodeListParamsSchema,
+  NodeInvokeParamsSchema,
+  SessionsListParamsSchema,
+  SessionsPreviewParamsSchema,
+  SessionsPatchParamsSchema,
+  SessionsResetParamsSchema,
+  SessionsDeleteParamsSchema,
+  SessionsCompactParamsSchema,
+  SessionsUsageParamsSchema,
+  UsageLedgerSummaryParamsSchema,
+  UsageLedgerEventsParamsSchema,
+  UsageLedgerWhatIfParamsSchema,
+  UsageLedgerExplainParamsSchema,
+  ConfigGetParamsSchema,
+  ConfigSetParamsSchema,
+  ConfigApplyParamsSchema,
+  ConfigPatchParamsSchema,
+  ConfigSchemaParamsSchema,
+  ConfigSchemaResponseSchema,
+  WizardStartParamsSchema,
+  WizardNextParamsSchema,
+  WizardCancelParamsSchema,
+  WizardStatusParamsSchema,
+  WizardStepSchema,
+  WizardNextResultSchema,
+  WizardStartResultSchema,
+  WizardStatusResultSchema,
+  TalkConfigParamsSchema,
+  TalkConfigResultSchema,
+  ChannelsStatusParamsSchema,
+  ChannelsStatusResultSchema,
+  ChannelsLogoutParamsSchema,
+  ChannelsUpdateParamsSchema,
+  ChannelsValidateParamsSchema,
+  ChannelsConfigureParamsSchema,
+  WebLoginStartParamsSchema,
+  WebLoginWaitParamsSchema,
+  AgentSummarySchema,
+  AgentsFileEntrySchema,
+  AgentsCreateParamsSchema,
+  AgentsCreateResultSchema,
+  AgentsUpdateParamsSchema,
+  AgentsUpdateResultSchema,
+  AgentsDeleteParamsSchema,
+  AgentsDeleteResultSchema,
+  AgentsFilesListParamsSchema,
+  AgentsFilesListResultSchema,
+  AgentsFilesGetParamsSchema,
+  AgentsFilesGetResultSchema,
+  AgentsFilesSetParamsSchema,
+  AgentsFilesSetResultSchema,
+  AgentsListParamsSchema,
+  AgentsListResultSchema,
+  ModelsAuthDeleteParamsSchema,
+  ModelsAuthListParamsSchema,
+  ModelsAuthSetParamsSchema,
+  ModelsAuthTestParamsSchema,
+  ModelsListParamsSchema,
+  ModelsSetDefaultParamsSchema,
+  SkillsStatusParamsSchema,
+  SkillsInstallParamsSchema,
+  SkillsUpdateParamsSchema,
+  SkillsCreateParamsSchema,
+  SkillsManageParamsSchema,
+  SkillsManageResultSchema,
+  SkillsMetricsParamsSchema,
+  SkillsEvolutionCorpusReviewParamsSchema,
+  SkillsEvolutionFeedbackParamsSchema,
+  SkillsPromoteParamsSchema,
+  SkillsPromoteResultSchema,
+  SkillsPublishParamsSchema,
+  SkillsRollbackParamsSchema,
+  SkillsRollbackResultSchema,
+  SkillsUpdateAgentFilterParamsSchema,
+  SkillsUpdateTrustSettingsParamsSchema,
+  SkillsUploadAgentskillsParamsSchema,
+  SkillsValidateParamsSchema,
+  LogsTailParamsSchema,
+  LogsTailResultSchema,
+  ChatHistoryParamsSchema,
+  ChatSendParamsSchema,
+  ChatInjectParamsSchema,
+  UpdateCheckParamsSchema,
+  UpdateRunParamsSchema,
+  TickEventSchema,
+  ShutdownEventSchema,
+  ProtocolSchemas,
+  PROTOCOL_VERSION,
+  ErrorCodes,
+  errorShape,
+};
+
+export type {
+  GatewayFrame,
+  ConnectParams,
+  HelloOk,
+  RequestFrame,
+  ResponseFrame,
+  EventFrame,
+  PresenceEntry,
+  Snapshot,
+  GatewayRuntime,
+  ErrorShape,
+  StateVersion,
+  AgentEvent,
+  AgentIdentityParams,
+  AgentIdentityResult,
+  AgentWaitParams,
+  ChatEvent,
+  TickEvent,
+  ShutdownEvent,
+  WakeParams,
+  NodePairRequestParams,
+  NodePairListParams,
+  NodePairApproveParams,
+  DevicePairListParams,
+  DevicePairApproveParams,
+  DevicePairRejectParams,
+  ConfigGetParams,
+  ConfigSetParams,
+  ConfigApplyParams,
+  ConfigPatchParams,
+  ConfigSchemaParams,
+  ConfigSchemaResponse,
+  WizardStartParams,
+  WizardNextParams,
+  WizardCancelParams,
+  WizardStatusParams,
+  WizardStep,
+  WizardNextResult,
+  WizardStartResult,
+  WizardStatusResult,
+  TalkConfigParams,
+  TalkConfigResult,
+  TalkModeParams,
+  ChannelsStatusParams,
+  ChannelsStatusResult,
+  ChannelsLogoutParams,
+  ChannelsUpdateParams,
+  ChannelsValidateParams,
+  ChannelsConfigureParams,
+  WebLoginStartParams,
+  WebLoginWaitParams,
+  AgentSummary,
+  AgentsFileEntry,
+  AgentsCreateParams,
+  AgentsCreateResult,
+  AgentsUpdateParams,
+  AgentsUpdateResult,
+  AgentsDeleteParams,
+  AgentsDeleteResult,
+  AgentsFilesListParams,
+  AgentsFilesListResult,
+  AgentsFilesGetParams,
+  AgentsFilesGetResult,
+  AgentsFilesSetParams,
+  AgentsFilesSetResult,
+  AgentsListParams,
+  AgentsListResult,
+  SkillsStatusParams,
+  SkillsBinsParams,
+  SkillsBinsResult,
+  SkillsInstallParams,
+  SkillsUpdateParams,
+  SkillsCreateParams,
+  SkillsManageParams,
+  SkillsManageResult,
+  SkillsMetricsParams,
+  SkillsMetricsResult,
+  SkillsEvolutionCorpusReviewParams,
+  SkillsEvolutionFeedbackParams,
+  SkillsEvolutionCalibrationExportParams,
+  SkillsEvolutionCalibrationScoreParams,
+  SkillsPromoteParams,
+  SkillsPromoteResult,
+  SkillsPublishParams,
+  SkillsPublishResult,
+  SkillsRollbackParams,
+  SkillsRollbackResult,
+  SkillsUpdateAgentFilterParams,
+  SkillsUpdateAgentFilterResult,
+  SkillsUpdateTrustSettingsParams,
+  SkillsUpdateTrustSettingsResult,
+  SkillsUploadAgentskillsParams,
+  SkillsUploadAgentskillsResult,
+  SkillsValidateParams,
+  SkillsValidateResult,
+  NodePairRejectParams,
+  NodePairVerifyParams,
+  NodeListParams,
+  NodeInvokeParams,
+  NodeInvokeResultParams,
+  NodeEventParams,
+  SessionsListParams,
+  SessionsPreviewParams,
+  SessionsResolveParams,
+  SessionsPatchParams,
+  SessionsPatchResult,
+  SessionsResetParams,
+  SessionsDeleteParams,
+  SessionsCompactParams,
+  SessionsUsageParams,
+  UsageLedgerSummaryParams,
+  UsageLedgerEventsParams,
+  UsageLedgerWhatIfParams,
+  UsageLedgerExplainParams,
+  ExecApprovalsGetParams,
+  ExecApprovalsSetParams,
+  ExecApprovalsSnapshot,
+  LogsTailParams,
+  LogsTailResult,
+  PollParams,
+  UpdateCheckParams,
+  UpdateRunParams,
+  ChatInjectParams,
+};

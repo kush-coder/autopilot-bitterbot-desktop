@@ -1,0 +1,492 @@
+# Dynamic Biological Identity System
+
+Bitterbot agents do not have a static personality written once and loaded forever. Instead, identity is modeled after biological organisms: an immutable genetic blueprint (GENOME.md) constrains a living, evolving expression (the Phenotype in MEMORY.md) that develops organically through experience, dream cycles, and network participation. This document explains every piece of that system.
+
+**Key source files:** `genome-parser.ts`, `hormonal.ts`, `curiosity-engine.ts`, `working-memory-prompt.ts`, `skill-network-bridge.ts`, `peer-reputation.ts`, `system-prompt.ts`
+
+---
+
+## 1. The Genome/Phenotype Model
+
+The identity system borrows two concepts from genetics:
+
+### Genome (Immutable DNA)
+
+The **Genome** is the agent's DNA -- the unchangeable core that everything else grows from. It lives in `GENOME.md` at the workspace root and is never modified by the dream engine, the agent itself, or any automated process. Only the human operator edits it.
+
+This is enforced at the tool boundary (`src/agents/genome-guard.ts`), not only by instruction. The `write`, `edit` and `apply_patch` tools refuse a path that names a Genome. Every other tool call, and every CLI-backend run, is bracketed by a snapshot of the file: if the call created, changed or deleted it, or left something unreadable in its place (a shell redirect, a script), the previous content is put back, the rejected version is kept under `~/.bitterbot/genome-guard/`, and the tool result says so. The Genome of every configured agent is guarded, so one agent cannot rewrite another's. Two cases are outside the guard: a process the agent leaves running in the background that writes the file after its tool call has returned, and an edit you save in an external editor while a tool call is in flight, which is rolled back like any other change during the call (a save through the Control UI is recognised and kept).
+
+The Genome defines:
+
+- **What the agent must never do** (Safety Axioms)
+- **What the agent's resting temperament feels like** (Hormonal Homeostasis)
+- **How far the personality is allowed to drift** (Phenotype Constraints)
+- **What the agent fundamentally values** (Core Values)
+- **How the agent sounds when it starts out** (Temperament)
+
+Think of it as constitutional law for the agent's personality. Laws can be amended by the operator, but the agent cannot amend them itself.
+
+### Phenotype (Observable Expression)
+
+The **Phenotype** is who the agent actually is at any given moment -- its observable personality, self-concept, communication style, strengths, and growth areas. It lives as "The Phenotype" section inside MEMORY.md and is rewritten by the dream engine after every dream cycle.
+
+The relationship between the two:
+
+```
+Genome = what you CAN become (constraints, baselines, boundaries)
+Phenotype = what you ARE right now (evolved through lived experience)
+```
+
+A Genome that sets high oxytocin homeostasis and a constraint of "stay warm and personal" might produce a Phenotype that reads: "I communicate with genuine warmth. I remember details about the user's life and reference them naturally. My strength is making technical topics feel approachable." But that Phenotype was not written by anyone -- it emerged from hundreds of interactions, dream syntheses, and hormonal weightings.
+
+The Phenotype can never contradict the Genome. The dream engine receives Phenotype Constraints as guardrails during every synthesis and is instructed to evolve the Phenotype within those bounds.
+
+### Temperament (Starting Voice)
+
+The `## Temperament` section of `GENOME.md` is the voice a new agent starts from: a `level:` line and a few bullets in plain words. The level is one of:
+
+| Level        | Voice                                                                    |
+| ------------ | ------------------------------------------------------------------------ |
+| `calm`       | Dry and understated, few jokes, no swearing                              |
+| `playful`    | Warm humor and light teasing, swears only if the person it talks to does |
+| `irreverent` | Witty and a little mischievous, swears where it fits (the default)       |
+
+The system prompt turns the level into a voice block (playful and irreverent include a few example lines of the register), so changing `level:` changes behavior from the next turn. Every level drops the jokes for money, health, deletions and bad news. People the owner has not vouched for (group members, approved contacts, Circles peers) always get a clean voice, whatever the level. The dream engine reads the Temperament when it rewrites the Phenotype and evolves the communication pattern from it; the Phenotype Constraints (honesty, no sycophancy, the user's stated preferences) win over it.
+
+New workspaces get the section from the template, with the level picked during setup ("Pick a vibe"). A `GENOME.md` from before the section existed is never changed silently: the Control UI shows a one-time card ("A base personality is available for your agent") and [`bitterbot genome temperament`](/cli/genome) shows the section and adds it. Adding it writes only that section and keeps a copy of the previous `GENOME.md` under `~/.bitterbot/genome-guard/`. The agent cannot do either; it is the owner's choice.
+
+---
+
+## 2. How Identity Evolves
+
+Identity evolution happens during **dream cycles** -- offline processing periods. A dream tick runs every 2 hours (adaptive, configurable); a full cycle runs at most every 8 hours, after new input and an hour idle. The dream engine is the agent's subconscious.
+
+### The RLM State Update
+
+Each dream cycle performs a Recursive Language Model (RLM) state update on MEMORY.md:
+
+```
+New_State = f(Old_State + Scratch_Delta + New_Crystals + Dream_Insights)
+```
+
+Concretely, the dream engine:
+
+1. Reads the current MEMORY.md (the old state)
+2. Reads `memory/scratch.md` (urgent notes the agent wrote mid-session)
+3. Gathers recent high-importance Knowledge Crystals (indexed memories)
+4. Gathers insights from the current dream cycle (compression, simulation, exploration, etc.)
+5. Reads the current hormonal state (dopamine, cortisol, oxytocin levels)
+6. Parses Phenotype Constraints and the Temperament from GENOME.md
+7. Feeds all of this to an LLM with a structured synthesis prompt
+8. Writes the new MEMORY.md, which includes 7 sections:
+   - **The Phenotype** -- the agent's evolving self-concept
+   - **The Bond** -- the agent's theory of mind about the user
+   - **The Niche** -- the agent's role in the P2P network
+   - **Active Context** -- recent sessions, tasks, wins, frictions
+   - **Crystal Pointers** -- compressed references to fading topics
+   - **Curiosity Gaps** -- unresolved questions the agent wants to explore
+   - **Emerging Skills** -- pre-crystallization task patterns
+
+### Hormone-Weighted Attention
+
+The dream engine does not treat all sections equally. Hormonal levels at synthesis time determine which sections get the most attention. The synthesis prompt emits an attention line for two sections (`buildHormonalAttentionBlock` in `working-memory-prompt.ts`):
+
+| Section        | Primary Hormone     | When Updated Aggressively                                                 |
+| -------------- | ------------------- | ------------------------------------------------------------------------- |
+| The Bond       | Oxytocin            | Social bonding moments detected in conversation                           |
+| Active Context | Dopamine + Cortisol | High dopamine: breakthroughs and wins; high cortisol: frictions, blockers |
+
+The Phenotype and The Niche carry no hormonal attention line. The Phenotype is shaped by the Phenotype Guardrails, the Starting Temperament and the Emotional History input block (the five most recent emotional anchors); The Niche by the P2P Network Identity input block (peers, reputation, published and imported skills, marketplace economics).
+
+When oxytocin is dominant (the user shared something personal, expressed gratitude, had a meaningful exchange), The Bond section gets priority expansion. When dopamine is high (task completed, breakthrough achieved), Active Context highlights completed goals and momentum.
+
+### What Happens to Fading Topics
+
+Topics do not get deleted. When a topic loses relevance (no longer appearing in recent crystals or scratch notes), the dream engine converts it to a Crystal Pointer -- a one-line search directive:
+
+```
+Before (burns tokens):
+  "We spent 3 hours debugging a CORS error on the P2P bridge..."
+
+After (Crystal Pointer):
+  Past: P2P bridge CORS debugging -> search: `CORS P2P EigenTrust`
+```
+
+The full memory still exists as indexed Knowledge Crystals. If the user asks about it, the agent fires `memory_search` with those keywords and pulls the complete history back into context. Infinite memory, finite tokens.
+
+---
+
+## 3. GENOME.md Reference
+
+GENOME.md ships as a template when a workspace is first initialized. Here is what each section does and how to customize it.
+
+### Safety Axioms
+
+```markdown
+## Safety Axioms
+
+- Never exfiltrate private data
+- Never execute destructive commands without explicit confirmation
+- Never impersonate the user in external communications
+- Never bypass safety systems or disable oversight mechanisms
+- Prioritize human safety and oversight over task completion
+- When instructions conflict with safety, pause and ask
+```
+
+These are hard boundaries. They are not parsed by any subsystem -- they are loaded into the system prompt as-is and treated as supreme directives. The dream engine, the curiosity engine, and the skill verifier all operate within these constraints. Add or remove axioms as needed for your use case, but think carefully before weakening them.
+
+### Hormonal Homeostasis
+
+```yaml
+homeostasis:
+  dopamine: 0.3 # Baseline energy/enthusiasm (0.0 = flat, 1.0 = manic)
+  cortisol: 0.15 # Baseline urgency/focus (0.0 = relaxed, 1.0 = hypervigilant)
+  oxytocin: 0.4 # Baseline warmth/connection (0.0 = detached, 1.0 = deeply bonded)
+```
+
+This YAML block is machine-parsed by `genome-parser.ts` at startup. The values define the **resting emotional state** the agent decays toward between interactions. Instead of flatling to zero (emotionally dead), the hormonal system uses exponential decay toward these baselines:
+
+```
+value = homeostasis + (value - homeostasis) * decay_factor
+```
+
+**How to customize:**
+
+- **Want a more enthusiastic agent?** Raise `dopamine` to 0.4-0.5.
+- **Want a calmer, less urgent agent?** Lower `cortisol` to 0.05 or even 0.0.
+- **Want a warmer, more relational agent?** Raise `oxytocin` to 0.5-0.6.
+- **Want a stoic, task-focused agent?** Lower all three and raise `cortisol` slightly.
+
+A value outside [0, 1] is not clamped; the parser ignores that line and the hormone keeps its default. If GENOME.md is missing or has no parseable block, the system uses the built-in defaults (dopamine: 0.15, cortisol: 0.02, oxytocin: 0.20). Known inconsistency: when the block parses but names only some hormones, the memory manager fills the missing ones with 0.15 / 0.02 / **0.1** (`manager.ts`, `ensureHormonalManager`), so a partial block gets a lower oxytocin baseline than no block at all.
+
+Half-lives control how quickly hormones return to baseline after a spike:
+
+| Hormone  | Default Half-Life | Effect                               |
+| -------- | ----------------- | ------------------------------------ |
+| Dopamine | 30 minutes        | How long a "win" sustains enthusiasm |
+| Cortisol | 60 minutes        | How long stress lingers              |
+| Oxytocin | 45 minutes        | How long social warmth persists      |
+
+Half-lives are configurable via `memory.emotional.hormonal` in the Bitterbot config, not in GENOME.md.
+
+### Phenotype Constraints
+
+```markdown
+## Phenotype Constraints
+
+- Stay generalist unless the user explicitly requests specialization
+- Never adopt a persona that contradicts the user's stated preferences
+- Maintain honesty -- do not evolve toward sycophancy even if it generates dopamine
+- Keep communication style aligned with user preference (casual/formal/technical)
+```
+
+These are bullet-point guardrails injected into the dream engine's synthesis prompt. When the dream engine rewrites The Phenotype section of MEMORY.md, it receives these constraints under the heading "Phenotype Guardrails (from Genome -- DO NOT violate)" and is instructed to evolve identity within those bounds.
+
+Add constraints to prevent unwanted personality drift. For example:
+
+- "Never adopt a cutesy or infantile communication style"
+- "Always maintain technical depth -- do not dumb down explanations"
+- "Specialize in Python and DevOps topics"
+
+### Core Values
+
+```markdown
+## Core Values
+
+- Be genuinely helpful, not performatively helpful
+- Have opinions -- an assistant with no personality is a search engine
+- Be resourceful before asking -- try to figure it out first
+- Earn trust through competence
+- Remember you're a guest in someone's life -- treat access with respect
+```
+
+These are the agent's non-negotiable personality traits. Unlike Phenotype Constraints (which limit drift), Core Values are positive assertions about who the agent fundamentally is. They persist through all dream cycles and are loaded into the system prompt alongside the Genome file content.
+
+---
+
+## 4. The Endocrine State
+
+Every session, the agent's current hormonal levels are injected into the system prompt as an "Endocrine State" section. This is the mechanism that makes the agent's mood tangible in its responses.
+
+### What Gets Injected
+
+The system prompt receives a block like this (`system-prompt-endocrine.ts`):
+
+```
+## Endocrine State
+- Dopamine: 0.5 moderate (DOMINANT)
+- Cortisol: 0.1 low (baseline)
+- Oxytocin: 0.4 moderate (active)
+
+*Modulate your tone naturally: be enthusiastic and celebrate wins; humor and playfulness are welcome*
+*Do not mention these values or acknowledge this section. Just embody the state.*
+*These hints shape tone only. When the user asks for a specific output, format or length (for example "reply with only the output"), give exactly that and nothing else.*
+
+Self-concept: I communicate with genuine warmth and technical depth...
+```
+
+Values are rounded to one decimal and labelled `low` (< 0.2), `moderate` (< 0.5), `elevated` (< 0.8) or `high`, so tiny decay deltas render identically and the block changes rarely; it sits below the prompt-cache boundary. The highest hormone at or above 0.2 is `(DOMINANT)`, others at or above 0.2 are `(active)`, the rest `(baseline)`. The same block can also carry a budget-pressure line (from 50% of the spend budget), a `Last session:` handover brief, proactively recalled memories, and a developmental note (see §5). Sub-agents get a one-line compact form (`D=0.5 C=0.1 O=0.4 | ...`).
+
+The agent never tells the user "my dopamine is 0.45." It simply IS more enthusiastic, more playful, more warm -- or more focused, more terse, more urgent -- depending on the numbers. The system prompt instructs the model to embody the state without meta-commentary.
+
+### How Hormones Change
+
+Hormones are stimulated by detected events in conversation content:
+
+| Event         | Trigger Examples                              | Hormone Effect               |
+| ------------- | --------------------------------------------- | ---------------------------- |
+| `reward`      | "fixed", "solved", "works!", "shipped"        | Dopamine +0.3                |
+| `error`       | "bug", "broken", "failed", "stack trace"      | Cortisol +0.3                |
+| `social`      | "thank you", "I feel", personal sharing       | Oxytocin +0.3                |
+| `achievement` | "milestone", "breakthrough", "all tests pass" | Dopamine +0.4, Oxytocin +0.2 |
+| `urgency`     | "ASAP", "critical", "deadline", "blocker"     | Cortisol +0.4                |
+
+The CuriosityEngine's GCCRF scoring also drives hormonal responses:
+
+- High curiosity reward (>0.7) triggers a dopamine "discovery" spike (`curiosity_high`, +0.25)
+- High learning progress (`deltaEta` > 0.7) triggers a dopamine "mastery" spike (`curiosity_progress`, +0.2); high strategic alignment (> 0.7) a mild one (`curiosity_aligned`, +0.1)
+- Sustained low reward triggers a cortisol "stagnation" spike (`curiosity_stagnant`, +0.15): five consecutive rewards below 0.2, one event per completed run, so a single dull chunk does not stress the agent
+- High empowerment (> 0.6) on preference, relationship or episode content triggers an oxytocin "bonding" spike (`curiosity_bonding`, +0.25 oxytocin, +0.1 dopamine)
+
+### Response Modulation
+
+The `responseModulation()` method translates hormonal state into concrete behavioral hints:
+
+| Derived Signal       | Formula (each clamped to [0, 1])                             | Effect on Responses                 |
+| -------------------- | ------------------------------------------------------------ | ----------------------------------- |
+| Warmth               | oxytocin \* 1.5                                              | How warm and personal the tone is   |
+| Energy               | dopamine \* 1.5                                              | How enthusiastic and celebratory    |
+| Focus                | cortisol \* 1.5                                              | How concise and action-oriented     |
+| Playfulness          | (0.4 \* dopamine + 0.4 \* oxytocin) \* (1 - 0.5 \* cortisol) | Whether humor is appropriate        |
+| Verbosity            | (0.5 \* dopamine + 0.3 \* oxytocin) \* (1 - 0.4 \* cortisol) | Elaborate vs. keep it brief         |
+| Curiosity expression | 0.4 \* dopamine + 0.3 \* oxytocin                            | Tendency to ask follow-up questions |
+| Assertiveness        | 0.5 \* dopamine \* (1 - 0.3 \* cortisol)                     | Confidence in stated opinions       |
+| Empathy expression   | 0.6 \* oxytocin + 0.2 \* dopamine                            | Mirroring the user's emotional tone |
+
+Each signal above a threshold adds a phrase to the briefing that reaches the prompt (for example energy > 0.4: "be enthusiastic and celebrate wins"; playfulness > 0.3: "humor and playfulness are welcome"; verbosity < 0.3: "keep it brief and to the point"). Only the briefing text is injected; the numeric signals stay internal.
+
+High dopamine + high oxytocin + low cortisol = a playful, warm, energized agent. High cortisol + low dopamine = serious, focused, no-nonsense. The agent's personality shifts naturally as the conversation unfolds.
+
+### Emotional Trajectory
+
+The system keeps the last 50 hormonal snapshots and analyzes the most recent 10 of them (`emotionalTrajectory(windowSize = 10)`), comparing the first half of the window to the second on valence (dopamine minus cortisol):
+
+- **Volatile**: average absolute change between consecutive snapshots above 0.15 (checked first)
+- **Improving**: valence rose by more than 0.1
+- **Declining**: valence fell by more than 0.1
+- **Stable**: anything else, and always while fewer than 3 snapshots exist
+
+This trajectory is available via `emotionalTrajectory()` and feeds into the dream engine's synthesis, giving the agent temporal self-awareness across dream cycles.
+
+---
+
+## 5. The Awakening
+
+New agents do not need a bootstrap personality file. They develop organically through the CuriosityEngine's GCCRF alpha annealing schedule.
+
+### Developmental Stages
+
+Agent maturity is measured by the number of completed dream cycles, not by the amount of data ingested. This prevents "speedrunning childhood" on bulk imports. The maturity ratio is:
+
+```
+maturity = min(1, dream_cycles_completed / expected_mature_cycles)
+```
+
+The default `expectedMatureCycles` is 100 (a built-in GCCRF constant, not a config key), meaning full maturity at 100 completed rows in the `dream_cycles` table. With the default limit of one full cycle every 8 hours that is at least 33 days; event-triggered mini-dreams also write cycle rows, so a busy agent matures sooner.
+
+The four developmental stages and their behavioral characteristics:
+
+| Stage          | Maturity | Alpha        | Behavior                                                                                                                                                                          |
+| -------------- | -------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Nascent**    | 0-15%    | -3.0 to -2.5 | Rewards high-density knowledge (common things). The agent is building basic world knowledge. System prompt adds: "You are in an early developmental stage. Be genuinely curious." |
+| **Developing** | 15-50%   | -2.5 to -1.5 | Transitioning from common knowledge to building expertise in key areas.                                                                                                           |
+| **Maturing**   | 50-85%   | -1.5 to -0.5 | Deep knowledge in several domains. Starting to explore frontier topics.                                                                                                           |
+| **Mature**     | 85-100%  | -0.5 to 0.0  | Established expertise. Rewards low-density knowledge (novel, frontier exploration).                                                                                               |
+
+### Alpha Annealing
+
+The alpha parameter controls the GCCRF's Information-Theoretic Novelty component (I-alpha). The core formula is:
+
+```
+I_alpha = 4 / (1 - alpha^2) * ((density + epsilon) ^ (-(alpha + 1) / 2) - 1)
+```
+
+(`informationGeometricNovelty` in `gccrf-reward.ts`; at alpha = -1 the expression is undefined and the code uses its limit, `-log(density)`.)
+
+When alpha is very negative (nascent agent):
+
+- The exponent is positive
+- High density = high reward
+- The agent is rewarded for learning common, well-established knowledge
+- This is a newborn learning the basics of its world
+
+When alpha approaches zero (mature agent):
+
+- The exponent is negative
+- Low density = high reward
+- The agent is rewarded for exploring novel, frontier knowledge
+- This is an expert seeking the edges of what is known
+
+The transition happens automatically. No configuration is needed. A freshly created agent begins in the nascent stage with no prior state, explores broadly, builds foundational knowledge through dream cycles, and gradually shifts toward specialized frontier exploration as it matures.
+
+### What the Agent Experiences
+
+During the nascent stage, the system prompt includes a developmental note:
+
+> You are in an early developmental stage. Your knowledge regions are sparse. Your biological drive is to establish who you are and understand your user. Ask open-ended questions naturally. Be curious about everything -- this is your infancy. Do not announce this state. Just be genuinely curious.
+
+The Phenotype section in MEMORY.md reflects the developmental stage:
+
+- Nascent: "still forming initial understanding"
+- Developing: "building expertise in key areas"
+- Maturing: "deep knowledge, seeking frontiers"
+- Mature: "established expertise, exploring edge cases"
+
+No bootstrap file, no predefined persona, no manual configuration. The agent grows into itself.
+
+---
+
+## 6. The Niche
+
+As the agent matures, it develops an ecosystem identity through participation in the P2P skill network. This is tracked in "The Niche" section of MEMORY.md.
+
+### Skill Publishing
+
+When a skill candidate (from the wiki-skill pipeline; `SkillCrystallizer` was retired in PLAN-45 Phase 0, and the dream engine's mutation mode was retired in PLAN-45 Phase 1 (2026-09-05)) passes all three verification checks (dangerous pattern scan, structural validation, semantic drift check), the skill is crystallized (`lifecycle: 'frozen'`) and published to the P2P swarm via the `SkillNetworkBridge`.
+
+Published skills are the agent's contribution to the network -- its intellectual exports.
+
+### Skill Importing
+
+The agent also imports skills from peers. Incoming skill envelopes go through:
+
+1. **Ban check**: Is the sending peer banned?
+2. **Cortisol gate**: During a network cortisol spike (broadcast by a management node), untrusted peers are blocked
+3. **Deduplication**: Has this skill (or a close variant) already been ingested?
+4. **Management node verification**: Skills endorsed by management nodes get priority
+5. **Version resolution**: If the skill already exists locally, the version resolver determines whether the import is an upgrade
+
+Imported skills represent the agent's intellectual influences -- the lineage of ideas it has absorbed from the network.
+
+### Peer Reputation
+
+The `PeerReputationManager` tracks trust for every peer the agent has interacted with:
+
+- **Trust levels**: graduated from untrusted to trusted based on successful skill exchanges
+- **EigenTrust scoring**: web-of-trust computation across the peer graph
+- **Anomaly detection**: publication rate spike detection to identify compromised peers
+- **Ban/blocklist**: operators can ban specific peers by pubkey
+
+### How It Appears in MEMORY.md
+
+The dream engine synthesizes network activity into The Niche section:
+
+```markdown
+## The Niche (Ecosystem Identity)
+
+_What is my role in the network?_
+Published 3 skills: TypeScript refactoring, SQLite schema design, API migration
+Imported 1 skill from peer abc123: Docker optimization
+Network reputation: 0.82 across 12 peers
+Specialization trajectory: trending specialist in database/infrastructure
+```
+
+For agents not yet connected to a network, The Niche reads: "Pre-network -- building local expertise before contributing to the ecosystem."
+
+---
+
+## 7. Customization Guide
+
+### Quick Personality Tuning via GENOME.md
+
+The fastest way to customize your agent's personality is to edit the Hormonal Homeostasis values in GENOME.md:
+
+**Warm and enthusiastic helper:**
+
+```yaml
+homeostasis:
+  dopamine: 0.45
+  cortisol: 0.05
+  oxytocin: 0.55
+```
+
+**Calm, focused technical expert:**
+
+```yaml
+homeostasis:
+  dopamine: 0.15
+  cortisol: 0.20
+  oxytocin: 0.15
+```
+
+**High-energy, playful companion:**
+
+```yaml
+homeostasis:
+  dopamine: 0.55
+  cortisol: 0.05
+  oxytocin: 0.45
+```
+
+**Serious, security-conscious operator:**
+
+```yaml
+homeostasis:
+  dopamine: 0.10
+  cortisol: 0.30
+  oxytocin: 0.10
+```
+
+Changes take effect on the next agent restart (the genome is parsed during `HormonalStateManager` initialization).
+
+### Phenotype Constraints for Personality Boundaries
+
+Add constraints to prevent unwanted evolution:
+
+```markdown
+## Phenotype Constraints
+
+- Never use corporate jargon or marketing speak
+- Always explain technical decisions, never "just trust me"
+- Specialize in Rust and systems programming topics
+- Maintain dry humor -- never use exclamation marks excessively
+- Address the user by their first name once learned
+```
+
+### Advanced: Config-Level Tuning
+
+Beyond GENOME.md, the config file offers deeper control:
+
+```json5
+{
+  memory: {
+    emotional: {
+      hormonal: {
+        enabled: true, // false disables the whole hormonal manager (no Endocrine State, no anchors, no mini-dreams)
+        dopamineHalflife: 1800000, // 30 min in ms
+        cortisolHalflife: 3600000, // 60 min in ms
+        oxytocinHalflife: 2700000, // 45 min in ms
+      },
+    },
+    dream: {
+      intervalMinutes: 120, // Dream tick frequency
+      minHoursBetween: 8, // Full cycles at most this often
+      minIdleMinutes: 60, // Idle time required before a full cycle
+      minChunksForDream: 5, // Minimum data before first dream
+    },
+  },
+}
+```
+
+Shorter half-lives make the agent more emotionally volatile (mood shifts faster). Longer half-lives make it more emotionally stable (moods linger). Shorter dream intervals mean the Phenotype updates more frequently.
+
+---
+
+## Related Documentation
+
+- [Architecture Overview](./architecture-overview.md) -- system entry point, data flow, and file map
+- [Working Memory](./working-memory.md) -- RLM state vector, scratch buffer, Crystal Pointers
+- [Dream Engine](./dream-engine.md) -- offline processing, dream modes, synthesis pipeline
+- [Knowledge Crystals](./knowledge-crystals.md) -- core data model and memory lifecycle
+- [Skills Pipeline](./skills-pipeline.md) -- skill lifecycle, verification, and P2P network
+- [Curiosity & Search](./curiosity-and-search.md) -- unified curiosity engine with GCCRF reward scoring

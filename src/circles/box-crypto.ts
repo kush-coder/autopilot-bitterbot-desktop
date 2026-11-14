@@ -1,0 +1,209 @@
+/**
+ * PLAN-31 C1 transport: sealed-box crypto for the relay mailbox (§3.2).
+ *
+ * Every node holds an X25519 "box" keypair alongside its Ed25519 identity
+ * (identity/box.json). The box PUBLIC key travels only inside Ed25519-signed
+ * circle envelopes (join/presence bodies), so a peer's box key is
+ * authenticated by the same signature chain as everything else.
+ *
+ * Sealing (standard sealed-box construction, Node built-ins only):
+ *   ephemeral X25519 keypair -> ECDH(ephemeral, recipient) -> HKDF-SHA256
+ *   (salt = ephemeral pub || recipient pub, info = domain string) ->
+ *   AES-256-GCM. The blob carries {v, epk, iv, ct, tag}; only the recipient's
+ *   box PRIVATE key opens it. A mailbox host stores ciphertext it cannot
+ *   read, which is the §3.2 honesty claim: "no server that can read your
+ *   messages or own your graph."
+ */
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { resolveStateDir } from "../config/paths.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+
+const log = createSubsystemLogger("circles/box-crypto");
+
+const HKDF_INFO = "circle-mailbox/v1 sealed box";
+
+export type BoxKeyPair = {
+  publicKeyB64: string;
+  privateKey: crypto.KeyObject;
+};
+
+export type SealedBlob = {
+  v: 1;
+  /** Ephemeral X25519 public key (base64, SPKI raw 32 bytes). */
+  epk: string;
+  iv: string;
+  ct: string;
+  tag: string;
+};
+
+const X25519_SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
+
+function rawFromPublicKey(pub: crypto.KeyObject): Buffer {
+  const spki = pub.export({ type: "spki", format: "der" }) as Buffer;
+  return spki.subarray(spki.length - 32);
+}
+
+function publicKeyFromRawB64(b64: string): crypto.KeyObject {
+  const raw = Buffer.from(b64, "base64");
+  if (raw.length !== 32) {
+    throw new Error("box pubkey must be 32 raw bytes");
+  }
+  return crypto.createPublicKey({
+    key: Buffer.concat([X25519_SPKI_PREFIX, raw]),
+    format: "der",
+    type: "spki",
+  });
+}
+
+export function generateBoxKeyPair(): BoxKeyPair {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("x25519");
+  return { publicKeyB64: rawFromPublicKey(publicKey).toString("base64"), privateKey };
+}
+
+type StoredBoxKeys = {
+  version: 1;
+  publicKeyB64: string;
+  privateKeyPem: string;
+  createdAtMs: number;
+};
+
+function defaultBoxKeyPath(): string {
+  return path.join(resolveStateDir(), "identity", "box.json");
+}
+
+/**
+ * Load the node's box keypair, or null when no key file exists yet. A file
+ * that exists but does not parse THROWS (security pass M4): silently minting
+ * a new key there would rotate this node's mailbox identity out from under
+ * every peer (their sealed blobs stop opening) and destroy a key that may be
+ * recoverable — and the A2A handlers reach this path on remote requests.
+ */
+export function loadBoxKeys(filePath: string = defaultBoxKeyPath()): BoxKeyPair | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(raw) as StoredBoxKeys;
+    if (
+      parsed?.version === 1 &&
+      typeof parsed.publicKeyB64 === "string" &&
+      typeof parsed.privateKeyPem === "string"
+    ) {
+      return {
+        publicKeyB64: parsed.publicKeyB64,
+        privateKey: crypto.createPrivateKey(parsed.privateKeyPem),
+      };
+    }
+  } catch {
+    // reported below
+  }
+  // The path stays in the local log only: this error can travel back to a
+  // remote peer inside an RPC error string, and the path names the OS user.
+  log.error(
+    `circle box key at ${filePath} is unreadable; refusing to replace it. ` +
+      `Restore it from a backup, or move it aside to mint a new box key ` +
+      `(friends pick up the new key from your next presence beat).`,
+  );
+  throw new Error("circle box key is unreadable (see the gateway log)");
+}
+
+/** Load the node's box keypair, creating + persisting (0600) one only when none exists. */
+export function loadOrCreateBoxKeys(filePath: string = defaultBoxKeyPath()): BoxKeyPair {
+  const existing = loadBoxKeys(filePath);
+  if (existing) {
+    return existing;
+  }
+  const pair = generateBoxKeyPair();
+  const stored: StoredBoxKeys = {
+    version: 1,
+    publicKeyB64: pair.publicKeyB64,
+    privateKeyPem: pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    createdAtMs: Date.now(),
+  };
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  // Write the whole key to a private temp file, then hard-link it into place:
+  // link() is atomic and fails with EEXIST if another process won the race,
+  // so a crash mid-write can never leave a truncated box.json that the
+  // strict loader above would then refuse forever.
+  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(stored, null, 2)}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(tmp, 0o600);
+  } catch {
+    // best-effort
+  }
+  try {
+    fs.linkSync(tmp, filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      const winner = loadBoxKeys(filePath);
+      if (winner) {
+        return winner;
+      }
+    }
+    throw err;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+  return pair;
+}
+
+function deriveKey(shared: Buffer, epkRaw: Buffer, recipientRaw: Buffer): Buffer {
+  return Buffer.from(
+    crypto.hkdfSync("sha256", shared, Buffer.concat([epkRaw, recipientRaw]), HKDF_INFO, 32),
+  );
+}
+
+/** Seal plaintext to a recipient's box pubkey. */
+export function sealToBox(recipientPubB64: string, plaintext: string): SealedBlob {
+  const recipientPub = publicKeyFromRawB64(recipientPubB64);
+  const eph = crypto.generateKeyPairSync("x25519");
+  const shared = crypto.diffieHellman({ privateKey: eph.privateKey, publicKey: recipientPub });
+  const epkRaw = rawFromPublicKey(eph.publicKey);
+  const key = deriveKey(shared, epkRaw, Buffer.from(recipientPubB64, "base64"));
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return {
+    v: 1,
+    epk: epkRaw.toString("base64"),
+    iv: iv.toString("base64"),
+    ct: ct.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+  };
+}
+
+/** Open a sealed blob with our box private key. Returns null on any failure. */
+export function openBox(ours: BoxKeyPair, blob: SealedBlob): string | null {
+  try {
+    if (blob?.v !== 1) return null;
+    // Pin the GCM parameters: a 96-bit IV and a full 128-bit tag. Without the
+    // length checks, Node's setAuthTag accepts a 4-byte tag and validates it,
+    // downgrading forgery resistance to 2^32 (security pass M1).
+    const iv = Buffer.from(blob.iv, "base64");
+    const tag = Buffer.from(blob.tag, "base64");
+    if (iv.length !== 12 || tag.length !== 16) return null;
+    const epk = publicKeyFromRawB64(blob.epk);
+    const shared = crypto.diffieHellman({ privateKey: ours.privateKey, publicKey: epk });
+    const key = deriveKey(
+      shared,
+      Buffer.from(blob.epk, "base64"),
+      Buffer.from(ours.publicKeyB64, "base64"),
+    );
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
+    decipher.setAuthTag(tag);
+    const pt = Buffer.concat([decipher.update(Buffer.from(blob.ct, "base64")), decipher.final()]);
+    return pt.toString("utf8");
+  } catch {
+    return null;
+  }
+}

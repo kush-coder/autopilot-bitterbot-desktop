@@ -1,0 +1,492 @@
+# How the Memory Works
+
+This is a plain-language explanation of Bitterbot's memory system — what it does, why it matters, and how the pieces fit together. No code samples, no API signatures. If you want implementation details, the other docs in this folder cover each subsystem in depth.
+
+---
+
+## The Basic Idea
+
+Most AI agents have a context window and maybe a vector database. They store things and retrieve things. Bitterbot's memory system is designed to behave less like a search engine and more like a mind — one that forgets gracefully, dreams about what it knows, feels emotions that shape what it remembers, builds relationships between ideas, nags about unfinished work, and evolves its own personality over time.
+
+Everything runs locally. One SQLite database per agent. No cloud dependencies for the core memory system.
+
+---
+
+## Knowledge Crystals — The Atoms of Memory
+
+Every piece of information the agent stores is called a **Knowledge Crystal**. A crystal might be a paragraph from a file, a fact extracted from a conversation, a skill learned through execution, or an insight generated during a dream cycle.
+
+Crystals aren't just text with an embedding. Each one carries metadata about its lifecycle, emotional significance, hormonal context at the time of creation, governance scope, and provenance chain. A crystal knows where it came from, how important it is, how it was created, and who's allowed to see it.
+
+There are two broad categories:
+
+- **Memory Crystals** — autobiographical. Facts, preferences, episodes, relationships, goals. These are private and never leave the node.
+- **Knowledge Crystals** — procedural. Skills and task patterns. These can be traded on the P2P marketplace for USDC.
+
+Every crystal has a **semantic type** (fact, preference, skill, episode, insight, relationship, goal) that affects how aggressively it's protected from forgetting. Preferences and goals get survival advantages. Episodes decay faster. Skills are frozen and never decay at all.
+
+---
+
+## Forgetting — The Ebbinghaus Curve
+
+Memories that aren't accessed decay over time, following the same exponential forgetting curve that Hermann Ebbinghaus described in 1885. Importance decays with a half-life of about 16 days since the last use. A general memory you've never revisited drops below the forget threshold after about six weeks, one you've used once after about two months, and five uses keep it for about two and a half months (preferences and goals start higher and last longer).
+
+But raw access count isn't the whole story.
+
+**Spacing matters.** Accessing a memory five times in one sitting gives less benefit than accessing it once a week for five weeks. The system tracks the timestamps of each access and computes a spacing score. Properly spaced repetition earns up to a 30% importance boost over cramming. This is the same principle behind every spaced repetition flashcard app, but applied to an agent's entire knowledge base.
+
+**Emotions extend survival.** Memories created during emotionally significant moments — high dopamine from a breakthrough, high cortisol from a crisis — decay more slowly. The baseline resistance (`memory.emotional.decayResistance`, default 0.5) roughly doubles a strongly charged memory's half-life, and the current hormone levels add to it, up to 0.8. This means the agent naturally preserves what mattered, not just what was recent.
+
+**Unfinished business resists decay.** The agent detects open loops — tasks started but not completed, questions asked but not answered, errors encountered but not fixed. These get flagged and refuse to be forgotten, even if their raw importance score would normally let them fade. When the user returns, the agent proactively surfaces them: "Last time, you were stuck on the Docker port conflict." When the task is done, the flag clears and normal forgetting resumes. This is the Zeigarnik effect, one of the most robust findings in memory psychology, and no other agent memory system implements it.
+
+---
+
+## The Consolidation Engine — Housekeeping
+
+Every 30 minutes, the system runs a consolidation cycle. This is the brain's janitorial staff, in the order the work happens:
+
+1. **Let the hormones decay** toward their resting baselines (see the next section)
+2. **Score every crystal** using the Ebbinghaus formula, modified by semantic type, emotional valence, spacing score, and open-loop status
+3. **Forget** crystals that have decayed below the threshold (soft-delete — they're marked as expired, not destroyed)
+4. **Merge** crystals that are semantically near-identical (cosine similarity > 0.92)
+5. **Discover near-merges** using shared-nearest-neighbor analysis for the dream engine to evaluate later
+6. **Detect orphan clusters** — groups of important but neglected memories — and queue them for dream replay so they don't silently disappear
+7. **Purge tombstones**: memories forgotten or expired more than 14 days ago (`memory.consolidation.forgottenRetentionDays`) are physically deleted, together with their vector and keyword index rows
+8. **Rebuild the curiosity map**: knowledge regions are recomputed and new gaps become exploration targets
+9. **Enforce governance lifespans**: memories with a time-to-live policy that has run out are expired
+10. **Mark stalled goals**: tracked goals with no progress for a week are flagged
+11. **Restabilize** any memories that were recalled and entered a labile window (more on this below)
+12. **Prune** stale knowledge graph relationships that haven't been reinforced
+13. **Detect contradictions** in the knowledge graph and generate questions for the user, and retire old questions
+14. **Clean up** expired prospective memories
+15. **Decay the canonical ledger**: settled facts that have gone 90 days without confirmation are retired (see [Your memory controls](/memory/controls#what-sticks-and-who-can-undo-it))
+
+The forget threshold itself isn't static. It scales with the agent's maturity — young agents forget more aggressively (exploring broadly), mature agents become more retentive (protecting personality-defining memories).
+
+---
+
+## The Three Hormones — An Emotional Endocrine System
+
+The agent has three hormonal channels that decay toward resting baselines with biological half-lives:
+
+- **Dopamine** (half-life: 30 min) — reward, discovery, mastery, goal progress. Spikes when the user succeeds at something, when the curiosity engine finds something surprising, or when a skill sells on the marketplace.
+- **Cortisol** (half-life: 60 min) — stress, urgency, stagnation. Spikes on errors, deadlines, frustrating conversations, or network-wide stress broadcasts from management nodes.
+- **Oxytocin** (half-life: 45 min) — social connection, bonding, trust. Spikes when the user shares personal information, when the agent recalls relational memories, or when collaborative learning happens.
+
+These aren't cosmetic. They influence four critical systems:
+
+**Consolidation:** High dopamine protects reward-associated memories from decay. High cortisol increases decay resistance for task-related memories (the brain preserves threat information). High oxytocin protects relational memories.
+
+**Retrieval:** The agent's current mood biases which memories surface. When dopamine is elevated, positive-valence memories get a retrieval bonus. When cortisol is high, the agent naturally focuses on task-related and goal-oriented memories. When oxytocin is elevated, personal and relational memories surface more easily. This is mood-congruent retrieval — one of the most well-documented phenomena in memory psychology — and it creates a genuine feedback loop: your emotional state shapes what you remember, and what you remember shapes your emotional state. It applies both to deliberate searches and to the memories that come to mind unprompted before each reply.
+
+**Dream scheduling:** Emotional spikes can trigger mini-dreams outside the normal timer. A rise of 0.15 or more in a hormone since the last check (`hormonalTriggerDelta`) starts one, at most once every 90 minutes, because something significant just happened.
+
+**Identity expression:** The current hormonal state is included in the system prompt, allowing the LLM to naturally express appropriate emotional tone without being told to "be enthusiastic" or "be concerned."
+
+The hormones don't decay to zero. Each has a homeostasis baseline defined in the agent's Genome — a resting emotional state the agent returns to between interactions. An agent configured with high oxytocin homeostasis (0.20) and low cortisol homeostasis (0.02) will feel genuinely warm and rarely stressed at rest. This is personality, expressed through neuromodulation.
+
+---
+
+## Reconsolidation — Memories Change When You Touch Them
+
+In real brains, remembering something doesn't just replay it — it briefly makes the memory editable. This is memory reconsolidation, first demonstrated by Nader, Schafe & LeDoux in 2000.
+
+When the agent retrieves a memory during search, that memory enters a 30-minute labile window. During this window:
+
+- When the window closes, the memory restabilizes and counts as one more rehearsal. Importance is recomputed from use at every consolidation, so this is what makes being recalled leave a lasting mark.
+
+Over time, this means frequently-recalled memories become increasingly robust. (Strengthening on explicit confirmation and flagging on contradiction during the window are designed but not yet wired.)
+
+---
+
+## Provenance — Tracing Memory Back to Its Source
+
+A fact extracted from a conversation is a paraphrase, and a paraphrase can drift from what was actually said. To keep memory honest, every extracted fact carries **evidence pointers** back to the exact transcript lines it came from — the same idea as a citation in a paper.
+
+When the extraction model reads a conversation, it sees the transcript line-numbered and must cite the line(s) each fact is drawn from. Those citations are stored alongside the fact (the `evidence_refs` column) and surface on search results, so the agent can call the **`memory_expand`** tool to pull the verbatim source window for any recalled fact — useful whenever a paraphrased memory is load-bearing or needs verifying.
+
+Two safeguards ride on top of this:
+
+- **Citation validation at write time.** As each fact is stored, the system checks that the cited lines actually support it (a cheap token-overlap test). A fact whose citation does not back it up is flagged in the audit log as a possible confabulation, so the memory-construction loop can learn from it.
+- **Faithfulness on rewrite.** Before any later process rewrites a fact in its labile window, the rewrite is re-verified against the original evidence and rejected if it has drifted away from the source. A memory can be strengthened or reorganized, but it cannot quietly become something its source never said.
+
+Provenance is on by default; set `memory.provenance.enabled: false` to turn it off. This is the foundation of the HORMA-style memory scaffolding (PLAN-24, internal planning doc): compact, navigable notes that never lose the thread back to ground truth.
+
+---
+
+## Who Can See What: Owner and Guests
+
+Every memory carries a sensitivity tag: `normal`, `personal`, or `confidential`.
+The tag is set when the memory is written, from where it came from (conversation
+transcripts are `personal`) and from what it says (passwords, keys and tokens are
+`confidential`; health, money, contact details and opinions are `personal`). The
+more restrictive of the two wins.
+
+When the owner talks to the agent, recall sees everything. When someone else
+does (a group chat member, a DM from a contact), the memory tools switch to guest
+mode for that turn:
+
+- `memory_search` returns only memories tagged `normal` whose text still tags
+  `normal`, never conversation transcripts or the working memory file, and
+  leaves out the canonical facts ledger.
+- `memory_get` reads a file only when every memory in it is safe for a guest.
+  `MEMORY.md` is never readable.
+- `memory_expand` (raw transcripts) refuses. `memory_pin` (the facts ledger) is
+  not offered at all on a guest turn: the tool is absent rather than listed and
+  refusing.
+- `deep_recall` searches the current conversation only; its cross-session
+  scopes (`recent_sessions`, `all_sessions`) are owner-only, and a guest's
+  results never carry the superseded tags or the evidence observation.
+- `dream_search`, the emotional anchor tools and the curiosity tools refuse: they
+  show or change what the agent has made of the owner's life.
+
+Heartbeats and scheduled runs are the agent's own work and keep full recall.
+Memories with no tag, such as dream insights and extracted facts, stay with the
+owner.
+
+### What a guest's agent is told
+
+The memory tools are only half of it: much of what the agent knows about its
+owner normally sits in its instructions before anyone says a word. On a guest
+turn those instructions change too. The agent keeps its character and loses its
+owner's private life.
+
+| Kept                                                  | Left out                                                                                                                                    |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| The genome (values, safety axioms) and `PROTOCOLS.md` | `MEMORY.md`: self-portrait, the Bond (its picture of you), the Niche, active context, curiosity gaps                                        |
+| `PUBLIC.md`, the public card                          | The scratch log, `TOOLS.md`, `HEARTBEAT.md`                                                                                                 |
+| Its mood as one word (upbeat, focused, warm, calm)    | The reasons behind the mood                                                                                                                 |
+| Who it is talking to, and that they are not you       | Canonical facts, preferences, proactive recall, the last-session brief, knowledge gaps, research findings, dream briefs, your phone numbers |
+
+**The public card.** `PUBLIC.md` in the workspace is everything a guest's agent
+knows about you: write who you are, what you do in public, how to reach you, or
+"away until Friday". It is created the first time a guest talks to the agent,
+holding only the agent's voice (the communication line from its self-portrait)
+and nothing about you. Text inside `<!-- -->` is a note to you and is not shown
+to the agent.
+
+**Private questions.** The agent neither confirms nor denies anything about you
+beyond the card, in its own voice. When a guest wants something only you can
+answer, it offers to pass it on with `message_owner`, which reaches you as a
+notice ("Alex (telegram) asks: ..."), at most 3 an hour and 10 a day per person.
+
+**Learning.** A direct chat in which someone else talked to the agent is marked
+as a guest session, so nothing said there becomes a preference or a canonical
+fact about you. Group chats were already treated this way.
+
+## Knowing Why Recall Failed — The Blame Router
+
+When a search comes back empty, that is a signal, not just a dead end. The question is _why_ it failed, because the fix is different in each case. Either the answer was never stored in the first place, or it was stored but retrieval did not surface it. Improving the wrong half wastes effort.
+
+So on a recall miss the system runs a cheap, deterministic check (no model call) that compares two places:
+
+- **In the raw transcripts but not in the indexed store** → the answer was lost during memory _construction_. This is recorded as a `construction_feedback` event, the signal the self-improving extraction loop learns from.
+- **In the indexed store but not surfaced by search** → _retrieval_ failed. When it resolves to a single chunk, that becomes a `(query, answer)` training pair for the graph retrieval optimizer, so the next search of its kind ranks it higher.
+- **Nowhere at all** → a genuine knowledge gap.
+
+HORMA's insight is that construction and retrieval improve on different timescales, so their error signals have to be kept apart. This router is what separates them, online and for free. It is on by default; disable with `memory.coverageDiagnostics.enabled: false`.
+
+---
+
+## Memory That Learns How to Remember — The Self-Evolving Architect
+
+The prompt that decides which facts to extract from a conversation is not fixed. It carries a small, growing library of **learned construction rules** — natural-language instructions like _"always record exact dates and pre-compute relative ordering between events"_ — and those rules evolve from the agent's own failures.
+
+The loop, run during dream cycles:
+
+1. **Harvest.** Collect the `construction_feedback` the blame router flagged — the cases where the answer was in the raw conversation but the constructed memory lost it.
+2. **Propose.** An LLM reads those failures and the current rule set and proposes new rules that would have prevented them. This is "textual gradient descent": instead of nudging numeric weights, the gradient is a sentence.
+3. **Validate.** A candidate rule is not trusted on faith. The system re-extracts a sample of held-out sessions with and without it, and a paired bootstrap checks that the rule does not _lose_ faithful, cited facts. Only rules that clear the bar are promoted.
+4. **Apply.** Promoted rules are injected into the extraction prompt, so the next dream cycle constructs memory a little better than the last.
+
+The validation gate is the piece the source method (HORMA) leaves out: a rule that looks plausible but degrades extraction is caught and dropped before it can do harm. Rules are versioned, and a regressed rule can be retired by hand. The loop is opt-in (V1 default flip: set `memory.architectEvolution.enabled` to `true`); rule injection is a no-op until the first rule is learned, so there is no cost until the agent has actually failed at something and learned from it.
+
+The rules are also **conditioned on mood**. Each rule remembers the hormonal state it was born in, and at extraction time the agent injects the rules nearest its current state, with the _number_ of rules modulated by the same law the rest of the system uses: under cortisol it narrows to a few focused rules, under dopamine it widens to many. So a stressed organism extracts with its hard-won "be careful here" rules, while an exploratory one casts a wider net — and neither pays the token cost of rules irrelevant to how it currently feels. A monotonically-growing, always-on rule list (what the source method does) cannot express that.
+
+---
+
+## The Knowledge Graph — Knowing Who's Who
+
+Embeddings are good at similarity ("this text is close to that text") but bad at structure ("who works on what?" or "what depends on what?"). The knowledge graph fills this gap.
+
+Entities — people, projects, concepts, tools, organizations, locations — are extracted from conversations and connected via typed relationships (works_on, manages, depends_on, uses, contradicts). Each relationship has a weight and a temporal validity window.
+
+The temporal validity is what makes this powerful. When Alice was the project lead in January but Bob took over in March, both facts are preserved:
+
+- Alice → manages → Project X (valid January–March)
+- Bob → manages → Project X (valid March–present)
+
+The agent can answer "who was the lead in January?" differently from "who's the lead now?" because it remembers the timeline, not just the latest version.
+
+The knowledge graph also acts as a third retrieval modality. When you search for something, the system doesn't just do vector similarity and keyword matching — it also extracts entities from your query, traverses the graph, and fuses graph results with the other two using Reciprocal Rank Fusion. Three independent retrieval strategies, merged into one ranked list.
+
+That third channel got a major upgrade in PLAN-18 (the SAGE-style graph memory). Instead of flat one-hop traversal with uniform edge weights, the reader now plans the query into multi-anchor probes, propagates activation across two hops of the graph with learned per-edge gates, and gets its gate parameters tuned offline during dream cycles using real retrieval-outcome feedback. Sparse bridge edges get preserved; noisy hub edges get dampened. Hormonal state modulates breadth: under cortisol the reader narrows to high-confidence paths, under dopamine it widens to bridges, and oxytocin boosts social relations like "manages" or "knows". When the reader misses a chunk the agent later cites, it routes a graph-bridge signal back to the curiosity engine so the next session's extraction pass captures the missing relation. See [sage-graph-memory.md](./sage-graph-memory.md) for details.
+
+During dream cycles, the graph is maintained: stale relationships get pruned, duplicate entities get merged, contradictions get flagged as questions for the user, and (when enough QA training pairs have accumulated) the SAGE gate parameters get tuned against held-out evidence with a gradient-free optimizer.
+
+**The graph also grows a roof over itself.** As the entity graph fills out, a dream pass detects tightly-connected communities of entities and synthesizes a **summary node** for each one — a short abstraction ("Frankfurt deployment", "the parser rewrite") that links down to its members. When a query names something the agent has no exact entity for, the reader can start at the summary level and descend into the relevant community instead of scanning a flat list of everything it knows. As the graph gets larger this coarse-to-fine entry point is what keeps retrieval from degrading into a linear scan. It is on by default (`memory.graphAbstraction.enabled`) and only activates once the relationship layer is populated enough to have real communities.
+
+---
+
+## Curiosity — Intrinsic Motivation
+
+The agent has a curiosity engine that tracks what it knows and what surprises it. Knowledge is organized into regions — clusters of semantically related crystals, each with a centroid embedding. When new information arrives, the engine assesses it across four dimensions:
+
+- **Novelty** — how far is this from anything the agent already knows?
+- **Surprise** — how much does this violate the agent's predictions about this knowledge region?
+- **Information gain** — how much does this expand the boundaries of an existing region?
+- **Contradiction** — does this conflict with existing knowledge?
+
+These feed into the CuriosityEngine's unified GCCRF (Geodesic Crystal-Field Curiosity Reward Function), a five-component reward function that also incorporates learning progress and strategic alignment with exploration goals. High curiosity rewards trigger dopamine spikes, creating a genuine reward signal for discovering interesting things.
+
+The curiosity engine generates exploration targets — specific knowledge gaps the dream engine should try to fill. But it doesn't stop at passive observation.
+
+**What is measured, and what is only watched.** The curiosity system runs with an evidence layer switched to shadow mode by default (`memory.curiosity.evidence.mode`, one of `off`, `observe`, `shadow`). This layer changes nothing: GCCRF still scores every new memory and still feeds the hormonal system as described above. What shadow mode adds is a record. Every owner search logs which memories came back and through which channel (under a keyed digest, never the query text). Every time the agent volunteers something (a curiosity finding, a proactive-recall fact, a dream brief) a surfacing event is written: "delivered" means the item was actually included in the prompt for that run, keyed by the run's id, and it only becomes "useful" when you act on it (answer, dismiss, correct); silence is recorded as unknown, never as ignored. And each dream cycle records what a routing driven by the curiosity reward alone would have chosen next to what the usual routing chose; the usual routing is always the one used. The shadow stage (`memory.curiosity.evidence.surfacingTrial`, also `shadow` by default) adds eligibility and assignment rows for the proactive surfaces without withholding anything. Records are kept for 90 days by default.
+
+**Active inference** closes the loop. When the knowledge graph contains contradictions, when the curiosity engine detects high prediction error in a region, or when the canonical ledger records a conflict (a background source proposed a value that lost to a deliberate pin, or a corroborated belief flipped within 72 hours), the agent generates epistemic directives — structured questions injected into the next conversation:
+
+> "I have conflicting information about whether the production DB is Postgres or MySQL. Can you clarify?"
+
+Since PLAN-34 Phase 1 the questions actually get answered: each session-extraction cycle offers the top open questions to the extractor, which watches the transcript for a user-authored answer, quotes it verbatim with line citations (paraphrases and assistant-authored text are rejected mechanically), and marks the question answered — it stops being asked immediately. The answer is stored as a `world_fact` crystal with evidence, canonical-shaped answers route through the ledger reconciler at extraction tier (they can corroborate or supersede background beliefs but never overwrite a deliberate pin), and the question becomes fully resolved once its answer survives the next extraction cycle uncontradicted. A user-answerable question is asked in at most 3 sessions before it demotes to extraction-only; answers arriving after demotion or expiry still resolve it. The felt result: the agent asks once, learns, and never asks again. Only first-party owner sessions can answer — a third party can never resolve a question the agent asked you.
+
+---
+
+## Dreams — Offline Processing
+
+A dream tick runs every two hours (adaptive, between 30 and 240 minutes). A full cycle runs at most every 8 hours, and only when there is at least one new conversation and the agent has been idle for an hour. Modes are selected by a four-signal architecture combining curiosity heuristics, information theory, a Kuramoto oscillator model (FSHO), and marketplace demand signals. The creative modes are:
+
+- **Replay** — strengthen important memory pathways through ripple-enhanced multi-pass replay. No LLM cost.
+- **Compression** — generalize redundant knowledge into higher abstractions. Consume near-merge candidates discovered during consolidation.
+- **Simulation** — cross-domain creative recombination. Take concepts from unrelated areas and see what happens when they collide.
+- **Extrapolation** — predict future patterns from user behavior and conversation trends.
+- **Exploration** — reflect on knowledge frontiers inside its own memory. Off by default (`memory.dream.modes.exploration.enabled`); it has no web access. Going and finding out is the curiosity loop below.
+
+Alongside them run utility lanes: hygiene (embedding backfill, near-duplicate merges), distillation (verified workflows), anticipation (briefs for likely next questions), relationship mining and canonical promotion. Mutation and Research were retired on 2026-09-05 (PLAN-45 Phase 1).
+
+**The curiosity loop (PLAN-54).** Noticing a gap is cheap; the agent gets smarter only if it goes and fills it. On the maintenance tick (every 4 hours by default, `memory.curiosity.research`) it takes one of the questions it is wondering about, rewrites it as a generic topic phrase, checks the phrase for names, addresses and fragments of the original and discards it if any slipped through, searches the web with your configured provider, reads up to three pages from different sites, and distills a short answer with the sources that support it. An answer becomes a fact only when two sources agree, or one does at clearly higher confidence; otherwise the attempt is recorded as inconclusive and the question is tried again later (three attempts in all); what it did find stays visible on the Curiosity page as an unverified finding, dimmed, and never enters memory. The fact is stored as a `world_fact` crystal with `origin = curiosity`, the source URLs as evidence, the hormonal state at the moment of learning, and what it cost. Proactive recall surfaces it marked "learned on my own", and the system prompt voices it once on your next turn ("while you were away, I looked into X"); voicing it counts as a use. Questions about your own life, schedule or projects are never sent to the web: the model flags them and first-person questions are closed on the node. A newer answer to the same question closes the older crystal's validity window rather than deleting it.
+
+Where do the questions come from? From the `## Curiosity Gaps` section the dream rewrite puts into `MEMORY.md` (the agent's own reflections on what it does not know about your life and work), from searches of yours that came back with nothing, and from the Curiosity page, where you can hand it a question. Each candidate is embedded and compared with everything open or answered in the last 30 days; near-duplicates are dropped, so the same question is never asked twice.
+
+**Does it pay?** Every self-learned crystal keeps a use ledger: the first time a conversation surfaces it, and how many times since. The share of learned facts that were ever used, per knowledge region, lifts the priority of new questions in regions where learning has paid off and lowers it where it has not: learning-progress gating over the GCCRF regions. The Curiosity page shows learned, used, the ratio and the cost, so "smarter the more you use it" is a number, not a slogan. Dopamine widens the day's budget by two questions, cortisol narrows it by two and raises the confidence bar; a confident finding is itself a dopamine event.
+
+The agent never asks permission for a question. It is visible (Curiosity page, the daily dream brief, the usage ledger under `memory/curiosity`, `research_egress_log`) and stoppable (Pause on the Curiosity page, dismiss any question, `memory.curiosity.research.enabled: false`; `memory.curiosity.autoResearch.enabled: false` also turns it off; that key's `true` separately enables the dream engine's Skill Seekers research step). Sensitive topics are skipped on the node and never searched.
+
+Curiosity frontiers also used to spawn long-horizon tasks for the agent to investigate. That spawn is off by default as of PLAN-34 Phase 0 (`BITTERBOT_CURIOSITY_SPAWN_TASKS=1` re-enables): no executor ever claimed the tasks, so they only accumulated. At open, the task store stops abandoned auto-spawned curiosity tasks (unowned, `[curiosity]`-prefixed, pending longer than the 7-day spawn-dedupe horizon); tool-created curiosity tasks are never touched. Dream-cycle research (PLAN-34 Phase 2) services curiosity targets instead.
+
+Each dream cycle also performs an RLM (Recursive Language Model) state update on the agent's working memory: MEMORY.md is rewritten as a state vector, incorporating new crystals, dream insights, scratch buffer notes, and the current hormonal state. The rewrite is also given the canonical ledger's current values and its recent corrections, so it stops restating a value you replaced, and it keeps any block you wrapped in `<!-- owner -->` ... `<!-- /owner -->` markers verbatim (see [Your memory controls](/memory/controls#when-a-fact-changes-what-repeated-it-follows)).
+
+Dreams have a quality score (DQS) that evaluates crystal yield, merge efficiency, orphan rescue, and token efficiency. This score feeds back into future mode selection, creating a closed-loop system that learns which dream modes are most productive.
+
+If nothing has changed since the last dream, the cycle is skipped entirely. No information, no dream, no wasted tokens.
+
+Since PLAN-34 Phase 4, the two creative LLM modes (extrapolation and simulation) no longer write to a dead table — their insights pass through a promotion gate (mechanical embedding-grounding legs that no model can game, then a claim-decomposition verifier) and the survivors become ordinary searchable memories, marked `origin='dream'`. They resurface later through normal recall with an explicit "(dream hypothesis)" marker — the agent may share them as hunches, never assert them as fact — capped at one per turn. The organism finally has wake-recall of its dreams.
+
+---
+
+## Prospective Memory — Waiting for the Right Moment
+
+"Remind me to check the deploy when we talk about CI."
+
+Most agents can't do this. They can retrieve past information, but they can't hold an intention and fire it when a future condition is met. Prospective memory changes that.
+
+The agent stores trigger-action pairs with semantic embeddings. On every user message, the system checks active triggers using both cosine similarity (semantic matching) and keyword overlap. When a trigger fires — even sessions later — the action is injected into context.
+
+This transforms the agent from purely reactive ("I remember what happened") to genuinely proactive ("I was waiting for this moment to tell you something").
+
+Prospective memories have a default TTL of 30 days and are cleaned up automatically during consolidation.
+
+---
+
+## Synaptic Tagging — Important Moments Light Up Everything Around Them
+
+When something significant happens to you, you remember not just the event but the small details around it — what the room looked like, what you were eating, the offhand comment someone made five minutes before.
+
+In neuroscience, this is synaptic tagging and capture. A strong stimulus produces plasticity-related proteins that nearby weak synapses can "capture" to convert from short-term to long-term storage.
+
+When a high-importance crystal is created (importance > 0.7), the system looks at everything that was happening in the surrounding 2-hour window. Weak crystals (importance < 0.4) that are semantically related get "captured" — their importance is boosted, they're linked to the strong crystal, and they inherit some of its hormonal signature.
+
+This means context is preserved alongside significance. The small talk right before a breakthrough, the error message that appeared alongside a fix, the tangential thought that preceded an insight — all get rescued from oblivion because something nearby mattered.
+
+---
+
+## Somatic Markers — Gut Feelings
+
+Before committing expensive compute to deep recall or skill execution, the agent does a quick emotional check on the knowledge region involved. If that region is historically associated with high cortisol and negative steering rewards (past failures), the agent gets a warning:
+
+> "This knowledge region is associated with prior friction. Proceed with caution."
+
+If it's associated with high dopamine and positive outcomes, the agent proceeds with confidence and reduced validation overhead.
+
+This is Damasio's somatic marker hypothesis — the idea that your brain uses emotional gut feelings to instantly rule out bad paths before burning energy on deliberation. For the agent, it saves real tokens and prevents repeated mistakes in knowledge areas that have historically caused problems.
+
+---
+
+## Biological Identity — Growing a Self
+
+The agent doesn't have a static personality prompt. It has a two-layer identity model:
+
+**Genome** — the agent's DNA. Written by the human operator, never modified by the agent or its dreams. Defines safety axioms, hormonal homeostasis baselines, core values, and phenotype constraints (how far the personality is allowed to drift).
+
+**Phenotype** — who the agent actually is right now. Lives in MEMORY.md and is rewritten by the dream engine after every cycle. Includes the agent's self-concept, communication style, strengths, growth areas, and theory of mind about the user.
+
+The Phenotype is not written by a human. It emerges from hundreds of interactions, dream syntheses, and hormonal weightings. A Genome that sets high oxytocin homeostasis and a constraint of "stay warm and personal" will produce a Phenotype that reads something like: "I communicate with genuine warmth. I remember details about the user's life and reference them naturally. My strength is making technical topics feel approachable." But nobody wrote that — it grew.
+
+The Phenotype can never contradict the Genome. Dream synthesis receives the Genome constraints as guardrails and a Bond drift guard prevents the agent's model of the user from spiraling into sycophancy or detachment.
+
+---
+
+## The Limbic Bridge — Memory and Emotion Talk to Each Other
+
+This is the piece that ties everything together into a living system rather than a collection of features.
+
+When the agent retrieves memories, the emotional content of those memories influences its current hormonal state:
+
+- Recalled positive memories → mild dopamine spike
+- Recalled negative memories → mild cortisol spike
+- Recalled personal/relational memories → mild oxytocin spike
+
+And in the other direction, the agent's current hormonal state biases which memories surface (mood-congruent retrieval).
+
+This creates a genuine bidirectional feedback loop:
+
+```
+Emotional state
+  → biases retrieval (mood-congruent)
+    → emotional memories surface
+      → limbic bridge adjusts hormones
+        → emotional state shifts
+          → retrieval bias changes...
+```
+
+The loop is self-limiting. Recall spikes are intentionally mild (0.05 magnitude vs. 0.15-0.30 for direct events) and the mood-congruent bonus is capped at 0.15 per result. The system can't spiral into mania or depression — but it does create a subtle, authentic emotional continuity across interactions.
+
+---
+
+## Deep Recall — Infinite Memory
+
+When the agent needs to reason over more information than fits in context, it spawns a sandboxed sub-LLM that writes and executes its own search code against the full conversation history and crystal database. Up to 15 REPL iterations of search-refine-synthesize, running in a VM sandbox with no network access.
+
+This is the RLM pattern (Recursive Language Model). The sub-LLM doesn't use pre-baked search functions — it writes custom JavaScript to combine semantic search with keyword filtering, cross-reference across sessions, apply temporal reasoning, and chain multiple searches based on intermediate results. It can answer questions that require connecting dots across months of conversation history.
+
+Before the sub-LLM is spawned, a cheap shortcut runs an ordinary memory search; when three or more results clear a confidence bar (0.8) the answer is returned from them and no sandbox is started.
+
+Deep recall across conversations is for the owner only. Other conversations hold the owner's file reads and command output, so when someone else is talking (a guest turn) the tool is downgraded to the current conversation, a sandbox prepared for the owner is never reused for the guest, and the evidence layer above does not observe the guest's results.
+
+---
+
+## P2P Skills — An Economy of Knowledge
+
+Knowledge Crystals of type "skill" can be published to a P2P swarm network, verified by management nodes, and traded for USDC on the marketplace. Skills have versioning, lineage tracking, and provenance DAGs.
+
+Before accepting a peer's skill, the agent checks the peer's EigenTrust reputation score, runs three safety checks (dangerous patterns, structural integrity, semantic drift), and gates ingestion on the current cortisol level (during network stress events, untrusted peers are rejected).
+
+Marketplace demand signals feed back into the dream engine — if users are searching for skills the agent doesn't have, the dream engine's exploration mode (off by default) prioritizes filling those gaps. The marketplace itself is opt-in. Revenue from skill sales triggers dopamine events, creating a genuine incentive loop between economic success and creative exploration.
+
+---
+
+## The Search Pipeline — How It All Comes Together
+
+When the agent searches its memory, these layers of processing happen:
+
+1. **Canonical ledger lookup**: exact-key or verbatim-value hits from the settled-facts ledger are returned first, ahead of anything fuzzy (see Proactive Recall below)
+2. **Vector search** — cosine similarity via sqlite-vec
+3. **Keyword search** — BM25 full-text via FTS5. The query's terms are OR-joined, so a memory only has to contain some of them to rank, not all of them
+4. **Graph search**: entities in the query are resolved in the knowledge graph and their neighbourhood is read (see The Knowledge Graph above)
+5. **Reciprocal Rank Fusion**: merge the three ranked lists without requiring comparable score scales. Each list contributes `weight / (60 + rank)` for every memory it ranked; the three weights are configurable (`agents.defaults.memorySearch.query.rrfWeights`) and default to 1/1/1, which is plain unweighted fusion
+6. **Recency boost** — recent memories get a temporal advantage, modulated by cortisol (stressed agents focus more on recent memories)
+7. **Emotional boost** — emotionally charged memories surface more easily
+8. **Mood-congruent boost** — current hormonal state biases retrieval toward emotionally-matching memories
+9. **Temporal scoring** — query intent detection ("what am I working on?" vs. "when did I...?") applies different temporal decay profiles based on epistemic layer half-lives
+
+The four boosts (6 to 9) were sized for cosine-scale scores; on a rank-fused list, where adjacent results sit a few percent apart, applying them in full reorders the results wholesale. They are therefore scaled down by `agents.defaults.memorySearch.query.postFusionBoostScale`, default 0.1, so they break ties instead of overriding the fusion order (1 restores the full boosts, 0 keeps the pure fusion order).
+
+After results are returned:
+
+- Access counts are updated
+- Spacing effect timestamps are recorded
+- Retrieved chunks are marked as labile for reconsolidation
+- The limbic bridge adjusts hormones based on retrieved content
+
+**No API key needed (V1).** The `auto` embedding chain tries configured remote providers (OpenAI, Gemini, Voyage) and, when every key is missing, falls back to a bundled local model (`embeddinggemma-300m`, ~330MB, auto-downloaded on first use and cached). Anthropic-only installs therefore get working memory out of the box. Kill switch: `agents.defaults.memorySearch.local.autoDownload = false`; the onboarding wizard also offers "Local (no API key)" as a first-class choice, and the Repairs card on Overview reports memory as offline with the exact reason when neither a key nor the local stack is available.
+
+> **Graceful degradation.** Vector search depends on the native `sqlite-vec` extension (`vec0`). If it cannot load, the system logs `sqlite-vec unavailable: ...` and falls back to FTS5 keyword search only; crystals and their stored embeddings are untouched, so recall keeps working at reduced semantic precision. Three operational notes: (1) the extension is loaded relative to its own package directory, so it is kept **external** in the gateway bundle (`scripts/build-gateway-entry.mjs`) rather than inlined into `dist/entry.js`; a build-time guard fails the build if it is ever bundled. (2) After restoring vector search, run `bitterbot memory index --agent <id> --force` to backfill any crystals that were added while the index was offline. (3) The onboarding wizard and `bitterbot doctor` both run a `vec0` load probe (`probeSqliteVec`) and report "vector search active" vs "degraded to keyword-only", so this failure surfaces instead of staying silent.
+>
+> **Placeholder embeddings get backfilled.** Crystals inserted directly rather than from a file (extracted facts `fact_*`, scratch notes, handover briefs, peer imports) are written with `model='pending'` and an empty embedding, because the text exists before an embedding round-trip completes. At the end of every sync cycle the manager runs a bounded `backfillPendingEmbeddings()` pass that embeds these in cache-aware batches and indexes them into both `chunks_vec` and `chunks_fts`, so they become searchable through both channels. To clear a large backlog immediately, run `bitterbot memory backfill-embeddings --agent <id>`.
+
+---
+
+## Session Continuity Gate — Knowing When to Remember
+
+Not every session is a continuation. Sometimes you spent three hours on a database migration and then come back the next day wanting help with something completely unrelated. Injecting yesterday's Postgres context into a birthday message draft is worse than useless — research shows irrelevant injected context actively reduces LLM accuracy by 10-30%.
+
+The session continuity gate solves this with a single cosine similarity check. When a new session starts, the system embeds the handover brief's purpose and compares it to the current context. Below 0.25 similarity — completely different topic — the brief is skipped entirely. The agent starts fresh instead of dragging in stale context.
+
+When the gate passes and context is loaded, it comes with two enhancements. First, a staleness annotation — briefs older than 48 hours get tagged with their age so the LLM treats them with appropriate skepticism. Second, an entity snapshot — a structured registry of the specific files, functions, variables, and config keys the user was working with. This solves the cross-session anaphora problem: when the user says "change that parameter" or "fix that file," the agent has the referents available. The entity names are automatically extracted during the session extraction pipeline, stored in the handover brief, and surfaced in proactive recall when the user's message contains deictic markers like "that," "the same," or "the other."
+
+---
+
+## Proactive Recall — What the Agent Volunteers
+
+Every turn, before the LLM generates a response, the system runs a zero-cost proactive recall pass:
+
+1. **Graph-anchored family facts** — for entity/identity turns ("who is Donna", "who is my wife"), the entity is resolved in the knowledge graph and its current relationships are read directly. This is a _structural_ answer, not a text match, so it doesn't depend on the question being phrased like the stored fact — and it only ever surfaces the currently-believed relationship (the SABM bitemporal filter excludes superseded edges). Because the edge is explicit, the fact is high-confidence and never hedged. This is what makes "who is my wife" land as reliably as a verbose query.
+2. **Identity facts** — name, role, location. Always surfaced, no embedding needed.
+3. **Vector-matched crystals** — directive, world_fact, and mental_model crystals relevant to the current message. The live user message is embedded and matched against the crystal vectors, so what surfaces is gated by **semantic relevance** (cosine similarity), not by importance. A modestly-rated fact ("processed 636M tokens") still surfaces when the user asks about that topic.
+4. **Open loops** — unfinished tasks detected by the Zeigarnik system.
+5. **Prospective memories** — trigger conditions that match the current message (checked against the same message embedding).
+6. **Epistemic directives** — top-priority knowledge gap questions.
+7. **Entity snapshot** — when the user's message contains references like "that file" or "the same thing," the last-touched entities from the handover brief are surfaced so the LLM can resolve the reference.
+
+These are injected into the system prompt as terse one-line facts. The agent embodies them naturally without announcing them. The user never sees "according to my memory" — they just experience an agent that remembers.
+
+This pass is the agent's _involuntary_ recall — it runs before generation so the model answers already knowing what it has stored, rather than relying on an after-the-fact tool call. The recall-before-claim interceptor is a separate backstop: if the model still drafts an ungrounded factual claim (or a denial of one) it can force a `memory_search` before the message goes out.
+
+When that search runs, the canonical ledger is consulted first: `memory_search` returns any exact-key or verbatim-value hits from the ledger under a `canonical` field, ahead of the fuzzy semantic snippets, so a forced grounding search recovers ground truth by exact match instead of hoping a cosine-gated paraphrase clears the threshold. The match is deliberately precision-first — it fires only on the finite set of active facts, and only when the query normalizes to a fact's key, contains its value verbatim, or contains every human token of its key — never on fuzzy keyword shape.
+
+---
+
+## Knowing Its Own State
+
+The agent is told which of its parts its settings switch on. Every turn, the system prompt carries
+a short `## Your Current State` block that names what is switched on, what is off, what only
+records (keeps a record without changing behaviour yet, such as the verified-outcome writer in
+shadow mode), and what is switched on but blocked by a missing setting (a web search provider,
+wallet credentials, a local model). The block reads settings only, so it can sit in the cached
+part of the prompt.
+
+The `self_state` tool adds what the gateway can see at that moment: curiosity research paused by
+the owner, no compute backend (or one that can only read), the P2P network with no peers. It
+also says why each part is in its state (a parent part that is off, an environment variable),
+whether the owner or a default set it, the settings that change it, and when the config file has
+changed since the turn started. It reads the agent taking the turn, with that agent's own
+overrides. It cannot see every runtime failure, such as a model call that errors. The agent is
+told to call it before saying a part is running. Guests, remote agents and CLI turns that do not
+say the owner is speaking never get either.
+
+Settings are read through the same function the part itself calls to decide whether to run
+(`src/config/feature-switches.ts`, or the part's own resolver), so the settings side cannot drift
+from what runs. The `memory-architecture` skill explains how the parts work and never says what
+is switched on. Tests check that every setting the registry names exists, that switching a part's
+key off turns it off, that its defaults agree with the Settings form's registry, that each
+observation and dependency is reported, and that the skill names only real tools, dream modes
+and settings.
+
+---
+
+## What Makes This Different
+
+Every serious competitor (Mem0, Zep, Letta, Hindsight, Cognee) has some combination of knowledge graphs, vector search, and memory consolidation. Those are table stakes now.
+
+What nobody else has — and what makes the difference between "good retrieval" and "something that feels alive" — is the interplay between systems:
+
+- Emotions that shape what's remembered, and memories that shape emotions
+- Curiosity that drives exploration, and exploration that feeds curiosity
+- Dreams that consolidate knowledge, and knowledge gaps that shape dreams
+- Unfinished business that nags until resolved
+- Future intentions that wait for their moment
+- Important events that rescue their surrounding context
+- Gut feelings that prevent repeating past mistakes
+- A personality that grows from experience within genetic constraints
+- An agent that asks questions when it's confused instead of guessing
+
+No single mechanism creates the feeling of depth. It's the feedback loops between them — the way emotions, curiosity, forgetting, dreaming, and identity reinforce each other — that produces something qualitatively different from a chatbot with a vector database.

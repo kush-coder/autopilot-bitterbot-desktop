@@ -1,0 +1,122 @@
+import {
+  cancel,
+  confirm,
+  intro,
+  isCancel,
+  log,
+  multiselect,
+  type Option,
+  outro,
+  password,
+  select,
+  spinner,
+  text,
+} from "@clack/prompts";
+import { createCliProgress } from "../cli/progress.js";
+import { note as emitNote } from "../terminal/note.js";
+import { stylePromptHint, stylePromptMessage, stylePromptTitle } from "../terminal/prompt-style.js";
+import { theme } from "../terminal/theme.js";
+import type { WizardProgress, WizardPrompter } from "./prompts.js";
+import { WizardCancelledError } from "./prompts.js";
+
+// @clack/prompts >= 1.8 types isCancel() as narrowing to its own unique
+// CANCEL_SYMBOL, and prompt results infer T with that symbol inside it. Strip
+// any symbol so callers get the plain answer type.
+function guardCancel<T>(value: T | symbol): Exclude<T, symbol> {
+  if (isCancel(value) || typeof value === "symbol") {
+    cancel(stylePromptTitle("Setup cancelled.") ?? "Setup cancelled.");
+    throw new WizardCancelledError();
+  }
+  return value as Exclude<T, symbol>;
+}
+
+export function createClackPrompter(): WizardPrompter {
+  return {
+    intro: async (title) => {
+      intro(stylePromptTitle(title) ?? title);
+    },
+    outro: async (message) => {
+      outro(stylePromptTitle(message) ?? message);
+    },
+    note: async (message, title) => {
+      emitNote(message, title);
+    },
+    select: async (params) =>
+      guardCancel(
+        await select({
+          message: stylePromptMessage(params.message),
+          options: params.options.map((opt) => {
+            const base = { value: opt.value, label: opt.label };
+            return opt.hint === undefined ? base : { ...base, hint: stylePromptHint(opt.hint) };
+          }) as Option<(typeof params.options)[number]["value"]>[],
+          initialValue: params.initialValue,
+        }),
+      ),
+    multiselect: async (params) =>
+      guardCancel(
+        await multiselect({
+          message: stylePromptMessage(params.message),
+          options: params.options.map((opt) => {
+            const base = { value: opt.value, label: opt.label };
+            return opt.hint === undefined ? base : { ...base, hint: stylePromptHint(opt.hint) };
+          }) as Option<(typeof params.options)[number]["value"]>[],
+          initialValues: params.initialValues,
+        }),
+      ),
+    text: async (params) => {
+      const validate = params.validate;
+      if (params.sensitive) {
+        // Secrets (API keys) are masked as typed and never echoed.
+        return guardCancel(
+          await password({
+            message: stylePromptMessage(params.message),
+            validate: validate ? (value) => validate(value ?? "") : undefined,
+          }),
+        );
+      }
+      return guardCancel(
+        await text({
+          message: stylePromptMessage(params.message),
+          initialValue: params.initialValue,
+          placeholder: params.placeholder,
+          validate: validate ? (value) => validate(value ?? "") : undefined,
+        }),
+      );
+    },
+    confirm: async (params) =>
+      guardCancel(
+        await confirm({
+          message: stylePromptMessage(params.message),
+          initialValue: params.initialValue,
+        }),
+      ),
+    section: (info) => {
+      if (!info) {
+        return;
+      }
+      log.step(
+        stylePromptTitle(`Step ${info.index} of ${info.total}: ${info.title}`) ?? info.title,
+      );
+    },
+    progress: (label: string): WizardProgress => {
+      const spin = spinner();
+      spin.start(theme.accent(label));
+      const osc = createCliProgress({
+        label,
+        indeterminate: true,
+        enabled: true,
+        fallback: "none",
+      });
+      return {
+        update: (message) => {
+          spin.message(theme.accent(message));
+          osc.setLabel(message);
+        },
+        stop: (message) => {
+          osc.done();
+          spin.stop(message);
+        },
+      };
+    },
+  };
+}

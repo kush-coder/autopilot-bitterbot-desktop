@@ -1,0 +1,442 @@
+# Curiosity & Search — Curiosity Engine and Retrieval System
+
+The curiosity engine identifies knowledge gaps by tracking what the system knows (knowledge regions), what surprises it (novelty assessment), and what the user searches for but can't find (gap detection). Since PLAN-54 (2026-10-07) the loop is closed: open questions are researched on the web on a schedule, verified against at least two sources, stored with provenance, surfaced in conversation marked "learned on my own", and counted when a conversation uses them, so the agent learns where learning pays off. The search system combines BM25 keyword matching with multi-perspective vector search for robust retrieval.
+
+**Key source files:** `curiosity-engine.ts`, `curiosity-types.ts`, `gccrf-reward.ts`, `mem-store.ts`, `user-model.ts`, `task-memory.ts`
+
+---
+
+## Curiosity Engine
+
+The `CuriosityEngine` (`curiosity-engine.ts`) maintains a map of what the system knows and detects gaps in that knowledge.
+
+### Knowledge Regions
+
+Regions are clusters of related knowledge, each with a centroid embedding:
+
+```typescript
+type KnowledgeRegion = {
+  id: string;
+  label: string;
+  centroid: number[];
+  chunkCount: number;
+  totalAccesses: number;
+  meanImportance: number;
+  predictionError: number; // How often this region surprises us
+  learningProgress: number; // Rate of prediction error reduction
+  createdAt: number;
+  lastUpdatedAt: number;
+};
+```
+
+Regions are rebuilt periodically during `run()`. The maximum number of regions is configurable (default: 50).
+
+### Unified GCCRF Scoring
+
+When a new chunk is indexed, `assessChunk()` uses the internal GCCRF reward function to evaluate it across 5 components:
+
+| Component                   | What it measures                                   | Weight |
+| --------------------------- | -------------------------------------------------- | ------ |
+| η (Prediction Error)        | Distance from nearest knowledge region centroid    | 0.25   |
+| Δη (Learning Progress)      | Per-region improvement in prediction accuracy      | 0.20   |
+| Iα (Info-Theoretic Novelty) | Density-based novelty with developmental annealing | 0.25   |
+| E·μ (Empowerment)           | Knowledge agency gated by uncertainty              | 0.20   |
+| S (Strategic Alignment)     | Alignment with active exploration targets          | 0.10   |
+
+Additionally, **contradiction detection** runs separately: it flags chunks with high cosine similarity (0.85 to 0.98) but different content hashes as _candidate_ conflicts. Near-identical embeddings (cosine >= 0.98) with different bytes are duplicates or paraphrases and score 0. This is a candidate signal for target generation, not an adjudication that the two chunks contradict each other; contradictions do not influence the reward score.
+
+```typescript
+type SurpriseAssessment = {
+  chunkId: string;
+  noveltyScore: number; // Maps to η (prediction error)
+  surpriseFactor: number; // Maps to Δη (learning progress)
+  informationGain: number; // Maps to Iα (info-theoretic novelty)
+  contradictionScore: number; // Standalone signal, not in GCCRF
+  compositeReward: number; // Final GCCRF reward [0,1]
+  regionId: string | null;
+  assessedAt: number;
+  gccrfComponents?: { eta; deltaEta; iAlpha; empowerment; strategic };
+  gccrfReward?: number;
+};
+```
+
+The GCCRF reward is written directly to `chunks.curiosity_reward`. The system also uses **alpha annealing** — young agents are rewarded for exploring common knowledge (α = -3), while mature agents are rewarded for frontier exploration (α → 0). See [Curiosity Reward Function](./curiosity-reward.md) for full details.
+
+### Gap Detection
+
+The engine detects knowledge gaps from two signals:
+
+1. **Low-score searches** — A query that returns results below `gapScoreThreshold` (default 0.5) becomes its own `knowledge_gap` target (one per query, embedding-deduped against everything open or answered in the last 30 days).
+2. **Working-memory questions** — The `## Curiosity Gaps` bullets the dream rewrite writes into `MEMORY.md` become `question` targets after every rewrite. These are the best questions the agent has: grounded in the owner's actual life and work.
+3. **Owner questions** — `curiosity.ask` (the Curiosity page) queues a question at top priority.
+
+The former "emerging skill" frontier generator was deleted: it mistook handover briefs and READMEs for skills.
+
+### Exploration Targets
+
+```typescript
+type ExplorationTargetType =
+  | "knowledge_gap" // Missing knowledge detected from search
+  | "contradiction" // Conflicting information found
+  | "stale_region" // Region with declining learning progress
+  | "frontier" // Edge of knowledge — opportunity to expand
+  | "graph_bridge"; // PLAN-18: the graph reader missed a chunk that vector/FTS found
+
+type ExplorationTarget = {
+  id: string;
+  type: ExplorationTargetType;
+  description: string;
+  priority: number;
+  regionId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  resolvedAt: number | null;
+  expiresAt: number; // 48h for engine targets, 14 days for questions
+};
+```
+
+Two more things live on the `curiosity_targets` row but outside the engine's type: the `question` row type (working-memory and owner questions, written by `curiosity-gaps.ts` and `curiosity.ask`, never produced by the engine itself), and the research columns `attempts` (closed as `unanswered` once it reaches `research.maxAttempts`, default 3) and `embedding_json` (for dedupe), which `curiosity-gaps.ts` reads directly.
+
+Maximum active targets: 10 (configurable). Expired targets are cleaned up during `run()`.
+
+### The research loop (PLAN-54)
+
+`src/memory/curiosity-researcher.ts`, on the maintenance tick, every `intervalMinutes` (240). One pass has an 8-minute wall-clock deadline; targets not started by then wait for the next pass:
+
+1. Pick up to 4 researchable targets (`question`, or `metadata.researchable = 1`), ranked by priority plus 0.25 × the region's curiosity ROI, minus 0.1 per prior attempt.
+2. Skip sensitive topics on the node (`isSensitiveTopic`), and questions the web cannot answer: the model marks `web_answerable` false for questions about the author's own life, schedule, people, projects or files, and any possessive first-person question ("my", "our", "mine", "ours") is closed as `not_web_answerable` without a web search (the rewrite call below still runs first). Rewrite the question as a search phrase with the agent's own model (a genuinely local model when configured), which also declares the public subject terms it kept (at most 4, each copied from the question). Reject the phrase if it contains an email, a URL, the owner's name or any knowledge-graph person/organization/project (checked on the raw phrase, so a "public term" can never launder a private name), a 3-token fragment or three copied bigrams of the question outside the declared public terms, or a copied non-ASCII token. `research.strictEgress: true` ignores declared public terms (then named technologies cannot be searched). A rejected phrase is never sent; the page shows the question as held back.
+3. Search (`runConfiguredWebSearch`, one retry with "explained"), fetch up to `maxPagesPerTarget` (3) pages from distinct hosts through the SSRF guard, log every egress to `research_egress_log`.
+4. Distill a ≤120-word answer with `confidence` and `supporting_sources`. Verified when confidence ≥ `minConfidence` (0.45) and two sources support it, or one does at confidence ≥ floor + 0.15 (that single-source bar is capped at 0.95).
+5. Store: a `world_fact` chunk (`origin = curiosity`, `path = curiosity/<target>`, evidence URLs, `valid_time_start`), a `curiosity_findings` row (question, phrase, answer, confidence, sources, hormonal state, cost, chunk), and a `research_findings` line the system prompt voices once. An earlier answer to the same target gets `valid_time_end` and is archived, never deleted. The target resolves with `researchOutcome = learned`; a dopamine `curiosity_progress` event fires.
+6. Otherwise the outcome is `inconclusive` (retry later) or, on the last attempt, `unanswered`. The answer it did find is kept as an unverified finding (`curiosity_findings.verified = 0`, no chunk, never voiced, excluded from utility and the brief) and shown dimmed on the Curiosity page as "found, but not confident enough to remember", so a miss is never silent.
+
+Budget: `maxPerDay` (10) questions per UTC day, +2 when dopamine > 0.65, −2 when cortisol > 0.65 (cortisol also raises the confidence floor by 0.1, to at most 0.9). Pause state lives in `memory_meta`.
+
+Use ledger (`src/memory/curiosity-use.ts`): memory search and proactive recall call `recordCuriosityUse` for any self-learned chunk they return; `curiosityRoiByRegion` feeds step 1. Evidence layer (`memory.curiosity.evidence`, default `shadow`): every owner search writes its top-K chunk ids under a keyed query digest, every voiced finding, proactive-recall fact and dream brief writes a `delivered` row, and a dismiss labels it `explicit`; since PLAN-59 Phase 2 the shadow surfacing trial (`evidence.surfacingTrial`, default `shadow`) logs each of those as `eligible` and `assigned` to a randomised-block arm first, without changing what is delivered; see [Evidence telemetry](/memory/evidence-telemetry). RPCs: `curiosity.status`, `curiosity.list`, `curiosity.pause`, `curiosity.resume`, `curiosity.dismiss`, `curiosity.ask`, `curiosity.runNow`; the same from the terminal as [`bitterbot curiosity`](/cli/curiosity).
+
+Private names come from the knowledge graph's `person`, `organization` and `project` entities. A "person" that is not a name ("here", "commands", a peer id) is filed as a `concept` at write time (`looksLikePersonName`) and migration v75 reclassified existing rows, so the filter blocks people, not ordinary words.
+
+### Bounty System (Phase 3)
+
+Management nodes can publish **global curriculum bounties** — network-wide exploration targets that tell every edge node "we need knowledge about X." Bounties arrive via Gossipsub and are ingested as ultra-high-priority exploration targets.
+
+#### Bounty Ingestion
+
+`CuriosityEngine.ingestBounty()` receives bounty events from `SkillNetworkBridge.handleBountyEvent()`:
+
+```typescript
+curiosityEngine.ingestBounty({
+  bountyId: "bounty-001",
+  targetType: "knowledge_gap", // maps to ExplorationTargetType
+  description: "Production debugging patterns for memory leak detection",
+  priority: 0.8,
+  rewardMultiplier: 2.5,
+  regionHint: "debugging",
+  expiresAt: Date.now() + 86_400_000,
+});
+```
+
+**Priority boost**: Bounty priority is doubled (capped at 1.5), making bounties consistently rank above locally-generated targets. The description is prefixed with `[BOUNTY {id}]` and metadata includes `{ isBounty: true, rewardMultiplier }`.
+
+#### Bounty Matching
+
+`CuriosityEngine.checkBountyMatch()` runs when a skill is crystallized. It keyword-matches the crystal's text against active bounty descriptions:
+
+```typescript
+const match = curiosityEngine.checkBountyMatch(crystalId, crystalText);
+// match: { bountyId: "bounty-001", rewardMultiplier: 2.5 } | null
+```
+
+When a match is found:
+
+1. The bounty target is resolved (`resolvedAt` set)
+2. The `SkillNetworkBridge` applies a massive **dopamine boost**: `"achievement"` events are stimulated `ceil(rewardMultiplier)` times (capped at 5)
+3. The crystal is updated with `bounty_match_id` and `bounty_priority_boost`
+4. The crystal is auto-published to the network (priority upload for bounty matches)
+
+This creates a network-wide incentive loop: management nodes post bounties, edge nodes prioritize those exploration targets in dream cycles, and matching crystals get rewarded with dopamine boosts that strengthen related memory pathways.
+
+---
+
+## Curiosity-Dream Feedback Loop
+
+The curiosity engine and dream engine form a bidirectional feedback loop:
+
+```mermaid
+flowchart LR
+    subgraph Curiosity Engine
+        A[Gap Detection] --> B[Exploration Targets]
+        F[Novelty Assessment] --> G[Importance Boost]
+        BN[Bounty Ingestion] --> B
+    end
+
+    subgraph Dream Engine
+        C[Exploration Mode] --> D[Generate gap-filling content]
+        D --> E[New Dream Insights]
+    end
+
+    subgraph P2P Network
+        MN[Management Node] -->|signed bounty| BN
+    end
+
+    B -->|targets feed| C
+    E -->|assessDreamInsight| F
+
+    subgraph Weight Adjustment
+        H[getDreamModeWeightAdjustments]
+    end
+
+    B -->|many gaps?| H
+    H -->|boost exploration weight| C
+```
+
+### Curiosity -> Dream
+
+1. **Target feeding** — The dream engine's exploration mode (off by default, no web) reflects on unresolved targets; the research loop above is what actually answers them
+2. **Weight adjustment** — `getDreamModeWeightAdjustments()` shifts dream mode selection based on curiosity state:
+   - Many knowledge gaps -> boost `exploration` mode weight
+   - Many contradictions -> boost `simulation` mode weight
+   - Many frontiers -> boost `distillation` mode weight
+
+### Dream -> Curiosity
+
+`assessDreamInsight()` checks each new dream insight against existing curiosity state:
+
+- **Gap filling** — If the insight's embedding is close to a knowledge gap target, the target is resolved
+- **Contradiction closure**: a `simulation` insight with confidence >= 0.7 resolves a contradiction target only when it is scoped to that target: it was dreamed from one of the chunks the contradiction was detected on, or it lands in the target's region (cosine >= 0.6 to the centroid) and its text names a term of the region label. An unrelated simulation leaves every contradiction target open. The normal closure path for targets remains the PLAN-54 research loop above.
+- **Frontier opening** — If the insight represents genuinely novel territory, a new `frontier` target is created
+
+---
+
+## Search System
+
+### Hybrid BM25 + Vector Search
+
+The primary search path in `MemoryIndexManager.search()` combines two retrieval methods:
+
+```mermaid
+flowchart TB
+    A[Search Query] --> B[Embed query via provider]
+    A --> C[Build FTS5 query]
+
+    B --> D[Vector search via sqlite-vec]
+    C --> E[Keyword search via FTS5/BM25]
+
+    D --> F[mergeHybridResults]
+    E --> F
+
+    F --> G[Apply importance boost]
+    G --> H[Sort by score, filter by minScore]
+    H --> I[Track search hits on chunks]
+    H --> J[Record query for curiosity gap detection]
+    H --> K[Return results]
+```
+
+**Hybrid merging** uses reciprocal rank fusion by default (`mergeStrategy: "rrf"`); the legacy `vectorWeight` / `textWeight` pair (0.7 + 0.3) applies only with `mergeStrategy: "weighted"`. BM25 ranks are converted to [0,1] scores via `bm25RankToScore()`. A PLAN-18 graph-reader channel joins the fusion as a third ranked list when the knowledge graph is populated.
+
+**RRF channel weights.** Under RRF each channel contributes `weight / (k + rank)` for every result it ranked, with `query.hybrid.rrfWeights: { vector, keyword, graph }` and `query.hybrid.rrfK` (default 60). The default is 1/1/1, plain unweighted RRF; a weight of 0 silences a channel without changing what it retrieves (a result found only by a silenced channel is dropped). Negative or non-finite values fall back to the default with a warning. On one node's real memory the keyword channel carries the fused list (names, paths and identifiers): a 2026-10-29 sweep on 318 generated questions found vector 0.1 / keyword 1 best by a wide margin, but on the agent's 68 real, shorter queries no keyword-heavier setting was better than 1/1/1 (vector 0.25: MRR 0.402 against 0.400, hit@5 identical), so the generated-question gain did not transfer and the default was kept. Vector 0.25 and 0.1 are non-inferior on real queries and available as configuration; a LongMemEval-S retrieval check at 0.25 is the precondition for any future default change. Measurement and decision rule: [the fusion-weights research page](../research/fusion-weights-2026-10-29.md).
+
+**Keyword query shape.** `buildFtsQuery()` OR-joins the query's terms for the FTS5 `MATCH`, dropping a short shared stopword list when the query has three or more tokens (a one- or two-word lookup keeps every word) and capping at 16 distinct terms. bm25 then ranks chunks by how many of the terms they contain and how rare those terms are, so a chunk holding every term still sorts first. Until 2026-10-27 the terms were AND-joined: a chunk had to contain every token, which held for terse lookups and for no conversational question, and the per-channel diagnostics showed the keyword channel contributing nothing to natural-language queries on the live store or the LongMemEval baseline. The `fusion` field still reports `rrf` in that case, so look at `channels.keyword` presence, not `fusion`, to tell whether the keyword channel took part.
+
+**Post-fusion boosts are bounded.** After fusion the search still applies the recency boost (`query.recency`, up to 1.5x with a 48 h half-life), an emotional-valence boost, the mood-congruent bonus and the temporal-intent multiplier (which for an ordinary question halves a memory's score every 45 days). Those multipliers were sized for cosine-scale scores. Under RRF the fused score is rank-only and adjacent ranks sit 1 to 3% apart, so the full multipliers reordered the list wholesale: on a 60-question held-out set built from one node's own memory (`benchmarks/live-recall/`, 2026-10-27), chunks ranked first by both channels landed at fused positions 13 to 23 and the fused list recalled less than either channel alone. `query.postFusionBoostScale` (default 0.1) shrinks every boost toward the fused score: a 1.5x boost becomes 1.05x, the six-month decay 0.906x, enough to break near-ties and not enough to overrule the channels.
+
+| `postFusionBoostScale`  | fused R@1 | fused R@5 | fused MRR |
+| ----------------------- | --------- | --------- | --------- |
+| 1 (legacy, full boosts) | 3.3%      | 8.3%      | 0.063     |
+| 0.25                    | 15.0%     | 33.3%     | 0.241     |
+| 0.1 (default)           | 20.0%     | 40.0%     | 0.276     |
+| 0 (pure fusion order)   | 26.7%     | 41.7%     | 0.336     |
+
+Vector alone scored 23% R@5 and keyword alone 55% on that set. The boosts did not help even the questions with explicit "currently / right now" intent (0 of 5 under the legacy setting, 1 of 5 bounded). Operators who want pure fusion order set the scale to 0; the LongMemEval retrieval runner pins 1 so its saved runs stay comparable (its sessions carry synthetic dates).
+
+**The clock is injectable.** Every age-dependent boost measures from `opts.now` when `manager.search(query, { now })` is given one, and from the wall clock otherwise. Nothing in the agent passes it; it exists so a benchmark that replays a dated history (the official-protocol LongMemEval runner back-dates each session's chunks to the session and asks each question at its `question_date`) scores a 2023 memory as it would have been scored in 2023 rather than as three years old.
+
+**Per-channel diagnostics (PLAN-58).** Every result carries `channels` and `fusion` alongside the fused `score`:
+
+```ts
+type MemorySearchResult = {
+  score: number; // fused; under RRF this is rank-only and tops out near 3/61
+  fusion?: "rrf" | "weighted" | "vector-only";
+  channels?: {
+    vector?: { rank: number; score: number }; // 1-based rank, cosine
+    keyword?: { rank: number; score: number }; // 1-based rank, bm25RankToScore
+    graph?: { rank: number; score: number }; // 1-based rank, graph reader score
+  };
+  // ...
+};
+```
+
+A channel that did not return the chunk is absent, never zero-filled. The ranks are the same ones `rrfFuse` used (it reports them as `sourceRanks`), so a consumer can see _why_ a memory matched: vector consensus, an exact keyword hit, a graph hop, or several at once. Anything that needs "how similar" (the `deep_recall` shortcut, thresholds, evaluation) must read `channels.vector.score`, not the fused RRF score.
+
+What the **model** sees is a config decision, `agents.defaults.memorySearch.query.channelDiagnostics`: `"ranks"` (default) adds a compact `{v, k, g}` rank map to each `memory_search` result (about 12 tokens); `"full"` adds native scores too; `"off"` makes tool output byte-identical to before. Programmatic callers of `manager.search()` always get the full block. Guest searches never carry it. `manager.status().search` reports which channels are live (`vector`, `keyword`, `graph`) and the fusion in effect.
+
+**Importance boost** applies a multiplicative factor:
+
+```
+boostedScore = score * (1 - importanceWeight + importanceWeight * importanceScore)
+```
+
+---
+
+## User Model
+
+The `UserModelManager` (`user-model.ts`) tracks user preferences and behavioral patterns.
+
+### Preference Extraction
+
+`extractPreferences()` scans text for user preferences using 7 regex-based extractors:
+
+| Category        | Pattern examples                    |
+| --------------- | ----------------------------------- |
+| `language`      | "prefer TypeScript", "I use Python" |
+| `tool`          | "using VSCode", "prefer vim"        |
+| `style`         | "like functional", "prefer OOP"     |
+| `workflow`      | "TDD approach", "CI/CD pipeline"    |
+| `communication` | "be concise", "explain in detail"   |
+
+Preferences are upserted with confidence boosting (+0.1 on repeated detection).
+
+```typescript
+type UserPreference = {
+  id: string;
+  category: "tool" | "language" | "style" | "workflow" | "communication";
+  key: string;
+  value: string;
+  confidence: number;
+  evidenceIds: string[];
+  createdAt: number;
+  updatedAt: number;
+};
+```
+
+### Pattern Detection
+
+`detectPatterns()` analyzes multiple texts to find recurring action patterns. Called during dream extrapolation mode. Requires >= 3 texts, returns patterns with frequency >= 2.
+
+```typescript
+type UserPattern = {
+  pattern: string;
+  frequency: number;
+  lastOccurrence: number;
+  predictiveValue: number;
+};
+```
+
+---
+
+## Task Memory
+
+The `TaskMemoryManager` (`task-memory.ts`) tracks user goals and their progress.
+
+### Goal Lifecycle
+
+```typescript
+type TaskGoal = {
+  id: string;
+  description: string;
+  progress: number; // 0-1
+  relatedCrystalIds: string[];
+  sessionKey: string | null;
+  status: "active" | "completed" | "stalled" | "abandoned";
+  createdAt: number;
+  updatedAt: number;
+};
+```
+
+**Auto-detection**: `detectGoals()` scans conversational text for goal-like statements ("I want to...", "I need to...", "let's...", "plan to..."). Returns up to 5 descriptions (minimum 10 characters each).
+
+**Stall detection**: `markStalledGoals()` runs periodically and marks goals as `stalled` if no progress update within 7 days (configurable).
+
+**Crystal linking**: Goals can be linked to relevant knowledge crystals via `linkCrystal()`, connecting user intent to system knowledge.
+
+### Integration with Skills Pipeline
+
+Active and stalled goals feed into the `DiscoveryAgent`'s `goal_alignment` strategy for proactive skill suggestions. When a goal is stalled, the system looks for marketplace skills that could help unstall it.
+
+---
+
+## Configuration Reference
+
+### Curiosity Config
+
+```typescript
+type CuriosityConfig = {
+  enabled?: boolean; // Default: true
+  weights?: Partial<CuriosityWeights>;
+  boostThreshold?: number; // Default: 0.4
+  boostMultiplier?: number; // Default: 1.3
+  maxRegions?: number; // Default: 50
+  maxTargets?: number; // Default: 10
+  targetTtlHours?: number; // Default: 48
+  maxQueryHistory?: number; // Default: 200
+  gapScoreThreshold?: number; // Default: 0.5
+  fshoCoupling?: boolean; // Default: false (FSHO R modulates GCCRF alpha; see curiosity-reward.md)
+  evidence?: {
+    mode?: "off" | "observe" | "shadow"; // Default: "shadow" (see evidence-telemetry.md)
+    retentionDays?: number; // Default: 90
+    topK?: number; // Default: 10 (capped at 200)
+    surfacingTrial?: {
+      mode?: "off" | "shadow"; // Default: "shadow"
+      blockMinutes?: number; // Default: 240
+      carryOverDays?: number; // Default: 7
+      seed?: string; // Default: derived from the node's evidence digest key
+    };
+  };
+  research?: {
+    enabled?: boolean; // Default: true (autoResearch.enabled=false also disables)
+    intervalMinutes?: number; // Default: 240
+    maxPerDay?: number; // Default: 10
+    maxSearchesPerTarget?: number; // Default: 2
+    maxPagesPerTarget?: number; // Default: 3
+    minConfidence?: number; // Default: 0.45
+    blockedDomains?: string[]; // Default: []
+    maxAttempts?: number; // Default: 3
+    strictEgress?: boolean; // Default: false (true ignores declared public terms)
+  };
+  requestFrequency?: {
+    enabled?: boolean; // Default: true (repeated-query analyzer over curiosity_queries)
+    lookbackDays?: number; // Default: 7
+    minFrequency?: number; // Default: 3 (phrase repeats before it becomes a signal)
+    maxSignals?: number; // Default: 5 (signals emitted per run)
+    ttlDays?: number; // Default: 14 (TTL of the injected knowledge_gap targets)
+  };
+};
+
+// Default weights
+const DEFAULT_CURIOSITY_WEIGHTS = {
+  novelty: 0.3,
+  surprise: 0.25,
+  informationGain: 0.25,
+  contradiction: 0.2,
+};
+```
+
+### Emotional Config
+
+```typescript
+type EmotionalConfig = {
+  enabled?: boolean; // Default: true
+  decayResistance?: number; // Default: 0.5
+  sentimentAnalysis?: "keyword" | "hybrid" | "llm" | "none";
+  hormonal?: {
+    enabled?: boolean;
+    dopamineHalflife?: number; // Default: 30 min (ms)
+    cortisolHalflife?: number; // Default: 60 min (ms)
+    oxytocinHalflife?: number; // Default: 45 min (ms)
+  };
+  userModel?: {
+    enabled?: boolean;
+    extractPreferences?: boolean;
+    detectPatterns?: boolean;
+  };
+};
+```
+
+---
+
+## Related Documentation
+
+- [Architecture Overview](./architecture-overview.md) — system entry point and file map
+- [Knowledge Crystals](./knowledge-crystals.md) — core data model and lifecycle
+- [Dream Engine](./dream-engine.md) — how curiosity targets feed dream exploration
+- [Skills Pipeline](./skills-pipeline.md) — skill suggestions from curiosity gaps

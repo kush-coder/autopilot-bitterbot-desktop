@@ -1,0 +1,3608 @@
+pub mod http;
+
+use base64::Engine as _;
+use crate::crypto;
+use crate::ipc::IpcCommand;
+use crate::security::SecurityValidator;
+use ed25519_dalek::SigningKey;
+use futures::StreamExt as _;
+use libp2p::{
+    autonat,
+    dcutr,
+    gossipsub::{self, MessageAuthenticity, ValidationMode},
+    identify,
+    kad::{self, store::MemoryStore},
+    noise, relay, request_response, tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    swarm::behaviour::toggle::Toggle,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+/// Gossipsub topic for skill propagation.
+pub const SKILLS_TOPIC: &str = "bitterbot/skills/v1";
+/// Gossipsub topic for telemetry data.
+pub const TELEMETRY_TOPIC: &str = "bitterbot/telemetry/v1";
+/// Gossipsub topic for hormonal weather broadcasts.
+pub const WEATHER_TOPIC: &str = "bitterbot/weather/v1";
+/// Gossipsub topic for global curriculum bounties.
+pub const BOUNTIES_TOPIC: &str = "bitterbot/bounties/v1";
+/// Gossipsub topic for bootnode census snapshots — periodic publishes
+/// from nodes running with `--bootnode-mode` so management nodes (and any
+/// other interested subscriber) get a real-time view of network-wide
+/// lifetime peer counts without polling the bootnode's HTTP endpoint.
+pub const CENSUS_TOPIC: &str = "bitterbot/census/v1";
+/// Gossipsub topic for peer-to-peer knowledge queries.
+pub const QUERIES_TOPIC: &str = "bitterbot/queries/v1";
+/// Signed, expiring capacity descriptors; never workload inputs or credentials.
+pub const COMPUTE_TOPIC: &str = "bitterbot/compute/v1";
+
+fn is_gateway_topic(topic: &str) -> bool {
+    topic == COMPUTE_TOPIC || is_circle_topic(topic)
+}
+
+/// Alongside the exact Compute topic, the gateway may subscribe/publish
+/// per-circle gossip topics (PLAN-36 Phase 4). The name is a blinded hash
+/// (`bitterbot/circle/<sha256(id:epoch)>/v1`) minted TS-side; here we only gate
+/// the namespace so the dynamic primitive can't touch the builtin topics or
+/// become a subscribe-anything lever.
+/// Exact circle-topic shape: `bitterbot/circle/<64 lowercase hex>/v1` (84
+/// chars). The producer (`circleTopicId`) always emits exactly this. The old
+/// prefix/suffix-only check accepted arbitrary-length strings, enabling a
+/// ~250 KB topic that OOM'd a 1 GB relay and degenerate forms like
+/// `bitterbot/circle/v1` (security pass C4/C5). Fixed length + charset kills
+/// both.
+fn is_circle_topic(topic: &str) -> bool {
+    topic.len() == 84
+        && topic.starts_with("bitterbot/circle/")
+        && topic.ends_with("/v1")
+        // lowercase hex only — exactly what circleTopicId (sha256 .digest hex)
+        // emits; uppercase/other forms are not legitimate topics.
+        && topic.as_bytes()[17..81]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// Stage 3 (circles transport): relay-side circle-topic carriage bounds.
+/// A relay subscribes to circle topics it observes peers announce so gossip
+/// can route between NAT'd members meshed only through the relay. Bounded so
+/// a subscription flood cannot balloon relay state, and idle-swept so dead
+/// circles age out.
+const MAX_CARRIED_CIRCLE_TOPICS: usize = 1024;
+const CARRIED_CIRCLE_TOPIC_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Per-peer carriage quota: a single peer may cause a relay to carry at most
+/// this many circle topics, so one flooder cannot fill (and LRU-evict every
+/// real circle out of) the global carriage set (security pass C3).
+const MAX_CARRIED_TOPICS_PER_PEER: usize = 16;
+
+/// A circle topic a relay carries to forward. `peer` is the announcer (for the
+/// per-peer quota); `has_traffic` marks a topic that has forwarded ≥1 real
+/// frame, which the eviction policy protects so a junk-subscription flood
+/// cannot evict a proven-live circle (security pass C3).
+struct CarriedTopic {
+    last_seen: std::time::Instant,
+    peer: String,
+    has_traffic: bool,
+}
+/// Hard cap on inbound circle-RPC channels held awaiting a gateway answer —
+/// bounds memory under a request flood (security pass HIGH-4).
+const MAX_INBOUND_CIRCLE_RPC: usize = 256;
+
+/// Stage 4 (circles transport): point-to-point circle RPC over libp2p
+/// request-response — the carrier that lets join/sync verbs skip HTTP when a
+/// member's PeerId is known. Payloads are opaque base64 (the gateway's signed
+/// circle envelopes; membership auth happens there, not here).
+const CIRCLE_RPC_PROTOCOL: &str = "/bitterbot/circle-rpc/1";
+/// How long an inbound request's response channel is held while the gateway
+/// computes an answer before it is dropped (requester sees a failure).
+const CIRCLE_RPC_INBOUND_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircleRpcRequest {
+    pub data_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircleRpcResponse {
+    pub data_b64: String,
+}
+
+/// Maximum payload size for gossipsub messages (256KB).
+const MAX_GOSSIPSUB_MSG_SIZE: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEnvelope {
+    pub version: u32,
+    pub skill_md: String, // base64
+    pub name: String,
+    pub author_peer_id: String,
+    pub author_pubkey: String, // base64
+    pub signature: String,     // base64
+    pub timestamp: u64,
+    pub content_hash: String, // sha256 hex
+    // Optional versioning fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_skill_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management_pubkey: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeatherEnvelope {
+    pub global_cortisol_spike: f64,
+    pub duration_ms: u64,
+    pub reason: String,
+    pub management_pubkey: String,
+    pub management_signature: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BountyEnvelope {
+    pub bounty_id: String,
+    pub target_type: String,
+    pub description: String,
+    pub priority: f64,
+    pub reward_multiplier: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_hint: Option<String>,
+    pub expires_at: u64,
+    /// v1: management node key. v2 (Forage): the poster's own pubkey — any
+    /// node may post, gated on funding fields instead of identity.
+    pub management_pubkey: String,
+    pub management_signature: String,
+    pub timestamp: u64,
+    // ---- PLAN-29 Forage v2 fields. All optional with serde defaults so v1
+    // curriculum envelopes (and older nodes) parse unchanged in both
+    // directions. A v2 envelope is `version == Some(2)`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub poster_wallet_address: Option<String>,
+    /// oneshot | heartbeat | pool | standing
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub category: Option<String>,
+    /// hash(sealed acceptance spec + salt); revealed at verification time.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub oracle_commitment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reward_usdc: Option<f64>,
+    /// Signed funding evidence (EIP-3009 auth or balance attestation). The
+    /// orchestrator checks presence + signature coverage only; economic
+    /// validation happens TS-side where chain access lives.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub funding_proof: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claim_stake_usdc: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deadline: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_claims: Option<u32>,
+}
+
+impl BountyEnvelope {
+    pub fn is_v2(&self) -> bool {
+        self.version == Some(2)
+    }
+
+    /// Structural funding gate for v2 envelopes: a Forage bounty is only
+    /// admissible if it names a payable wallet, a positive reward, and
+    /// carries a funding proof. Unfunded text is spam and never propagates.
+    pub fn has_funding(&self) -> bool {
+        self.poster_wallet_address.as_deref().is_some_and(|w| !w.is_empty())
+            && self.reward_usdc.is_some_and(|r| r > 0.0)
+            && self.funding_proof.as_deref().is_some_and(|p| !p.is_empty())
+            && self.oracle_commitment.as_deref().is_some_and(|o| !o.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEnvelope {
+    pub signal_type: String,
+    pub data: serde_json::Value,
+    pub author_peer_id: String,
+    pub author_pubkey: String,
+    pub signature: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryEnvelope {
+    pub query_id: String,
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_hint: Option<String>,
+    pub author_peer_id: String,
+    pub author_pubkey: String,
+    pub signature: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerDetail {
+    pub addrs: Vec<String>,
+    pub connected_at: u64,
+    #[serde(default)]
+    pub skills_received_from: u64,
+    #[serde(default)]
+    pub reputation_score: f64,
+    #[serde(default)]
+    pub tier: String,
+    #[serde(default)]
+    pub tier_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmStats {
+    pub peer_id: String,
+    pub connected_peers: usize,
+    pub skills_published: u64,
+    /// Distinct skills received this session: one per (author, skill name),
+    /// however many times it is re-broadcast. See skill_receipts.rs.
+    pub skills_received: u64,
+    /// Raw skill gossip messages that passed envelope validation, repeats of
+    /// an already-counted skill included.
+    #[serde(default)]
+    pub skill_messages_received: u64,
+    pub uptime_secs: u64,
+    pub peer_details: HashMap<String, PeerDetail>,
+    pub listen_addrs: Vec<String>,
+    // Gossipsub mesh health
+    pub mesh_peers_count: usize,
+    pub subscribed_topics: Vec<String>,
+    /// Peak concurrent peer count seen this session (replaces the misleading
+    /// `total_peers_seen` from earlier management-state code).
+    #[serde(default)]
+    pub peak_concurrent_peers: usize,
+    /// Distinct peer IDs encountered this session (set cardinality, not count
+    /// of connection events). Persists across reconnects of the same peer.
+    #[serde(default)]
+    pub lifetime_unique_peer_ids: u64,
+    /// Cumulative peer-join events since process start.
+    #[serde(default)]
+    pub peers_joined_total: u64,
+    /// Cumulative peer-leave events since process start.
+    #[serde(default)]
+    pub peers_left_total: u64,
+    /// Rolling per-minute join history (timestamp_secs, count). Capped at 60.
+    #[serde(default)]
+    pub joins_per_minute: Vec<(u64, u32)>,
+    /// Rolling per-minute leave history (timestamp_secs, count). Capped at 60.
+    #[serde(default)]
+    pub leaves_per_minute: Vec<(u64, u32)>,
+    /// Per-topic gossipsub mesh size.
+    #[serde(default)]
+    pub mesh_peers_per_topic: HashMap<String, usize>,
+    /// Approximate Kademlia routing table size (sum of all k-bucket entries).
+    #[serde(default)]
+    pub routing_table_size: usize,
+    /// Milliseconds from process start to the first established peer connection.
+    #[serde(default)]
+    pub time_to_first_peer_ms: Option<u64>,
+    /// Distribution of peer-address types: ipv4_public, ipv4_private, ipv6, relay, other.
+    #[serde(default)]
+    pub address_types: HashMap<String, usize>,
+    // ── Relay/NAT counters ────────────────────────────────────────────
+    #[serde(default)]
+    pub relay_reservations_accepted: u64,
+    #[serde(default)]
+    pub relay_circuits_established: u64,
+    #[serde(default)]
+    pub hole_punches_succeeded: u64,
+    #[serde(default)]
+    pub hole_punches_failed: u64,
+    /// Latest AutoNAT verdict: "unknown", "public", or "private".
+    #[serde(default)]
+    pub nat_status: String,
+    // ── Bandwidth (gossipsub) ─────────────────────────────────────────
+    /// Bytes received per gossipsub topic.
+    #[serde(default)]
+    pub bytes_received_per_topic: HashMap<String, u64>,
+    /// Bytes published per gossipsub topic.
+    #[serde(default)]
+    pub bytes_published_per_topic: HashMap<String, u64>,
+    // ── Skill propagation latency (rolling p50/p95) ───────────────────
+    /// Median observed receive latency (ms), based on envelope.timestamp.
+    #[serde(default)]
+    pub skill_latency_p50_ms: Option<u64>,
+    /// 95th-percentile observed receive latency (ms).
+    #[serde(default)]
+    pub skill_latency_p95_ms: Option<u64>,
+    /// Number of latency samples in the rolling window.
+    #[serde(default)]
+    pub skill_latency_samples: usize,
+}
+
+pub type SharedStats = Arc<Mutex<SwarmStats>>;
+
+// ── Management Node Analytics ─────────────────────────────────────────────
+
+/// Network-wide aggregated state maintained only by management-tier nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementState {
+    /// Total unique peers ever seen by this management node.
+    pub total_peers_seen: u64,
+    /// Current peer count by tier (e.g., {"edge": 5, "management": 2}).
+    pub peers_by_tier: HashMap<String, usize>,
+    /// Rolling window of peer snapshots for trend analysis.
+    pub peer_snapshots: Vec<PeerSnapshot>,
+    /// Telemetry event counts by signal_type.
+    pub telemetry_counts_by_type: HashMap<String, u64>,
+    /// Rolling window of telemetry records (last 30 minutes).
+    pub telemetry_window: Vec<TelemetryRecord>,
+    /// Total skills published across the network.
+    pub skills_published_network_wide: u64,
+    /// Per-peer skill publication count in current window.
+    pub skills_per_peer_window: HashMap<String, u64>,
+    /// Economic activity signals.
+    pub economic_signals: Vec<EconomicSignal>,
+    /// Active anomaly alerts.
+    pub anomaly_alerts: Vec<AnomalyAlert>,
+    /// Network health score (0.0 - 1.0).
+    pub network_health_score: f64,
+    /// Timestamp of last census run.
+    pub last_census_at: u64,
+    /// Historical peer counts for trend analysis.
+    pub peer_count_history: Vec<(u64, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSnapshot {
+    pub peer_id: String,
+    pub tier: String,
+    pub tier_verified: bool,
+    pub skills_received_from: u64,
+    pub reputation_score: f64,
+    pub connected_at: u64,
+    pub snapshot_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryRecord {
+    pub signal_type: String,
+    pub author_peer_id: String,
+    pub timestamp: u64,
+    pub data_summary: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EconomicSignal {
+    pub peer_id: String,
+    pub signal_type: String,
+    pub amount_usdc: f64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnomalyAlert {
+    pub alert_type: String,
+    pub severity: String,
+    pub peer_ids: Vec<String>,
+    pub description: String,
+    pub detected_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_action: Option<String>,
+}
+
+pub type SharedManagementState = Arc<Mutex<ManagementState>>;
+
+// ── Bootnode Census Registry (Tier 2) ─────────────────────────────────────
+
+/// Per-peer record kept by a bootnode. Keyed on author_pubkey (base64) so it
+/// survives PeerId churn across reinstalls or transport changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootnodePeerRecord {
+    pub peer_pubkey: String,
+    pub last_peer_id: String,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub tier: String,
+    pub address_type: String,
+    pub connection_count: u64,
+}
+
+/// Persistent registry of every distinct peer a bootnode has ever observed.
+///
+/// Backing store: a single JSON snapshot file rewritten on every flush. For
+/// the metro-scale fleet we expect (thousands of peers, not millions) this is
+/// trivially fast and sidesteps adding a SQLite dependency to the orchestrator.
+#[derive(Debug)]
+pub struct BootnodeRegistry {
+    enabled: bool,
+    state_path: Option<PathBuf>,
+    /// Pubkey-keyed (the canonical, persistent identity) lifetime registry.
+    peers: HashMap<String, BootnodePeerRecord>,
+    /// Marks the registry dirty so the periodic flush actually writes.
+    dirty: bool,
+}
+
+impl BootnodeRegistry {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            state_path: None,
+            peers: HashMap::new(),
+            dirty: false,
+        }
+    }
+
+    pub fn load(state_path: PathBuf) -> Self {
+        let peers: HashMap<String, BootnodePeerRecord> = match std::fs::read(&state_path) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<BootnodePeerRecord>>(&bytes) {
+                Ok(records) => {
+                    let mut m = HashMap::with_capacity(records.len());
+                    for r in records {
+                        m.insert(r.peer_pubkey.clone(), r);
+                    }
+                    info!("Bootnode registry loaded: {} peers from {:?}", m.len(), state_path);
+                    m
+                }
+                Err(e) => {
+                    warn!("Bootnode registry parse failed ({}); starting empty", e);
+                    HashMap::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("Bootnode registry file does not exist yet; starting empty");
+                HashMap::new()
+            }
+            Err(e) => {
+                warn!("Bootnode registry read error ({}); starting empty", e);
+                HashMap::new()
+            }
+        };
+
+        Self {
+            enabled: true,
+            state_path: Some(state_path),
+            peers,
+            dirty: false,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn lifetime_unique(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn record_seen(
+        &mut self,
+        peer_pubkey: &str,
+        peer_id: &str,
+        tier: &str,
+        address_type: &str,
+        now_secs: u64,
+    ) {
+        if !self.enabled || peer_pubkey.is_empty() {
+            return;
+        }
+        let entry = self
+            .peers
+            .entry(peer_pubkey.to_string())
+            .or_insert_with(|| BootnodePeerRecord {
+                peer_pubkey: peer_pubkey.to_string(),
+                last_peer_id: peer_id.to_string(),
+                first_seen_at: now_secs,
+                last_seen_at: now_secs,
+                tier: tier.to_string(),
+                address_type: address_type.to_string(),
+                connection_count: 0,
+            });
+        entry.last_peer_id = peer_id.to_string();
+        entry.last_seen_at = now_secs;
+        if !tier.is_empty() {
+            entry.tier = tier.to_string();
+        }
+        if !address_type.is_empty() {
+            entry.address_type = address_type.to_string();
+        }
+        entry.connection_count = entry.connection_count.saturating_add(1);
+        self.dirty = true;
+    }
+
+    pub fn flush_if_dirty(&mut self) {
+        if !self.enabled || !self.dirty {
+            return;
+        }
+        let Some(ref path) = self.state_path else { return };
+        let records: Vec<&BootnodePeerRecord> = self.peers.values().collect();
+        match serde_json::to_vec(&records) {
+            Ok(bytes) => {
+                let tmp_path = path.with_extension("tmp");
+                if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                    warn!("Bootnode registry write failed ({:?}): {}", tmp_path, e);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp_path, path) {
+                    warn!("Bootnode registry rename failed ({:?} -> {:?}): {}", tmp_path, path, e);
+                    return;
+                }
+                self.dirty = false;
+            }
+            Err(e) => warn!("Bootnode registry serialize failed: {}", e),
+        }
+    }
+
+    /// Return aggregated census suitable for /api/bootstrap/census.
+    pub fn census(&self, now_secs: u64) -> serde_json::Value {
+        let day = 24 * 3600u64;
+        let week = 7 * day;
+        // "Active" window for the per-peer list that downstream aggregators union
+        // by pubkey to compute an exact network-wide unique count. Bounded so the
+        // census stays well under the 256 KiB gossip limit.
+        let active_window = 1800u64; // 30 min
+        let max_peers = 2000usize;
+        let mut by_tier: HashMap<String, usize> = HashMap::new();
+        let mut by_address_type: HashMap<String, usize> = HashMap::new();
+        let mut active_24h = 0usize;
+        let mut active_7d = 0usize;
+        let mut active_peers: Vec<serde_json::Value> = Vec::new();
+        for record in self.peers.values() {
+            let tier_label = if record.tier.is_empty() { "unknown" } else { record.tier.as_str() };
+            *by_tier.entry(tier_label.to_string()).or_insert(0) += 1;
+            let addr_label = if record.address_type.is_empty() {
+                "unknown"
+            } else {
+                record.address_type.as_str()
+            };
+            *by_address_type.entry(addr_label.to_string()).or_insert(0) += 1;
+            if now_secs.saturating_sub(record.last_seen_at) <= day {
+                active_24h += 1;
+            }
+            if now_secs.saturating_sub(record.last_seen_at) <= week {
+                active_7d += 1;
+            }
+            if now_secs.saturating_sub(record.last_seen_at) <= active_window
+                && active_peers.len() < max_peers
+            {
+                active_peers.push(serde_json::json!({
+                    "pubkey": record.peer_pubkey.as_str(),
+                    "tier": tier_label,
+                    "address_type": addr_label,
+                    "last_seen_at": record.last_seen_at,
+                }));
+            }
+        }
+        serde_json::json!({
+            "enabled": self.enabled,
+            "lifetime_unique_peers": self.peers.len(),
+            "active_last_24h": active_24h,
+            "active_last_7d": active_7d,
+            "by_tier": by_tier,
+            "by_address_type": by_address_type,
+            "peers": active_peers,
+            "generated_at": now_secs,
+        })
+    }
+}
+
+pub type SharedBootnodeRegistry = Arc<Mutex<BootnodeRegistry>>;
+
+/// Categorize a multiaddr into a coarse address-type bucket suitable for
+/// dashboards: ipv4_public, ipv4_private, ipv6, relay, dns, other.
+pub fn classify_address(addr: &Multiaddr) -> &'static str {
+    use libp2p::multiaddr::Protocol;
+    let mut has_circuit = false;
+    let mut ip4: Option<std::net::Ipv4Addr> = None;
+    let mut has_ip6 = false;
+    let mut has_dns = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::P2pCircuit => has_circuit = true,
+            Protocol::Ip4(a) => ip4 = Some(a),
+            Protocol::Ip6(_) => has_ip6 = true,
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) => has_dns = true,
+            _ => {}
+        }
+    }
+    if has_circuit {
+        return "relay";
+    }
+    if let Some(ip) = ip4 {
+        if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+            return "ipv4_private";
+        }
+        return "ipv4_public";
+    }
+    if has_ip6 {
+        return "ipv6";
+    }
+    if has_dns {
+        return "dns";
+    }
+    "other"
+}
+
+impl ManagementState {
+    pub fn new() -> Self {
+        Self {
+            total_peers_seen: 0,
+            peers_by_tier: HashMap::new(),
+            peer_snapshots: Vec::new(),
+            telemetry_counts_by_type: HashMap::new(),
+            telemetry_window: Vec::new(),
+            skills_published_network_wide: 0,
+            skills_per_peer_window: HashMap::new(),
+            economic_signals: Vec::new(),
+            anomaly_alerts: Vec::new(),
+            network_health_score: 1.0,
+            last_census_at: 0,
+            peer_count_history: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SwarmEvent {
+    SkillReceived(SkillEnvelope),
+    WeatherReceived(WeatherEnvelope),
+    BountyReceived(BountyEnvelope),
+    TelemetryReceived(TelemetryEnvelope),
+    QueryReceived(QueryEnvelope),
+    PeerConnected(PeerId, Vec<Multiaddr>),
+    PeerDisconnected(PeerId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayMode {
+    Off,
+    Client,
+    Server,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatStatus {
+    Unknown,
+    Public,
+    Private,
+}
+
+/// Combined libp2p behaviour for the Bitterbot network.
+#[derive(libp2p::swarm::NetworkBehaviour)]
+pub struct BitterbotBehaviour {
+    pub gossipsub: gossipsub::Behaviour,
+    pub kademlia: kad::Behaviour<MemoryStore>,
+    pub autonat: autonat::v2::client::Behaviour,
+    /// AutoNAT v2 server. Without this on at least some peers in the
+    /// network, every node's NAT verdict stays "unknown" forever
+    /// because client probes have no one to answer them. Enabling on
+    /// every node (including NAT'd ones) is safe: a NAT'd server's
+    /// dial-back attempts that fail correctly tell the requesting peer
+    /// "you're not reachable from where I am" — the very signal AutoNAT
+    /// needs to flip a verdict to Private.
+    pub autonat_server: autonat::v2::server::Behaviour,
+    pub identify: identify::Behaviour,
+    pub relay_client: Toggle<relay::client::Behaviour>,
+    pub relay_server: Toggle<relay::Behaviour>,
+    pub dcutr: Toggle<dcutr::Behaviour>,
+    /// Stage 4: point-to-point circle RPC (join/sync verbs over the mesh).
+    pub circle_rpc: request_response::cbor::Behaviour<CircleRpcRequest, CircleRpcResponse>,
+}
+
+pub struct SwarmHandle {
+    signing_key: SigningKey,
+    /// crypto::author_pubkey_b64(&signing_key), computed once.
+    own_author_pubkey: String,
+    local_peer_id: PeerId,
+    stats: SharedStats,
+    security: SecurityValidator,
+    swarm: libp2p::Swarm<BitterbotBehaviour>,
+    skills_topic: gossipsub::IdentTopic,
+    telemetry_topic: gossipsub::IdentTopic,
+    weather_topic: gossipsub::IdentTopic,
+    bounties_topic: gossipsub::IdentTopic,
+    queries_topic: gossipsub::IdentTopic,
+    census_topic: gossipsub::IdentTopic,
+    /// Channel for forwarding swarm events to Node.js via the IPC layer.
+    ipc_event_tx: mpsc::UnboundedSender<serde_json::Value>,
+    genesis_trust_list: Vec<String>,
+    node_tier: String,
+    /// Management-only aggregated state. None for edge nodes.
+    management_state: Option<SharedManagementState>,
+    /// Current NAT status detected by AutoNAT.
+    nat_status: NatStatus,
+    /// Relay servers to request reservations from when behind NAT.
+    relay_server_addrs: Vec<(Multiaddr, PeerId)>,
+    /// Whether we have an active relay reservation.
+    has_relay_reservation: bool,
+    /// Relay mode configuration.
+    relay_mode: RelayMode,
+    /// Distinct PeerIds observed since process start. Cardinality lands in
+    /// `SwarmStats::lifetime_unique_peer_ids`.
+    lifetime_peer_ids: HashSet<String>,
+    /// Process start (wall-clock) used to derive time-to-first-peer.
+    started_at: std::time::Instant,
+    /// In-progress per-minute join/leave counters. Snapshotted to the rolling
+    /// histories every 60s and reset.
+    current_minute_start: u64,
+    current_minute_joins: u32,
+    current_minute_leaves: u32,
+    /// Rolling buffer of skill receive latencies (ms), capped at LATENCY_WINDOW.
+    latency_window_ms: std::collections::VecDeque<u64>,
+    /// Which (author, skill name) pairs have already been counted.
+    skill_receipts: crate::skill_receipts::SkillReceiptTracker,
+    /// Bootnode registry — only flushes to disk if enabled.
+    bootnode_registry: SharedBootnodeRegistry,
+    /// Stage 3: circle topics this RELAY carries purely to forward. Only
+    /// populated in RelayMode::Server; frames are sender-key encrypted so
+    /// carriage exposes no content. Tracks the announcing peer (per-peer
+    /// quota) and whether real traffic has crossed it (eviction protection).
+    carried_circle_topics: std::collections::HashMap<gossipsub::TopicHash, CarriedTopic>,
+    /// Stage 4: inbound circle-RPC response channels held while the gateway
+    /// computes an answer, keyed by a local counter surfaced over IPC.
+    inbound_circle_rpc: std::collections::HashMap<
+        u64,
+        (
+            request_response::ResponseChannel<CircleRpcResponse>,
+            std::time::Instant,
+        ),
+    >,
+    next_inbound_circle_rpc_id: u64,
+}
+
+const LATENCY_WINDOW: usize = 256;
+
+impl SwarmHandle {
+    pub fn stats(&self) -> SharedStats {
+        Arc::clone(&self.stats)
+    }
+
+    pub fn management_state(&self) -> Option<SharedManagementState> {
+        self.management_state.as_ref().map(Arc::clone)
+    }
+
+    pub fn bootnode_registry(&self) -> SharedBootnodeRegistry {
+        Arc::clone(&self.bootnode_registry)
+    }
+
+    /// Send a JSON-line event to the IPC event stream (consumed by Node.js).
+    fn emit_ipc_event(&self, event: serde_json::Value) {
+        if let Err(e) = self.ipc_event_tx.send(event) {
+            debug!("IPC event channel closed (no receiver): {}", e);
+        }
+    }
+
+    /// Publish the current bootnode census to the gossipsub CENSUS_TOPIC.
+    ///
+    /// Only fires when the registry is enabled (i.e. when the orchestrator
+    /// was started with `--bootnode-mode`). This is the push side of the
+    /// real-time network-wide peer view — every subscriber on CENSUS_TOPIC
+    /// receives the latest counts without polling the bootnode's HTTP API.
+    fn broadcast_bootnode_census(&mut self) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let snapshot = {
+            let registry = self
+                .bootnode_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // No-op on non-bootnode nodes — saves the gossip bandwidth and
+            // keeps the topic clean.
+            if !registry.enabled() {
+                return;
+            }
+            registry.census(now_secs)
+        };
+        let bytes = match serde_json::to_vec(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("census serialize failed: {}", e);
+                return;
+            }
+        };
+        let topic = self.census_topic.clone();
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, bytes)
+        {
+            // Insufficient peers is normal early in life — only warn at debug.
+            debug!("census publish failed: {:?}", e);
+        }
+    }
+
+    /// Run periodic management census — snapshot all peers, compute tier distribution.
+    fn run_management_census(&self) {
+        let Some(ref mgmt) = self.management_state else { return };
+        let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = mgmt.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Snapshot peers by tier
+        state.peers_by_tier.clear();
+        for (peer_id, detail) in &stats.peer_details {
+            let tier = if detail.tier.is_empty() { "unknown" } else { &detail.tier };
+            *state.peers_by_tier.entry(tier.to_string()).or_insert(0) += 1;
+
+            state.peer_snapshots.push(PeerSnapshot {
+                peer_id: peer_id.clone(),
+                tier: detail.tier.clone(),
+                tier_verified: detail.tier_verified,
+                skills_received_from: detail.skills_received_from,
+                reputation_score: detail.reputation_score,
+                connected_at: detail.connected_at,
+                snapshot_at: now,
+            });
+        }
+
+        // Cap snapshot history
+        if state.peer_snapshots.len() > 10_000 {
+            let drain = state.peer_snapshots.len() - 10_000;
+            state.peer_snapshots.drain(0..drain);
+        }
+
+        // Track peer count history for trend analysis
+        state.peer_count_history.push((now, stats.connected_peers));
+        if state.peer_count_history.len() > 1440 {
+            let drain_count = state.peer_count_history.len() - 1440;
+            state.peer_count_history.drain(0..drain_count);
+        }
+
+        // `total_peers_seen` was historically a high-water mark of concurrent
+        // peers, which is misleading. Set it to the true lifetime unique count
+        // we now track. Anything reading the field gets a more honest answer;
+        // peak concurrent is still available via SwarmStats::peak_concurrent_peers.
+        state.total_peers_seen = stats.lifetime_unique_peer_ids;
+        state.last_census_at = now;
+
+        drop(state);
+        drop(stats);
+
+        // Emit census event to IPC
+        self.emit_ipc_event(serde_json::json!({
+            "type": "management_census",
+            "payload": {
+                "timestamp": now,
+                "connected_peers": self.stats.lock().unwrap_or_else(|e| e.into_inner()).connected_peers,
+            }
+        }));
+    }
+
+    /// Run anomaly detection — rate spikes, peer drops, sybil patterns.
+    fn run_anomaly_detection(&self) {
+        let Some(ref mgmt) = self.management_state else { return };
+        let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = mgmt.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut alerts: Vec<AnomalyAlert> = Vec::new();
+
+        // 1. Sudden peer drop detection (>30% drop from 10min average)
+        let recent_counts: Vec<usize> = state.peer_count_history.iter()
+            .filter(|(ts, _)| *ts > now.saturating_sub(600))
+            .map(|(_, c)| *c)
+            .collect();
+        if !recent_counts.is_empty() {
+            let avg = recent_counts.iter().sum::<usize>() as f64 / recent_counts.len() as f64;
+            let current = stats.connected_peers as f64;
+            if avg > 2.0 && current < avg * 0.7 {
+                alerts.push(AnomalyAlert {
+                    alert_type: "peer_drop".to_string(),
+                    severity: if current < avg * 0.5 { "high" } else { "medium" }.to_string(),
+                    peer_ids: vec![],
+                    description: format!(
+                        "Peer count dropped from avg {:.0} to {} ({:.0}% drop)",
+                        avg, stats.connected_peers, (1.0 - current / avg) * 100.0
+                    ),
+                    detected_at: now,
+                    auto_action: None,
+                });
+            }
+        }
+
+        // 2. Skill publication rate spike per peer
+        for (peer_id, count) in &state.skills_per_peer_window {
+            if *count > 20 {
+                alerts.push(AnomalyAlert {
+                    alert_type: "rate_spike".to_string(),
+                    severity: if *count > 50 { "high" } else { "medium" }.to_string(),
+                    peer_ids: vec![peer_id.clone()],
+                    description: format!("Peer {} published {} skills in window", peer_id, count),
+                    detected_at: now,
+                    auto_action: None,
+                });
+            }
+        }
+
+        // 3. Sybil cluster detection — many new peers in short time
+        let recent_connections: Vec<&PeerSnapshot> = state.peer_snapshots.iter()
+            .filter(|s| s.connected_at > now.saturating_sub(60))
+            .collect();
+        if recent_connections.len() > 10 {
+            alerts.push(AnomalyAlert {
+                alert_type: "sybil_cluster".to_string(),
+                severity: "high".to_string(),
+                peer_ids: recent_connections.iter().map(|s| s.peer_id.clone()).collect(),
+                description: format!("{} new peers in last 60 seconds", recent_connections.len()),
+                detected_at: now,
+                auto_action: None,
+            });
+        }
+
+        // Reset per-window counters
+        state.skills_per_peer_window.clear();
+
+        // Store alerts
+        state.anomaly_alerts.extend(alerts.clone());
+        if state.anomaly_alerts.len() > 100 {
+            let drain = state.anomaly_alerts.len() - 100;
+            state.anomaly_alerts.drain(0..drain);
+        }
+
+        // Compute network health score
+        let peer_stability = if !recent_counts.is_empty() {
+            let avg = recent_counts.iter().sum::<usize>() as f64 / recent_counts.len() as f64;
+            if avg > 0.0 { (stats.connected_peers as f64 / avg).min(1.0) } else { 1.0 }
+        } else {
+            1.0
+        };
+        let critical_count = alerts.iter().filter(|a| a.severity == "high" || a.severity == "critical").count();
+        let anomaly_absence = (1.0 - critical_count as f64 / 10.0).max(0.0);
+        state.network_health_score = 0.4 * peer_stability + 0.3 * anomaly_absence + 0.3;
+
+        drop(state);
+        drop(stats);
+
+        // Emit anomaly alerts to IPC
+        for alert in &alerts {
+            self.emit_ipc_event(serde_json::json!({
+                "type": "management_anomaly",
+                "payload": alert
+            }));
+        }
+    }
+
+    /// Aggregate telemetry into management state (called on each telemetry receive).
+    fn aggregate_telemetry(&self, envelope: &TelemetryEnvelope) {
+        let Some(ref mgmt) = self.management_state else { return };
+        let mut state = mgmt.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        *state.telemetry_counts_by_type
+            .entry(envelope.signal_type.clone())
+            .or_insert(0) += 1;
+
+        state.telemetry_window.push(TelemetryRecord {
+            signal_type: envelope.signal_type.clone(),
+            author_peer_id: envelope.author_peer_id.clone(),
+            timestamp: envelope.timestamp,
+            data_summary: envelope.data.clone(),
+        });
+
+        // Prune window to last 30 minutes
+        let cutoff = now.saturating_sub(1800);
+        state.telemetry_window.retain(|t| t.timestamp > cutoff);
+    }
+
+    /// Track skill publication rate for management anomaly detection.
+    fn track_skill_publication(&self, author_peer_id: &str) {
+        let Some(ref mgmt) = self.management_state else { return };
+        let mut state = mgmt.lock().unwrap_or_else(|e| e.into_inner());
+        state.skills_published_network_wide += 1;
+        *state.skills_per_peer_window
+            .entry(author_peer_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Stage 3: start carrying a circle topic this relay observed a peer
+    /// announce. Bounded: at the cap, the least-recently-active carried topic
+    /// is evicted first.
+    fn note_carried_circle_topic(&mut self, topic: &gossipsub::TopicHash, announcer: &str) {
+        let now = std::time::Instant::now();
+        if let Some(entry) = self.carried_circle_topics.get_mut(topic) {
+            entry.last_seen = now;
+            return;
+        }
+        // Per-peer quota: one peer cannot cause a relay to carry more than its
+        // share, so a flooder can never fill (and evict every real circle out
+        // of) the global set (C3).
+        let by_peer = self
+            .carried_circle_topics
+            .values()
+            .filter(|e| e.peer == announcer)
+            .count();
+        if by_peer >= MAX_CARRIED_TOPICS_PER_PEER {
+            debug!("peer {} at carriage quota; not carrying {}", announcer, topic);
+            return;
+        }
+        if self.carried_circle_topics.len() >= MAX_CARRIED_CIRCLE_TOPICS {
+            // Evict the least-recently-seen topic that has NOT carried traffic;
+            // proven-live circles (has_traffic) are protected. If everything is
+            // live, fall back to plain LRU.
+            let victim = self
+                .carried_circle_topics
+                .iter()
+                .min_by_key(|(_, e)| (e.has_traffic, e.last_seen))
+                .map(|(t, _)| t.clone());
+            if let Some(v) = victim {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .unsubscribe(&gossipsub::IdentTopic::new(v.as_str().to_string()));
+                self.carried_circle_topics.remove(&v);
+            }
+        }
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&gossipsub::IdentTopic::new(topic.as_str().to_string()))
+        {
+            Ok(_) => {
+                self.carried_circle_topics.insert(
+                    topic.clone(),
+                    CarriedTopic { last_seen: now, peer: announcer.to_string(), has_traffic: false },
+                );
+                // debug, not info, and only a short topic prefix — a relay's
+                // logs must not become a durable peer↔circle map (C9).
+                debug!(
+                    "relay carrying circle topic {}… ({} carried)",
+                    &topic.to_string().chars().take(28).collect::<String>(),
+                    self.carried_circle_topics.len()
+                );
+            }
+            Err(e) => debug!("relay circle-topic subscribe failed for {}: {:?}", topic, e),
+        }
+    }
+
+    /// Stage 3: drop carried circle topics with no observed activity (no
+    /// subscription announcements, no messages) for CARRIED_CIRCLE_TOPIC_IDLE.
+    fn sweep_carried_circle_topics(&mut self) {
+        if self.carried_circle_topics.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let idle: Vec<gossipsub::TopicHash> = self
+            .carried_circle_topics
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.last_seen) >= CARRIED_CIRCLE_TOPIC_IDLE)
+            .map(|(t, _)| t.clone())
+            .collect();
+        for t in idle {
+            let _ = self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .unsubscribe(&gossipsub::IdentTopic::new(t.as_str().to_string()));
+            self.carried_circle_topics.remove(&t);
+            debug!("relay stopped carrying idle circle topic {}", t);
+        }
+    }
+
+    pub async fn run_event_loop(
+        &mut self,
+        mut ipc_rx: mpsc::UnboundedReceiver<IpcCommand>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let start = std::time::Instant::now();
+        let mut prune_interval = tokio::time::interval(Duration::from_secs(120));
+        prune_interval.tick().await; // skip immediate first tick
+        // Held circle-RPC channels are swept fast (5s) against the 30s TTL so a
+        // flood cannot outrun the sweep (security pass HIGH-4).
+        let mut circle_rpc_sweep = tokio::time::interval(Duration::from_secs(5));
+        circle_rpc_sweep.tick().await;
+        let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(300));
+        bootstrap_interval.tick().await; // skip immediate first tick
+
+        // Management node periodic intervals (only active for management tier)
+        let mut census_interval = tokio::time::interval(Duration::from_secs(60));
+        census_interval.tick().await;
+        let mut anomaly_interval = tokio::time::interval(Duration::from_secs(300));
+        anomaly_interval.tick().await;
+        let is_management = self.management_state.is_some();
+
+        // Relay reservation renewal (45 min, before the 1-hour expiry)
+        let mut relay_renewal_interval = tokio::time::interval(Duration::from_secs(2700));
+        relay_renewal_interval.tick().await;
+
+        // Bootnode census broadcast — every 60s when --bootnode-mode is on,
+        // publish the current registry census to the gossipsub CENSUS_TOPIC.
+        // No-op on non-bootnode deployments (registry.enabled is false).
+        let mut bootnode_broadcast_interval = tokio::time::interval(Duration::from_secs(60));
+        bootnode_broadcast_interval.tick().await;
+
+        // Stats refresh + bootnode registry flush.
+        //
+        // This MUST stay a hoisted `interval` and must never become an inline
+        // `tokio::time::sleep(..)` inside the `select!` below. A future built
+        // inside `select!` is reconstructed on every loop iteration, so its
+        // timer restarts whenever any other branch completes first. The
+        // 5-second `circle_rpc_sweep` alone guarantees an iteration at least
+        // every 5 seconds, so an inline 10-second sleep could never elapse and
+        // this arm was unreachable in practice. That was a live bug: every
+        // derived stat (mesh peer count, per-topic fanout, routing table size,
+        // uptime, latency percentiles, churn buckets) stayed frozen at its
+        // construction default forever, and the bootnode registry — whose only
+        // caller of `flush_if_dirty` is this arm — was never persisted, so a
+        // relay lost its entire lifetime peer registry on every restart.
+        let mut stats_interval = tokio::time::interval(Duration::from_secs(10));
+        stats_interval.tick().await; // skip immediate first tick
+
+        loop {
+            tokio::select! {
+                Some(cmd) = ipc_rx.recv() => {
+                    self.handle_ipc_command(cmd).await;
+                }
+                event = self.swarm.select_next_some() => {
+                    use libp2p::swarm::SwarmEvent as LibSwarmEvent;
+                    match event {
+                        LibSwarmEvent::Behaviour(behaviour_event) => {
+                            self.handle_behaviour_event(behaviour_event).await;
+                        }
+                        LibSwarmEvent::ConnectionEstablished {
+                            peer_id,
+                            endpoint,
+                            num_established,
+                            ..
+                        } => {
+                            // Only emit PeerConnected on the FIRST connection to this peer.
+                            // libp2p fires ConnectionEstablished per-connection, and a single
+                            // peer can hold multiple simultaneously (direct + relay circuits,
+                            // QUIC + TCP, etc.). Without this guard the connected_peers
+                            // counter inflates while peer_details (keyed on peer_id) stays at
+                            // the true unique count — producing the dashboard mismatch where
+                            // "Connected Peers: N" disagreed with "edge + management" tier
+                            // totals. The matching ConnectionClosed branch already dedups by
+                            // checking is_connected(), so making this side symmetric closes
+                            // the loop.
+                            if num_established.get() == 1 {
+                                let addr = endpoint.get_remote_address().clone();
+                                self.handle_swarm_event(SwarmEvent::PeerConnected(
+                                    peer_id,
+                                    vec![addr],
+                                ))
+                                .await;
+                            }
+                        }
+                        LibSwarmEvent::ConnectionClosed {
+                            peer_id,
+                            ..
+                        } => {
+                            // Only emit disconnect if the peer has no remaining connections
+                            if !self.swarm.is_connected(&peer_id) {
+                                self.handle_swarm_event(SwarmEvent::PeerDisconnected(peer_id))
+                                    .await;
+                            }
+                        }
+                        LibSwarmEvent::NewListenAddr { address, .. } => {
+                            info!("Listening on {}", address);
+                            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                            if !stats.listen_addrs.contains(&address.to_string()) {
+                                stats.listen_addrs.push(address.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = stats_interval.tick() => {
+                    // Snapshot per-minute churn buckets before locking stats, so we
+                    // never hold the swarm/stats locks at the same time.
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    // Compute per-topic mesh fanout and routing-table size.
+                    let routing_table_size: usize = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .kbuckets()
+                        .map(|bucket| bucket.iter().count())
+                        .sum();
+                    let mut mesh_per_topic: HashMap<String, usize> = HashMap::new();
+                    let topic_hashes: Vec<gossipsub::TopicHash> = self
+                        .swarm
+                        .behaviour()
+                        .gossipsub
+                        .topics()
+                        .cloned()
+                        .collect();
+                    for topic_hash in &topic_hashes {
+                        let count = self
+                            .swarm
+                            .behaviour()
+                            .gossipsub
+                            .mesh_peers(topic_hash)
+                            .count();
+                        mesh_per_topic.insert(topic_hash.to_string(), count);
+                    }
+                    let total_mesh = self
+                        .swarm
+                        .behaviour()
+                        .gossipsub
+                        .all_mesh_peers()
+                        .count();
+                    let subscribed: Vec<String> = topic_hashes
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect();
+
+                    // Compute latency p50/p95 from rolling buffer.
+                    let (p50, p95, samples) = if self.latency_window_ms.is_empty() {
+                        (None, None, 0)
+                    } else {
+                        let mut buf: Vec<u64> = self.latency_window_ms.iter().copied().collect();
+                        buf.sort_unstable();
+                        let n = buf.len();
+                        let p50_idx = n / 2;
+                        let p95_idx = ((n as f64) * 0.95) as usize;
+                        let p95_idx = p95_idx.min(n - 1);
+                        (Some(buf[p50_idx]), Some(buf[p95_idx]), n)
+                    };
+
+                    // Roll the per-minute churn bucket if a new minute has begun.
+                    let bucket_start = now_secs - (now_secs % 60);
+                    let mut take_joins: Option<u32> = None;
+                    let mut take_leaves: Option<u32> = None;
+                    let bucket_to_close = self.current_minute_start;
+                    if bucket_start != self.current_minute_start {
+                        take_joins = Some(self.current_minute_joins);
+                        take_leaves = Some(self.current_minute_leaves);
+                        self.current_minute_start = bucket_start;
+                        self.current_minute_joins = 0;
+                        self.current_minute_leaves = 0;
+                    }
+
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.uptime_secs = start.elapsed().as_secs();
+                    stats.mesh_peers_count = total_mesh;
+                    stats.subscribed_topics = subscribed;
+                    stats.mesh_peers_per_topic = mesh_per_topic;
+                    stats.routing_table_size = routing_table_size;
+                    stats.skill_latency_p50_ms = p50;
+                    stats.skill_latency_p95_ms = p95;
+                    stats.skill_latency_samples = samples;
+                    if let (Some(joins), Some(leaves)) = (take_joins, take_leaves) {
+                        stats.joins_per_minute.push((bucket_to_close, joins));
+                        stats.leaves_per_minute.push((bucket_to_close, leaves));
+                        // Cap each history to the last 60 minutes.
+                        let cap = 60;
+                        if stats.joins_per_minute.len() > cap {
+                            let drain = stats.joins_per_minute.len() - cap;
+                            stats.joins_per_minute.drain(0..drain);
+                        }
+                        if stats.leaves_per_minute.len() > cap {
+                            let drain = stats.leaves_per_minute.len() - cap;
+                            stats.leaves_per_minute.drain(0..drain);
+                        }
+                    }
+                    drop(stats);
+
+                    // Persist the bootnode registry — no-op if disabled.
+                    {
+                        let mut registry = self
+                            .bootnode_registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        registry.flush_if_dirty();
+                    }
+                }
+                _ = prune_interval.tick() => {
+                    self.security.prune();
+                }
+                _ = circle_rpc_sweep.tick() => {
+                    // Drop inbound circle-RPC channels the gateway never
+                    // answered (requester sees a failure, not a hang).
+                    let now = std::time::Instant::now();
+                    self.inbound_circle_rpc.retain(|_, (_, held)| {
+                        now.duration_since(*held) < CIRCLE_RPC_INBOUND_TTL
+                    });
+                }
+                _ = bootstrap_interval.tick() => {
+                    info!("Triggering periodic Kademlia bootstrap");
+                    let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+                    self.sweep_carried_circle_topics();
+                }
+                _ = census_interval.tick(), if is_management => {
+                    self.run_management_census();
+                }
+                _ = anomaly_interval.tick(), if is_management => {
+                    self.run_anomaly_detection();
+                }
+                _ = relay_renewal_interval.tick(), if self.relay_mode == RelayMode::Client => {
+                    if self.has_relay_reservation && !self.relay_server_addrs.is_empty() {
+                        info!("Renewing relay reservations");
+                        self.has_relay_reservation = false; // Force re-reservation
+                        self.initiate_relay_reservations();
+                    }
+                }
+                _ = bootnode_broadcast_interval.tick() => {
+                    self.broadcast_bootnode_census();
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received shutdown signal");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_behaviour_event(&mut self, event: BitterbotBehaviourEvent) {
+        match event {
+            BitterbotBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            }) => {
+                let topic_str = message.topic.to_string();
+                debug!(
+                    "Gossipsub message from {} on topic {} (id: {})",
+                    propagation_source, topic_str, message_id
+                );
+
+                if topic_str == SKILLS_TOPIC {
+                    match serde_json::from_slice::<SkillEnvelope>(&message.data) {
+                        Ok(envelope) => {
+                            self.handle_swarm_event(SwarmEvent::SkillReceived(envelope)).await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize skill envelope from {}: {}",
+                                propagation_source, e
+                            );
+                        }
+                    }
+                } else if topic_str == WEATHER_TOPIC {
+                    match serde_json::from_slice::<WeatherEnvelope>(&message.data) {
+                        Ok(envelope) => {
+                            self.handle_swarm_event(SwarmEvent::WeatherReceived(envelope)).await;
+                        }
+                        Err(e) => warn!("Failed to deserialize weather envelope: {}", e),
+                    }
+                } else if topic_str == BOUNTIES_TOPIC {
+                    match serde_json::from_slice::<BountyEnvelope>(&message.data) {
+                        Ok(envelope) => {
+                            self.handle_swarm_event(SwarmEvent::BountyReceived(envelope)).await;
+                        }
+                        Err(e) => warn!("Failed to deserialize bounty envelope: {}", e),
+                    }
+                } else if topic_str == TELEMETRY_TOPIC {
+                    match serde_json::from_slice::<TelemetryEnvelope>(&message.data) {
+                        Ok(envelope) => {
+                            self.handle_swarm_event(SwarmEvent::TelemetryReceived(envelope)).await;
+                        }
+                        Err(e) => warn!("Failed to deserialize telemetry envelope: {}", e),
+                    }
+                } else if topic_str == QUERIES_TOPIC {
+                    match serde_json::from_slice::<QueryEnvelope>(&message.data) {
+                        Ok(envelope) => {
+                            self.handle_swarm_event(SwarmEvent::QueryReceived(envelope)).await;
+                        }
+                        Err(e) => warn!("Failed to deserialize query envelope: {}", e),
+                    }
+                } else if topic_str == CENSUS_TOPIC {
+                    // Bootnode census broadcast — forward the JSON snapshot
+                    // to the IPC layer so the gateway can cache the freshest
+                    // network-wide view. We don't validate the payload shape
+                    // here; the receiver is responsible for matching against
+                    // the documented schema.
+                    match serde_json::from_slice::<serde_json::Value>(&message.data) {
+                        Ok(snapshot) => {
+                            let source = match &message.source {
+                                Some(p) => p.to_string(),
+                                None => String::new(),
+                            };
+                            self.emit_ipc_event(serde_json::json!({
+                                "type": "census_received",
+                                "payload": {
+                                    "source_peer_id": source,
+                                    "snapshot": snapshot,
+                                }
+                            }));
+                        }
+                        Err(e) => warn!("Failed to deserialize census snapshot: {}", e),
+                    }
+                } else if is_gateway_topic(&topic_str) {
+                    if topic_str == COMPUTE_TOPIC && message.data.len() > 8192 {
+                        return;
+                    }
+                    let from = match &message.source {
+                        Some(p) => p.to_string(),
+                        None => String::new(),
+                    };
+                    // Per-peer rate limit BEFORE any forwarding/DB work: an
+                    // unauthenticated mesh peer that knows a carried topic id
+                    // could otherwise flood undecryptable frames and burn the
+                    // gateway's per-frame decode + circle scan (security pass
+                    // CRIT-2 / H1). Keyed on the propagation source so a relay
+                    // bounds each forwarder independently.
+                    if !self.security.check_circle_rate(&propagation_source.to_string()) {
+                        debug!("circle topic frame from {} rate-limited", propagation_source);
+                    } else {
+                        // Stage 3: real traffic refreshes a carried topic AND
+                        // marks it live so eviction protects it (C3).
+                        if self.relay_mode == RelayMode::Server {
+                            if let Some(entry) = self.carried_circle_topics.get_mut(&message.topic) {
+                                entry.last_seen = std::time::Instant::now();
+                                entry.has_traffic = true;
+                            }
+                        }
+                        // PLAN-36 Phase 4: a frame on a per-circle topic we're
+                        // subscribed to. Forward opaque bytes to the gateway as
+                        // a topic_message event; the circle envelope inside
+                        // carries its own membership auth (verified by
+                        // handleCircleMethod), so we do not (and cannot, once
+                        // encrypted) inspect it here.
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "topic_message",
+                            "payload": {
+                                "topic": topic_str,
+                                "from_peer_id": from,
+                                "data_b64": base64::engine::general_purpose::STANDARD.encode(&message.data),
+                            }
+                        }));
+                    }
+                }
+            }
+            BitterbotBehaviourEvent::CircleRpc(request_response::Event::Message {
+                peer,
+                message,
+                ..
+            }) => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    // Per-peer rate limit + a hard cap on outstanding held
+                    // channels: an unauthenticated peer can open this protocol
+                    // and flood requests, each pinning a ResponseChannel and a
+                    // gateway dispatch (security pass CRIT-2 / HIGH-4). Drop
+                    // (let the channel close) past either bound.
+                    if !self.security.check_circle_rate(&peer.to_string())
+                        || self.inbound_circle_rpc.len() >= MAX_INBOUND_CIRCLE_RPC
+                    {
+                        debug!("circle rpc request from {} dropped (rate/cap)", peer);
+                    } else {
+                        // Hold the channel; the gateway answers over IPC
+                        // (circle_respond). Held channels are TTL-swept so an
+                        // unresponsive gateway cannot leak them.
+                        let rid = self.next_inbound_circle_rpc_id;
+                        self.next_inbound_circle_rpc_id =
+                            self.next_inbound_circle_rpc_id.wrapping_add(1);
+                        self.inbound_circle_rpc
+                            .insert(rid, (channel, std::time::Instant::now()));
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "circle_request",
+                            "payload": {
+                                "request_id": rid,
+                                "from_peer_id": peer.to_string(),
+                                "data_b64": request.data_b64,
+                            }
+                        }));
+                    }
+                }
+                request_response::Message::Response { request_id, response } => {
+                    self.emit_ipc_event(serde_json::json!({
+                        "type": "circle_response",
+                        "payload": {
+                            "request_id": request_id.to_string(),
+                            "ok": true,
+                            "data_b64": response.data_b64,
+                        }
+                    }));
+                }
+            },
+            BitterbotBehaviourEvent::CircleRpc(request_response::Event::OutboundFailure {
+                request_id,
+                error,
+                ..
+            }) => {
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "circle_response",
+                    "payload": {
+                        "request_id": request_id.to_string(),
+                        "ok": false,
+                        "error": format!("{:?}", error),
+                    }
+                }));
+            }
+            BitterbotBehaviourEvent::CircleRpc(request_response::Event::InboundFailure {
+                error,
+                ..
+            }) => {
+                debug!("circle-rpc inbound failure: {:?}", error);
+            }
+            BitterbotBehaviourEvent::CircleRpc(request_response::Event::ResponseSent { .. }) => {}
+            BitterbotBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+                peer_id,
+                topic,
+            }) => {
+                debug!("Peer {} subscribed to {}", peer_id, topic);
+                // Stage 3: gossipsub only forwards a topic between peers that
+                // are themselves subscribed, and a headless relay has no
+                // gateway to drive subscribe_topic over IPC — so without
+                // carriage, two NAT'd members meshed only through this relay
+                // could never exchange a circle frame. When a peer announces
+                // a circle topic (IdentTopic: hashes are the readable names),
+                // a relay subscribes too, purely to forward.
+                if self.relay_mode == RelayMode::Server && is_gateway_topic(topic.as_str()) {
+                    self.note_carried_circle_topic(&topic, &peer_id.to_string());
+                }
+            }
+            BitterbotBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed {
+                peer_id,
+                topic,
+            }) => {
+                debug!("Peer {} unsubscribed from {}", peer_id, topic);
+            }
+            BitterbotBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
+                peer, addresses, ..
+            }) => {
+                debug!(
+                    "Kademlia routing updated: peer {} with {} addresses",
+                    peer,
+                    addresses.len()
+                );
+            }
+            BitterbotBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                result,
+                ..
+            }) => {
+                debug!("Kademlia query progress: {:?}", result);
+            }
+            BitterbotBehaviourEvent::Identify(identify::Event::Received {
+                peer_id, info, ..
+            }) => {
+                debug!(
+                    "Identify: peer {} running {} with {} listen addrs",
+                    peer_id,
+                    info.protocol_version,
+                    info.listen_addrs.len()
+                );
+                // Add identified addresses to Kademlia
+                for addr in &info.listen_addrs {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
+                }
+
+                // Extract tier from agent_version: "bitterbot-orchestrator/{version}/{tier}"
+                let parts: Vec<&str> = info.agent_version.split('/').collect();
+                let claimed_tier = parts.get(2).unwrap_or(&"edge").to_string();
+                let mut tier_verified = false;
+                // Always extract the peer's Ed25519 pubkey from the identify
+                // payload so downstream lifetime-peer accounting can key on
+                // it (not just management peers — edge peers count too).
+                let pubkey_b64 = info
+                    .public_key
+                    .clone()
+                    .try_into_ed25519()
+                    .ok()
+                    .map(|pk| base64::engine::general_purpose::STANDARD.encode(pk.to_bytes()))
+                    .unwrap_or_default();
+
+                if claimed_tier == "management" && !pubkey_b64.is_empty() {
+                    tier_verified = self.genesis_trust_list.contains(&pubkey_b64);
+                }
+
+                // Update PeerDetail with tier info
+                let address_type_label = {
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    let label = if let Some(detail) = stats.peer_details.get_mut(&peer_id.to_string()) {
+                        detail.tier = claimed_tier.clone();
+                        detail.tier_verified = tier_verified;
+                        detail
+                            .addrs
+                            .iter()
+                            .find_map(|s| s.parse::<Multiaddr>().ok())
+                            .as_ref()
+                            .map(classify_address)
+                            .unwrap_or("other")
+                            .to_string()
+                    } else {
+                        "other".to_string()
+                    };
+                    label
+                };
+
+                // Bootnode-mode persistence: record this peer (keyed on
+                // authenticated pubkey) so we have a true lifetime census
+                // even after the peer disconnects.
+                if !pubkey_b64.is_empty() {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let mut registry = self
+                        .bootnode_registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    registry.record_seen(
+                        &pubkey_b64,
+                        &peer_id.to_string(),
+                        &claimed_tier,
+                        &address_type_label,
+                        now_secs,
+                    );
+                }
+
+                // Auto-discover relay servers from identify. A peer that
+                // advertises libp2p::relay::HOP_PROTOCOL_NAME is offering
+                // circuit-relay-v2 hop service. We collect their publicly
+                // reachable addresses so initiate_relay_reservations() has
+                // something to dial — closing the gap where Private-verdict
+                // nodes had nowhere to reserve a circuit because
+                // relay_server_addrs was empty unless --relay-servers was
+                // passed explicitly.
+                let supports_relay = info
+                    .protocols
+                    .iter()
+                    .any(|p| p == &libp2p::relay::HOP_PROTOCOL_NAME);
+                if supports_relay {
+                    let mut added = 0;
+                    for addr in &info.listen_addrs {
+                        if classify_address(addr) != "ipv4_public" {
+                            continue;
+                        }
+                        let entry = (addr.clone(), peer_id);
+                        if !self.relay_server_addrs.iter().any(|(a, p)| a == &entry.0 && p == &entry.1) {
+                            self.relay_server_addrs.push(entry);
+                            added += 1;
+                        }
+                    }
+                    if added > 0 {
+                        info!(
+                            "Discovered {} relay-server address(es) on peer {} (total relay servers: {})",
+                            added,
+                            peer_id,
+                            self.relay_server_addrs.len(),
+                        );
+                        // If we already know we're behind NAT and don't have
+                        // a reservation yet, try this newly-discovered relay.
+                        if matches!(self.nat_status, NatStatus::Private)
+                            && !self.has_relay_reservation
+                            && self.relay_mode == RelayMode::Client
+                        {
+                            self.initiate_relay_reservations();
+                        }
+                    }
+                }
+
+                // Emit peer_identified IPC event
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "peer_identified",
+                    "payload": {
+                        "peer_id": peer_id.to_string(),
+                        "tier": claimed_tier,
+                        "verified": tier_verified,
+                        "pubkey": pubkey_b64,
+                        "supports_relay": supports_relay,
+                    }
+                }));
+            }
+            BitterbotBehaviourEvent::Autonat(event) => {
+                // libp2p_autonat::v2::client::Event has a structured shape:
+                //   { tested_addr, bytes_sent, server, result: Result<(), Error> }
+                // The previous parser sniffed `format!("{:?}", event)` for words
+                // like "Reachable" / "Public" — those literals never appear in
+                // this Event's Debug output, so the verdict was permanently
+                // stuck at unknown. Now we match on the structured result:
+                // Ok ⇒ a peer successfully dialed us back ⇒ Public,
+                // Err ⇒ peer could not dial us back ⇒ Private. A single
+                // confirmed Public sticks; we never downgrade Public → Private
+                // on a later failed probe (the failure may just mean one
+                // particular probing peer can't reach us, while the network
+                // generally can).
+                let was_unknown = matches!(self.nat_status, NatStatus::Unknown);
+                let new_status = match &event.result {
+                    Ok(()) => NatStatus::Public,
+                    Err(_) if !matches!(self.nat_status, NatStatus::Public) => NatStatus::Private,
+                    Err(_) => self.nat_status,
+                };
+                if new_status != self.nat_status || was_unknown {
+                    let label = match new_status {
+                        NatStatus::Public => "public",
+                        NatStatus::Private => "private",
+                        NatStatus::Unknown => "unknown",
+                    };
+                    info!(
+                        "AutoNAT verdict: {} (tested {} via {}, result {})",
+                        label,
+                        event.tested_addr,
+                        event.server,
+                        if event.result.is_ok() { "ok" } else { "err" },
+                    );
+                    self.nat_status = new_status;
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.nat_status = label.to_string();
+                }
+                // When AutoNAT detects we're behind NAT, initiate relay reservations
+                if self.relay_mode == RelayMode::Client {
+                    if !self.has_relay_reservation && !self.relay_server_addrs.is_empty() {
+                        info!("NAT detected, initiating relay reservations");
+                        self.initiate_relay_reservations();
+                    }
+                }
+            }
+            BitterbotBehaviourEvent::RelayClient(event) => {
+                match event {
+                    relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. } => {
+                        info!("Relay reservation accepted by {} (renewal: {})", relay_peer_id, renewal);
+                        self.has_relay_reservation = true;
+                        {
+                            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                            stats.relay_reservations_accepted =
+                                stats.relay_reservations_accepted.saturating_add(1);
+                        }
+
+                        // Advertise relay address so other peers can reach us
+                        let relay_addr: Multiaddr = format!(
+                            "/p2p/{}/p2p-circuit",
+                            relay_peer_id
+                        ).parse().unwrap();
+                        self.swarm.add_external_address(relay_addr);
+
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "relay_reservation_accepted",
+                            "payload": {
+                                "relay_peer_id": relay_peer_id.to_string(),
+                                "renewal": renewal,
+                            }
+                        }));
+                    }
+                    // Note: libp2p-relay 0.18 does not have a ReservationReqFailed variant.
+                    // Reservation failures surface as transport errors or connection failures.
+                    relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
+                        info!("Outbound circuit via relay {} established", relay_peer_id);
+                        {
+                            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                            stats.relay_circuits_established =
+                                stats.relay_circuits_established.saturating_add(1);
+                        }
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "relay_circuit_established",
+                            "payload": {
+                                "relay_peer_id": relay_peer_id.to_string(),
+                                "direction": "outbound",
+                            }
+                        }));
+                    }
+                    relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
+                        info!("Inbound circuit from {} established", src_peer_id);
+                        {
+                            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                            stats.relay_circuits_established =
+                                stats.relay_circuits_established.saturating_add(1);
+                        }
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "relay_circuit_established",
+                            "payload": {
+                                "src_peer_id": src_peer_id.to_string(),
+                                "direction": "inbound",
+                            }
+                        }));
+                    }
+                }
+            }
+            BitterbotBehaviourEvent::RelayServer(event) => {
+                match event {
+                    relay::Event::ReservationReqAccepted { src_peer_id, renewed } => {
+                        info!("Relay server: accepted reservation from {} (renewed: {})", src_peer_id, renewed);
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "relay_server_reservation",
+                            "payload": {
+                                "peer_id": src_peer_id.to_string(),
+                                "renewed": renewed,
+                            }
+                        }));
+                    }
+                    relay::Event::ReservationTimedOut { src_peer_id } => {
+                        debug!("Relay server: reservation timed out for {}", src_peer_id);
+                    }
+                    relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, .. } => {
+                        debug!("Relay server: circuit denied from {} to {}", src_peer_id, dst_peer_id);
+                    }
+                    _ => {}
+                }
+            }
+            BitterbotBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result }) => {
+                match result {
+                    Ok(_) => {
+                        info!("DCUtR hole-punch succeeded with {}", remote_peer_id);
+                        {
+                            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                            stats.hole_punches_succeeded =
+                                stats.hole_punches_succeeded.saturating_add(1);
+                        }
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "hole_punch_succeeded",
+                            "payload": {
+                                "peer_id": remote_peer_id.to_string(),
+                            }
+                        }));
+                    }
+                    Err(ref e) => {
+                        warn!("DCUtR hole-punch failed with {}: {:?}", remote_peer_id, e);
+                        {
+                            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                            stats.hole_punches_failed =
+                                stats.hole_punches_failed.saturating_add(1);
+                        }
+                        self.emit_ipc_event(serde_json::json!({
+                            "type": "hole_punch_failed",
+                            "payload": {
+                                "peer_id": remote_peer_id.to_string(),
+                                "error": format!("{:?}", e),
+                            }
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn initiate_relay_reservations(&mut self) {
+        if self.has_relay_reservation {
+            debug!("Already have relay reservation, skipping");
+            return;
+        }
+        for (addr, peer_id) in self.relay_server_addrs.clone() {
+            info!("Requesting relay reservation from {} at {}", peer_id, addr);
+            let relay_addr = addr
+                .with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                .with(libp2p::multiaddr::Protocol::P2pCircuit);
+            match self.swarm.listen_on(relay_addr.clone()) {
+                Ok(_) => info!("Listening on relay circuit: {}", relay_addr),
+                Err(e) => warn!("Failed to listen on relay {}: {}", relay_addr, e),
+            }
+        }
+    }
+
+    async fn handle_ipc_command(&mut self, cmd: IpcCommand) {
+        match cmd {
+            IpcCommand::PublishSkill {
+                id,
+                payload,
+                respond,
+            } => {
+                debug!("Publishing skill: {}", payload.name);
+                let envelope = crypto::sign_skill(
+                    &self.signing_key,
+                    &self.local_peer_id,
+                    &payload.skill_md,
+                    &payload.name,
+                );
+
+                // Serialize and publish via Gossipsub
+                match serde_json::to_vec(&envelope) {
+                    Ok(serialized) => {
+                        match self.swarm.behaviour_mut().gossipsub.publish(
+                            self.skills_topic.clone(),
+                            serialized,
+                        ) {
+                            Ok(msg_id) => {
+                                let peers_reached = self
+                                    .swarm
+                                    .behaviour()
+                                    .gossipsub
+                                    .all_mesh_peers()
+                                    .count();
+                                let bytes_published = serde_json::to_vec(&envelope)
+                                    .map(|v| v.len() as u64)
+                                    .unwrap_or(0);
+                                let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                                stats.skills_published += 1;
+                                *stats
+                                    .bytes_published_per_topic
+                                    .entry(SKILLS_TOPIC.to_string())
+                                    .or_insert(0) += bytes_published;
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "payload": {
+                                        "ok": true,
+                                        "content_hash": envelope.content_hash,
+                                        "peers_reached": peers_reached,
+                                        "message_id": msg_id.to_string()
+                                    }
+                                }));
+                                info!(
+                                    "Skill published: {} (hash: {}, reached: {} peers)",
+                                    payload.name, envelope.content_hash, peers_reached
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to publish skill to gossipsub: {}", e);
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "payload": {
+                                        "ok": false,
+                                        "error": format!("gossipsub publish failed: {}", e),
+                                        "content_hash": envelope.content_hash,
+                                        "peers_reached": 0
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize envelope: {}", e);
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response",
+                            "id": id,
+                            "payload": { "ok": false, "error": e.to_string() }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::GetPeers { id, respond } => {
+                let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = respond.send(serde_json::json!({
+                    "type": "response",
+                    "id": id,
+                    "payload": {
+                        "peers": stats.connected_peers,
+                        "peer_details": stats.peer_details
+                    }
+                }));
+            }
+            IpcCommand::GetStats { id, respond } => {
+                let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = respond.send(serde_json::json!({
+                    "type": "response",
+                    "id": id,
+                    "payload": {
+                        "peer_id": stats.peer_id,
+                        "peers": stats.connected_peers,
+                        "published": stats.skills_published,
+                        // Distinct skills (author + name); raw count below.
+                        "received": stats.skills_received,
+                        "messages_received": stats.skill_messages_received,
+                        "uptime_secs": stats.uptime_secs,
+                        "mesh_peers_count": stats.mesh_peers_count,
+                        "subscribed_topics": stats.subscribed_topics,
+                        "listen_addrs": stats.listen_addrs,
+                        "peak_concurrent_peers": stats.peak_concurrent_peers,
+                        "lifetime_unique_peer_ids": stats.lifetime_unique_peer_ids,
+                        "peers_joined_total": stats.peers_joined_total,
+                        "peers_left_total": stats.peers_left_total,
+                        "joins_per_minute": stats.joins_per_minute,
+                        "leaves_per_minute": stats.leaves_per_minute,
+                        "mesh_peers_per_topic": stats.mesh_peers_per_topic,
+                        "routing_table_size": stats.routing_table_size,
+                        "time_to_first_peer_ms": stats.time_to_first_peer_ms,
+                        "address_types": stats.address_types,
+                        "relay_reservations_accepted": stats.relay_reservations_accepted,
+                        "relay_circuits_established": stats.relay_circuits_established,
+                        "hole_punches_succeeded": stats.hole_punches_succeeded,
+                        "hole_punches_failed": stats.hole_punches_failed,
+                        "nat_status": stats.nat_status,
+                        "bytes_received_per_topic": stats.bytes_received_per_topic,
+                        "bytes_published_per_topic": stats.bytes_published_per_topic,
+                        "skill_latency_p50_ms": stats.skill_latency_p50_ms,
+                        "skill_latency_p95_ms": stats.skill_latency_p95_ms,
+                        "skill_latency_samples": stats.skill_latency_samples,
+                    }
+                }));
+            }
+            IpcCommand::GetIdentity { id, respond } => {
+                // Expose the orchestrator's Ed25519 libp2p pubkey (base64) so the
+                // TypeScript layer can use it as the management-node identity and
+                // verify it against the genesis trust list. Peer ID is the libp2p
+                // multihash form; node_tier reflects startup config.
+                let pubkey_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(self.signing_key.verifying_key().to_bytes());
+                let _ = respond.send(serde_json::json!({
+                    "type": "response",
+                    "id": id,
+                    "payload": {
+                        "pubkey": pubkey_b64,
+                        "peer_id": self.local_peer_id.to_string(),
+                        "node_tier": self.node_tier,
+                    }
+                }));
+            }
+            IpcCommand::SignComputeDescriptor { id, descriptor, respond } => {
+                let payload = match crypto::sign_compute_descriptor(&self.signing_key, &descriptor) {
+                    Ok(signature) => serde_json::json!({ "ok": true, "signature": signature }),
+                    Err(error) => serde_json::json!({ "ok": false, "error": error }),
+                };
+                let _ = respond.send(serde_json::json!({ "type": "response", "id": id, "payload": payload }));
+            }
+            IpcCommand::ComputeEigenTrust {
+                id,
+                payload,
+                respond,
+            } => {
+                debug!(
+                    "Computing EigenTrust: {} edges, {} pre-trusted, max {} iterations",
+                    payload.trust_edges.len(),
+                    payload.pre_trusted.len(),
+                    payload.max_iterations,
+                );
+                let scores = compute_eigentrust(
+                    &payload.trust_edges,
+                    &payload.pre_trusted,
+                    payload.max_iterations,
+                );
+
+                // Inject EigenTrust scores into gossipsub peer scoring
+                // Map peer pubkeys/IDs to PeerIds and set application-specific scores
+                {
+                    let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut injected = 0usize;
+                    for (peer_key, &score) in &scores {
+                        // Try to find the PeerId for this pubkey by checking peer_details
+                        for (peer_id_str, detail) in &stats.peer_details {
+                            // Match by peer_id string or pubkey
+                            if peer_id_str == peer_key || detail.tier == *peer_key {
+                                if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
+                                    // Map EigenTrust score (0-1) to gossipsub app score (-100 to 100)
+                                    let app_score = (score - 0.5) * 200.0;
+                                    self.swarm.behaviour_mut().gossipsub
+                                        .set_application_score(&peer_id, app_score);
+                                    injected += 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if injected > 0 {
+                        info!("Injected {} EigenTrust scores into gossipsub peer scoring", injected);
+                    }
+                }
+
+                let _ = respond.send(serde_json::json!({
+                    "type": "response",
+                    "id": id,
+                    "payload": {
+                        "scores": scores
+                    }
+                }));
+            }
+            IpcCommand::SignAsManagement { id, payload, respond } => {
+                if self.node_tier != "management" {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "not a management node" }
+                    }));
+                    return;
+                }
+                let (sig, pubkey) = crypto::sign_as_management(&self.signing_key, &payload.skill_md);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id,
+                    "payload": { "ok": true, "management_signature": sig, "management_pubkey": pubkey }
+                }));
+            }
+            IpcCommand::PublishWeather { id, payload, respond } => {
+                if self.node_tier != "management" {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "not a management node" }
+                    }));
+                    return;
+                }
+                let (sig, pubkey) = crypto::sign_weather(
+                    &self.signing_key,
+                    payload.global_cortisol_spike,
+                    payload.duration_ms,
+                    &payload.reason,
+                );
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                let envelope = WeatherEnvelope {
+                    global_cortisol_spike: payload.global_cortisol_spike,
+                    duration_ms: payload.duration_ms,
+                    reason: payload.reason,
+                    management_pubkey: pubkey,
+                    management_signature: sig,
+                    timestamp: now_ms,
+                };
+                match serde_json::to_vec(&envelope) {
+                    Ok(serialized) => {
+                        match self.swarm.behaviour_mut().gossipsub.publish(
+                            self.weather_topic.clone(), serialized,
+                        ) {
+                            Ok(_) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": true }
+                                }));
+                            }
+                            Err(e) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": false, "error": format!("publish failed: {}", e) }
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": format!("serialize failed: {}", e) }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::PublishBounty { id, payload, respond } => {
+                let is_v2 = payload.version == Some(2);
+                if !is_v2 && self.node_tier != "management" {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "not a management node" }
+                    }));
+                    return;
+                }
+                let (sig, pubkey) = if is_v2 {
+                    // PLAN-29 Forage: any node may publish, but only a
+                    // structurally funded bounty. Enforce locally too so a
+                    // node never gossips something peers will drop.
+                    let wallet = payload.poster_wallet_address.clone().unwrap_or_default();
+                    let oracle = payload.oracle_commitment.clone().unwrap_or_default();
+                    let proof = payload.funding_proof.clone().unwrap_or_default();
+                    let reward = payload.reward_usdc.unwrap_or(0.0);
+                    if wallet.is_empty() || oracle.is_empty() || proof.is_empty() || reward <= 0.0 {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": "v2 bounty requires poster_wallet_address, oracle_commitment, funding_proof, and reward_usdc > 0" }
+                        }));
+                        return;
+                    }
+                    crypto::sign_bounty_v2(
+                        &self.signing_key,
+                        &payload.bounty_id, &payload.target_type, &payload.description,
+                        payload.priority, payload.reward_multiplier, payload.expires_at,
+                        &wallet,
+                        payload.kind.as_deref().unwrap_or("oneshot"),
+                        payload.category.as_deref().unwrap_or("general"),
+                        &oracle, reward, &proof,
+                        payload.claim_stake_usdc.unwrap_or(0.0),
+                        payload.deadline.unwrap_or(0),
+                        payload.max_claims.unwrap_or(1),
+                    )
+                } else {
+                    crypto::sign_bounty(
+                        &self.signing_key,
+                        &payload.bounty_id, &payload.target_type, &payload.description,
+                        payload.priority, payload.reward_multiplier, payload.expires_at,
+                    )
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                let envelope = BountyEnvelope {
+                    bounty_id: payload.bounty_id,
+                    target_type: payload.target_type,
+                    description: payload.description,
+                    priority: payload.priority,
+                    reward_multiplier: payload.reward_multiplier,
+                    region_hint: payload.region_hint,
+                    expires_at: payload.expires_at,
+                    management_pubkey: pubkey,
+                    management_signature: sig,
+                    timestamp: now_ms,
+                    version: payload.version,
+                    poster_wallet_address: payload.poster_wallet_address.clone(),
+                    kind: if is_v2 { Some(payload.kind.clone().unwrap_or_else(|| "oneshot".into())) } else { payload.kind.clone() },
+                    category: if is_v2 { Some(payload.category.clone().unwrap_or_else(|| "general".into())) } else { payload.category.clone() },
+                    oracle_commitment: payload.oracle_commitment.clone(),
+                    reward_usdc: payload.reward_usdc,
+                    funding_proof: payload.funding_proof.clone(),
+                    claim_stake_usdc: if is_v2 { Some(payload.claim_stake_usdc.unwrap_or(0.0)) } else { payload.claim_stake_usdc },
+                    deadline: if is_v2 { Some(payload.deadline.unwrap_or(0)) } else { payload.deadline },
+                    max_claims: if is_v2 { Some(payload.max_claims.unwrap_or(1)) } else { payload.max_claims },
+                };
+                match serde_json::to_vec(&envelope) {
+                    Ok(serialized) => {
+                        match self.swarm.behaviour_mut().gossipsub.publish(
+                            self.bounties_topic.clone(), serialized,
+                        ) {
+                            Ok(_) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": true }
+                                }));
+                            }
+                            Err(e) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": false, "error": format!("publish failed: {}", e) }
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": format!("serialize failed: {}", e) }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::PublishTelemetry { id, payload, respond } => {
+                let (sig, pubkey) = crypto::sign_telemetry(
+                    &self.signing_key,
+                    &payload.signal_type,
+                    &payload.data,
+                );
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let envelope = TelemetryEnvelope {
+                    signal_type: payload.signal_type,
+                    data: payload.data,
+                    author_peer_id: self.local_peer_id.to_string(),
+                    author_pubkey: pubkey,
+                    signature: sig,
+                    timestamp: now_secs,
+                };
+                match serde_json::to_vec(&envelope) {
+                    Ok(serialized) => {
+                        match self.swarm.behaviour_mut().gossipsub.publish(
+                            self.telemetry_topic.clone(), serialized,
+                        ) {
+                            Ok(_) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": true }
+                                }));
+                                debug!("Telemetry published: type={}", envelope.signal_type);
+                            }
+                            Err(e) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": false, "error": format!("publish failed: {}", e) }
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": format!("serialize failed: {}", e) }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::PublishQuery { id, payload, respond } => {
+                let (sig, pubkey) = crypto::sign_query(
+                    &self.signing_key,
+                    &payload.query_id,
+                    &payload.query,
+                );
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let envelope = QueryEnvelope {
+                    query_id: payload.query_id,
+                    query: payload.query,
+                    domain_hint: payload.domain_hint,
+                    author_peer_id: self.local_peer_id.to_string(),
+                    author_pubkey: pubkey,
+                    signature: sig,
+                    timestamp: now_secs,
+                };
+                match serde_json::to_vec(&envelope) {
+                    Ok(serialized) => {
+                        match self.swarm.behaviour_mut().gossipsub.publish(
+                            self.queries_topic.clone(), serialized,
+                        ) {
+                            Ok(_) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": true }
+                                }));
+                                debug!("Query published: id={}", envelope.query_id);
+                            }
+                            Err(e) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": false, "error": format!("publish failed: {}", e) }
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": format!("serialize failed: {}", e) }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::SubscribeTopic { id, topic, respond } => {
+                // Only blinded circles and the exact Compute topic are dynamic;
+                // builtin topics stay compile-time rather than exposing a
+                // general subscribe-anything primitive.
+                if is_gateway_topic(&topic) {
+                    let t = gossipsub::IdentTopic::new(topic.clone());
+                    match self.swarm.behaviour_mut().gossipsub.subscribe(&t) {
+                        Ok(_) => {
+                            let _ = respond.send(serde_json::json!({
+                                "type": "response", "id": id,
+                                "payload": { "ok": true, "topic": topic }
+                            }));
+                        }
+                        Err(e) => {
+                            let _ = respond.send(serde_json::json!({
+                                "type": "response", "id": id,
+                                "payload": { "ok": false, "error": format!("subscribe failed: {}", e) }
+                            }));
+                        }
+                    }
+                } else {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "only exact Compute or valid blinded circle topics allowed" }
+                    }));
+                }
+            }
+            IpcCommand::UnsubscribeTopic { id, topic, respond } => {
+                // Same gate as subscribe/publish: without it, the IPC verb can
+                // detach the node from the compile-time core topics
+                // (skills/census/queries), silently partitioning it (C7).
+                if !is_gateway_topic(&topic) {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "only exact Compute or valid blinded circle topics allowed" }
+                    }));
+                } else {
+                    let t = gossipsub::IdentTopic::new(topic.clone());
+                    let ok = self.swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": ok, "topic": topic }
+                    }));
+                }
+            }
+            IpcCommand::PublishTopic { id, topic, data_b64, respond } => {
+                if !is_gateway_topic(&topic) {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "only exact Compute or valid blinded circle topics allowed" }
+                    }));
+                } else {
+                    match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                        Ok(bytes) => {
+                            let t = gossipsub::IdentTopic::new(topic.clone());
+                            match self.swarm.behaviour_mut().gossipsub.publish(t, bytes) {
+                                Ok(msg_id) => {
+                                    let _ = respond.send(serde_json::json!({
+                                        "type": "response", "id": id,
+                                        "payload": { "ok": true, "message_id": msg_id.to_string() }
+                                    }));
+                                }
+                                Err(e) => {
+                                    let _ = respond.send(serde_json::json!({
+                                        "type": "response", "id": id,
+                                        "payload": { "ok": false, "error": format!("publish failed: {}", e) }
+                                    }));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = respond.send(serde_json::json!({
+                                "type": "response", "id": id,
+                                "payload": { "ok": false, "error": format!("bad base64: {}", e) }
+                            }));
+                        }
+                    }
+                }
+            }
+            IpcCommand::CircleRequest { id, peer_id, data_b64, respond } => {
+                // Two-phase by design: the IPC reader is sequential, so we
+                // answer immediately with the outbound request id and deliver
+                // the network outcome later as a circle_response EVENT — a
+                // 20s in-flight request must never stall the whole bridge.
+                match peer_id.parse::<PeerId>() {
+                    Ok(peer) => {
+                        let rid = self
+                            .swarm
+                            .behaviour_mut()
+                            .circle_rpc
+                            .send_request(&peer, CircleRpcRequest { data_b64 });
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": true, "request_id": rid.to_string() }
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": format!("invalid peer id: {}", e) }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::CircleRespond { id, request_id, data_b64, respond } => {
+                match self.inbound_circle_rpc.remove(&request_id) {
+                    Some((channel, _)) => {
+                        let ok = self
+                            .swarm
+                            .behaviour_mut()
+                            .circle_rpc
+                            .send_response(channel, CircleRpcResponse { data_b64 })
+                            .is_ok();
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": ok }
+                        }));
+                    }
+                    None => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": "unknown or expired request_id" }
+                        }));
+                    }
+                }
+            }
+            IpcCommand::GetNetworkCensus { id, respond } => {
+                if self.node_tier != "management" {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "not a management node" }
+                    }));
+                    return;
+                }
+                let census = if let Some(ref mgmt) = self.management_state {
+                    let state = mgmt.lock().unwrap_or_else(|e| e.into_inner());
+                    let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    serde_json::json!({
+                        "ok": true,
+                        "total_peers_seen": state.total_peers_seen,
+                        "lifetime_unique_peer_ids": stats.lifetime_unique_peer_ids,
+                        "peak_concurrent_peers": stats.peak_concurrent_peers,
+                        "peers_by_tier": state.peers_by_tier,
+                        "skills_published_network_wide": state.skills_published_network_wide,
+                        "telemetry_counts_by_type": state.telemetry_counts_by_type,
+                        "network_health_score": state.network_health_score,
+                        "last_census_at": state.last_census_at,
+                        "connected_peers": stats.connected_peers,
+                        "peer_count_history": state.peer_count_history.iter()
+                            .rev().take(100).collect::<Vec<_>>(),
+                    })
+                } else {
+                    serde_json::json!({ "ok": false, "error": "management state not initialized" })
+                };
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": census
+                }));
+            }
+            IpcCommand::GetAnomalyAlerts { id, respond } => {
+                if self.node_tier != "management" {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "not a management node" }
+                    }));
+                    return;
+                }
+                let alerts = if let Some(ref mgmt) = self.management_state {
+                    let state = mgmt.lock().unwrap_or_else(|e| e.into_inner());
+                    serde_json::json!({
+                        "ok": true,
+                        "alerts": state.anomaly_alerts,
+                        "network_health_score": state.network_health_score,
+                    })
+                } else {
+                    serde_json::json!({ "ok": false, "error": "management state not initialized" })
+                };
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": alerts
+                }));
+            }
+            IpcCommand::PropagateBan { id, peer_pubkey, reason, respond } => {
+                if self.node_tier != "management" {
+                    let _ = respond.send(serde_json::json!({
+                        "type": "response", "id": id,
+                        "payload": { "ok": false, "error": "not a management node" }
+                    }));
+                    return;
+                }
+                // Publish ban via telemetry topic — signed with management key
+                let ban_data = serde_json::json!({ "peer_pubkey": peer_pubkey, "reason": reason });
+                let (signature, author_pubkey) = crypto::sign_telemetry(
+                    &self.signing_key,
+                    "management_ban",
+                    &ban_data,
+                );
+                let ban_envelope = serde_json::json!({
+                    "signal_type": "management_ban",
+                    "data": ban_data,
+                    "author_peer_id": self.local_peer_id.to_string(),
+                    "author_pubkey": author_pubkey,
+                    "signature": signature,
+                    "timestamp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
+                match serde_json::to_vec(&ban_envelope) {
+                    Ok(data) => {
+                        match self.swarm.behaviour_mut().gossipsub.publish(
+                            self.telemetry_topic.clone(), data
+                        ) {
+                            Ok(_) => {
+                                info!("Ban propagated for peer {} (reason: {})", peer_pubkey, reason);
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": true }
+                                }));
+                            }
+                            Err(e) => {
+                                let _ = respond.send(serde_json::json!({
+                                    "type": "response", "id": id,
+                                    "payload": { "ok": false, "error": format!("publish failed: {}", e) }
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = respond.send(serde_json::json!({
+                            "type": "response", "id": id,
+                            "payload": { "ok": false, "error": format!("serialize failed: {}", e) }
+                        }));
+                    }
+                }
+            }
+            // PLAN-14 Pillar 4: computer use commands. Each handler in
+            // crate::computer::imp respects the runtime env-var gate
+            // and returns a JSON envelope. We just wrap the response.
+            IpcCommand::ComputerScreenshot { id, payload, respond } => {
+                let result = crate::computer::imp::screenshot(payload);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": result
+                }));
+            }
+            IpcCommand::ComputerScreenSize { id, payload, respond } => {
+                let result = crate::computer::imp::screen_size(payload);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": result
+                }));
+            }
+            IpcCommand::ComputerMouseMove { id, payload, respond } => {
+                let result = crate::computer::imp::mouse_move(payload);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": result
+                }));
+            }
+            IpcCommand::ComputerMouseClick { id, payload, respond } => {
+                let result = crate::computer::imp::mouse_click(payload);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": result
+                }));
+            }
+            IpcCommand::ComputerType { id, payload, respond } => {
+                let result = crate::computer::imp::type_text(payload);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": result
+                }));
+            }
+            IpcCommand::ComputerKey { id, payload, respond } => {
+                let result = crate::computer::imp::key(payload);
+                let _ = respond.send(serde_json::json!({
+                    "type": "response", "id": id, "payload": result
+                }));
+            }
+        }
+    }
+
+    async fn handle_swarm_event(&mut self, event: SwarmEvent) {
+        match event {
+            SwarmEvent::SkillReceived(mut envelope) => {
+                if !self.security.validate_envelope(&envelope) {
+                    warn!(
+                        "Rejected invalid skill envelope from {}",
+                        envelope.author_peer_id
+                    );
+                    return;
+                }
+
+                // Our own skill echoed back (a peer re-published it, or another
+                // machine shares this node key). Gossipsub already suppresses our
+                // own messages, but not a re-publish. Same rule as telemetry
+                // below: never count, reward, or forward our own output.
+                if envelope.author_pubkey == self.own_author_pubkey {
+                    debug!("Dropping our own skill echoed back: {}", envelope.name);
+                    return;
+                }
+
+                // Validate management signature (strips invalid claims but never rejects)
+                self.security.validate_management_signature(&mut envelope);
+
+                // Skill propagation latency sample. envelope.timestamp is in
+                // seconds (see crypto::sign_skill); we approximate ms latency
+                // as max(0, now_secs - envelope.timestamp) * 1000. Coarse but
+                // good enough for p50/p95 tracking.
+                let now_secs_for_latency = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let latency_ms = now_secs_for_latency
+                    .saturating_sub(envelope.timestamp)
+                    .saturating_mul(1000);
+                if self.latency_window_ms.len() == LATENCY_WINDOW {
+                    self.latency_window_ms.pop_front();
+                }
+                self.latency_window_ms.push_back(latency_ms);
+
+                // Approximate gossipsub byte volume for the skills topic. We
+                // re-serialize the envelope here for the sake of accuracy —
+                // this is the same shape the publisher emitted.
+                let approx_bytes = serde_json::to_vec(&envelope)
+                    .map(|v| v.len() as u64)
+                    .unwrap_or(0);
+
+                // Count skills, not messages: a re-broadcast of a skill this
+                // author already sent (same name, new bytes) is still forwarded
+                // to Node below, but neither counts as a new skill nor earns the
+                // sender reputation again.
+                let first_receipt = self
+                    .skill_receipts
+                    .record(&envelope.author_pubkey, &envelope.name);
+                {
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.skill_messages_received += 1;
+                    *stats
+                        .bytes_received_per_topic
+                        .entry(SKILLS_TOPIC.to_string())
+                        .or_insert(0) += approx_bytes;
+                }
+                if first_receipt {
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.skills_received += 1;
+                    if let Some(detail) = stats.peer_details.get_mut(&envelope.author_peer_id) {
+                        detail.skills_received_from += 1;
+                        // Diminishing reputation gain: logarithmic scaling, capped at 100
+                        if detail.reputation_score < 100.0 {
+                            let gain = 1.0 / (1.0 + (detail.skills_received_from as f64).ln());
+                            detail.reputation_score = (detail.reputation_score + gain).min(100.0);
+                        }
+                    }
+                }
+
+                // Emit to IPC so Node.js can process the received skill
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "skill_received",
+                    "payload": envelope
+                }));
+
+                // Management node: track skill publication rate
+                self.track_skill_publication(&envelope.author_peer_id);
+
+                info!(
+                    "Skill received: {} from {}",
+                    envelope.name, envelope.author_peer_id
+                );
+            }
+            SwarmEvent::WeatherReceived(envelope) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                if envelope.timestamp + 300_000 < now_ms || envelope.timestamp > now_ms + 60_000 {
+                    debug!("Dropping stale/future weather envelope (ts={})", envelope.timestamp);
+                    return;
+                }
+                if !self.security.is_management_pubkey(&envelope.management_pubkey) {
+                    warn!("Weather envelope from non-management pubkey, discarding");
+                    return;
+                }
+                if !crypto::verify_weather(&envelope) {
+                    warn!("Weather envelope has invalid signature, discarding");
+                    return;
+                }
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "weather_received",
+                    "payload": {
+                        "global_cortisol_spike": envelope.global_cortisol_spike,
+                        "duration_ms": envelope.duration_ms,
+                        "reason": envelope.reason,
+                        "management_pubkey": envelope.management_pubkey,
+                        "timestamp": envelope.timestamp,
+                    }
+                }));
+                info!("Weather broadcast received: cortisol={} reason={}", envelope.global_cortisol_spike, envelope.reason);
+            }
+            SwarmEvent::BountyReceived(envelope) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                if envelope.timestamp + 300_000 < now_ms || envelope.timestamp > now_ms + 60_000 {
+                    debug!("Dropping stale/future bounty envelope (ts={})", envelope.timestamp);
+                    return;
+                }
+                if envelope.is_v2() {
+                    // PLAN-29 Forage: any-pubkey bounties are admitted on
+                    // FUNDING, not identity. Structurally unfunded bounties
+                    // are spam and stop here; economic validation of the
+                    // funding proof happens TS-side (chain access lives
+                    // there), before the bounty reaches bounty_posts.
+                    if !envelope.has_funding() {
+                        debug!("Dropping unfunded v2 bounty {}", envelope.bounty_id);
+                        return;
+                    }
+                    if !crypto::verify_bounty_v2(&envelope) {
+                        warn!("v2 bounty envelope has invalid poster signature, discarding");
+                        return;
+                    }
+                } else {
+                    if !self.security.is_management_pubkey(&envelope.management_pubkey) {
+                        warn!("Bounty envelope from non-management pubkey, discarding");
+                        return;
+                    }
+                    if !crypto::verify_bounty(&envelope) {
+                        warn!("Bounty envelope has invalid signature, discarding");
+                        return;
+                    }
+                }
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "bounty_received",
+                    "payload": {
+                        "bounty_id": envelope.bounty_id,
+                        "target_type": envelope.target_type,
+                        "description": envelope.description,
+                        "priority": envelope.priority,
+                        "reward_multiplier": envelope.reward_multiplier,
+                        "region_hint": envelope.region_hint,
+                        "expires_at": envelope.expires_at,
+                        "management_pubkey": envelope.management_pubkey,
+                        "timestamp": envelope.timestamp,
+                        "version": envelope.version,
+                        "poster_wallet_address": envelope.poster_wallet_address,
+                        "kind": envelope.kind,
+                        "category": envelope.category,
+                        "oracle_commitment": envelope.oracle_commitment,
+                        "reward_usdc": envelope.reward_usdc,
+                        "funding_proof": envelope.funding_proof,
+                        "claim_stake_usdc": envelope.claim_stake_usdc,
+                        "deadline": envelope.deadline,
+                        "max_claims": envelope.max_claims,
+                    }
+                }));
+                info!("Bounty received: {} (type: {})", envelope.bounty_id, envelope.target_type);
+            }
+            SwarmEvent::TelemetryReceived(envelope) => {
+                // Timestamp window check
+                if !self.security.validate_timestamp_secs(envelope.timestamp) {
+                    debug!("Dropping stale/future telemetry (ts={})", envelope.timestamp);
+                    return;
+                }
+                // Signature verification
+                if !crypto::verify_telemetry(&envelope) {
+                    warn!("Telemetry from {} has invalid signature, discarding", envelope.author_peer_id);
+                    return;
+                }
+                // Per-peer rate limiting
+                if !self.security.check_telemetry_rate(&envelope.author_peer_id) {
+                    debug!("Telemetry rate limit exceeded for {}", envelope.author_peer_id);
+                    return;
+                }
+                // Don't forward our own telemetry back to ourselves
+                if envelope.author_peer_id == self.local_peer_id.to_string() {
+                    return;
+                }
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "telemetry_received",
+                    "payload": {
+                        "signal_type": envelope.signal_type,
+                        "data": envelope.data,
+                        "author_peer_id": envelope.author_peer_id,
+                        "timestamp": envelope.timestamp,
+                    }
+                }));
+                // Management node: aggregate telemetry
+                self.aggregate_telemetry(&envelope);
+
+                debug!("Telemetry received: type={} from {}", envelope.signal_type, envelope.author_peer_id);
+            }
+            SwarmEvent::QueryReceived(envelope) => {
+                // Timestamp window check
+                if !self.security.validate_timestamp_secs(envelope.timestamp) {
+                    debug!("Dropping stale/future query (ts={})", envelope.timestamp);
+                    return;
+                }
+                // Signature verification
+                if !crypto::verify_query(&envelope) {
+                    warn!("Query from {} has invalid signature, discarding", envelope.author_peer_id);
+                    return;
+                }
+                // Per-peer rate limiting
+                if !self.security.check_query_rate(&envelope.author_peer_id) {
+                    debug!("Query rate limit exceeded for {}", envelope.author_peer_id);
+                    return;
+                }
+                // Don't forward our own queries back to ourselves
+                if envelope.author_peer_id == self.local_peer_id.to_string() {
+                    return;
+                }
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "query_received",
+                    "payload": {
+                        "query_id": envelope.query_id,
+                        "query": envelope.query,
+                        "domain_hint": envelope.domain_hint,
+                        "author_peer_id": envelope.author_peer_id,
+                        "timestamp": envelope.timestamp,
+                    }
+                }));
+                info!("Query received: '{}' from {}", envelope.query, envelope.author_peer_id);
+            }
+            SwarmEvent::PeerConnected(peer_id, addrs) => {
+                let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+                let address_type = addrs
+                    .first()
+                    .map(classify_address)
+                    .unwrap_or("other")
+                    .to_string();
+                let is_new_lifetime = self.lifetime_peer_ids.insert(peer_id.to_string());
+                let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+                self.current_minute_joins = self.current_minute_joins.saturating_add(1);
+                {
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.connected_peers += 1;
+                    if stats.connected_peers > stats.peak_concurrent_peers {
+                        stats.peak_concurrent_peers = stats.connected_peers;
+                    }
+                    if is_new_lifetime {
+                        stats.lifetime_unique_peer_ids = self.lifetime_peer_ids.len() as u64;
+                    }
+                    stats.peers_joined_total = stats.peers_joined_total.saturating_add(1);
+                    if stats.time_to_first_peer_ms.is_none() {
+                        stats.time_to_first_peer_ms = Some(elapsed_ms);
+                    }
+                    *stats.address_types.entry(address_type.clone()).or_insert(0) += 1;
+                    let detail = PeerDetail {
+                        addrs: addr_strings.clone(),
+                        connected_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        skills_received_from: 0,
+                        reputation_score: 0.0,
+                        tier: String::new(),
+                        tier_verified: false,
+                    };
+                    stats
+                        .peer_details
+                        .insert(peer_id.to_string(), detail);
+                }
+
+                // Emit to IPC
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "peer_connected",
+                    "payload": {
+                        "peer_id": peer_id.to_string(),
+                        "addrs": addr_strings,
+                        "address_type": address_type,
+                        "is_new_lifetime": is_new_lifetime,
+                    }
+                }));
+
+                info!("Peer connected: {} ({:?})", peer_id, addrs);
+            }
+            SwarmEvent::PeerDisconnected(peer_id) => {
+                self.current_minute_leaves = self.current_minute_leaves.saturating_add(1);
+                {
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.connected_peers = stats.connected_peers.saturating_sub(1);
+                    stats.peers_left_total = stats.peers_left_total.saturating_add(1);
+                    // Clear connection addrs but preserve reputation data
+                    if let Some(detail) = stats.peer_details.get_mut(&peer_id.to_string()) {
+                        detail.addrs.clear();
+                        detail.connected_at = 0; // mark as disconnected
+                    }
+                }
+
+                // Emit to IPC
+                self.emit_ipc_event(serde_json::json!({
+                    "type": "peer_disconnected",
+                    "payload": {
+                        "peer_id": peer_id.to_string()
+                    }
+                }));
+
+                info!("Peer disconnected: {}", peer_id);
+            }
+        }
+    }
+}
+
+/// Compute EigenTrust scores from a trust edge list via power iteration.
+///
+/// Algorithm: t_new = alpha * C^T * t + (1 - alpha) * p
+/// where C is the row-normalized trust matrix and p is the pre-trust vector.
+pub fn compute_eigentrust(
+    edges: &[(String, String, f64)],
+    pre_trusted: &[String],
+    max_iterations: u32,
+) -> HashMap<String, f64> {
+    // Collect all peers
+    let mut peer_set = std::collections::HashSet::new();
+    for (a, b, _) in edges {
+        peer_set.insert(a.clone());
+        peer_set.insert(b.clone());
+    }
+    let peers: Vec<String> = peer_set.into_iter().collect();
+    let n = peers.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    let idx: HashMap<&str, usize> = peers.iter().enumerate().map(|(i, p)| (p.as_str(), i)).collect();
+
+    // Build row-normalized trust matrix C
+    let mut c = vec![vec![0.0f64; n]; n];
+    let mut row_sums = vec![0.0f64; n];
+
+    for (truster, trustee, weight) in edges {
+        if let (Some(&i), Some(&j)) = (idx.get(truster.as_str()), idx.get(trustee.as_str())) {
+            let w = weight.max(0.0);
+            c[i][j] += w;
+            row_sums[i] += w;
+        }
+    }
+
+    // Row-normalize
+    for i in 0..n {
+        if row_sums[i] > 0.0 {
+            for j in 0..n {
+                c[i][j] /= row_sums[i];
+            }
+        }
+    }
+
+    // Pre-trust vector p
+    let mut p = vec![1.0 / n as f64; n];
+    if !pre_trusted.is_empty() {
+        p = vec![0.0; n];
+        for pk in pre_trusted {
+            if let Some(&i) = idx.get(pk.as_str()) {
+                p[i] = 1.0 / pre_trusted.len() as f64;
+            }
+        }
+    }
+
+    // Power iteration
+    let alpha = 0.9;
+    let convergence_threshold = 0.001;
+    let mut t = vec![1.0 / n as f64; n];
+
+    for _ in 0..max_iterations {
+        let mut t_new = vec![0.0f64; n];
+
+        // C^T * t
+        for i in 0..n {
+            for j in 0..n {
+                t_new[j] += c[i][j] * t[i];
+            }
+        }
+
+        // Blend: alpha * C^T*t + (1-alpha) * p
+        for i in 0..n {
+            t_new[i] = alpha * t_new[i] + (1.0 - alpha) * p[i];
+        }
+
+        // Check convergence
+        let max_diff = t.iter().zip(t_new.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+
+        t = t_new;
+        if max_diff < convergence_threshold {
+            break;
+        }
+    }
+
+    peers.into_iter().enumerate().map(|(i, p)| (p, t[i])).collect()
+}
+
+/// Convert an `ed25519_dalek::SigningKey` into a `libp2p::identity::Keypair`.
+fn dalek_to_libp2p_keypair(signing_key: &SigningKey) -> libp2p::identity::Keypair {
+    let secret_bytes = signing_key.to_bytes();
+    let public_bytes = signing_key.verifying_key().to_bytes();
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(&secret_bytes);
+    combined[32..].copy_from_slice(&public_bytes);
+    let libp2p_kp = libp2p::identity::ed25519::Keypair::try_from_bytes(&mut combined)
+        .expect("valid ed25519 keypair bytes");
+    libp2p::identity::Keypair::from(libp2p_kp)
+}
+
+/// Parse relay server multiaddresses into (addr_without_p2p, peer_id) pairs.
+fn parse_relay_servers(relay_servers: &[String]) -> Vec<(Multiaddr, PeerId)> {
+    let mut result = Vec::new();
+    for s in relay_servers {
+        match s.parse::<Multiaddr>() {
+            Ok(addr) => {
+                if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) =
+                    addr.iter().find(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                {
+                    let addr_without_p2p: Multiaddr = addr
+                        .iter()
+                        .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                        .collect();
+                    result.push((addr_without_p2p, peer_id));
+                } else {
+                    warn!("Relay server address {} missing /p2p/<peer_id>, skipping", s);
+                }
+            }
+            Err(e) => warn!("Invalid relay server address '{}': {}", s, e),
+        }
+    }
+    result
+}
+
+fn new_circle_rpc_behaviour() -> request_response::cbor::Behaviour<CircleRpcRequest, CircleRpcResponse>
+{
+    request_response::cbor::Behaviour::new(
+        [(
+            StreamProtocol::new(CIRCLE_RPC_PROTOCOL),
+            request_response::ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
+    )
+}
+
+pub async fn build_swarm(
+    keypair: &SigningKey,
+    listen_addr: &str,
+    bootstrap_peers: &[String],
+    node_tier: &str,
+    genesis_trust_list: Vec<String>,
+    relay_mode: RelayMode,
+    relay_servers: &[String],
+    bootnode_state_path: Option<PathBuf>,
+) -> Result<
+    (
+        SwarmHandle,
+        mpsc::UnboundedReceiver<serde_json::Value>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let local_peer_id = crypto::peer_id_from_keypair(keypair);
+    let libp2p_keypair = dalek_to_libp2p_keypair(keypair);
+
+    // --- Gossipsub configuration ---
+    let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(Duration::from_secs(1))
+        .validation_mode(ValidationMode::Strict)
+        .max_transmit_size(MAX_GOSSIPSUB_MSG_SIZE)
+        .build()
+        .map_err(|e| format!("gossipsub config error: {}", e))?;
+
+    let mut gossipsub_behaviour = gossipsub::Behaviour::new(
+        MessageAuthenticity::Signed(libp2p_keypair.clone()),
+        gossipsub_config,
+    )
+    .map_err(|e| format!("gossipsub behaviour error: {}", e))?;
+
+    // Enable peer scoring — integrates with EigenTrust reputation
+    {
+        use gossipsub::{PeerScoreParams, PeerScoreThresholds, TopicScoreParams};
+        let mut topic_params = HashMap::new();
+
+        // Skills topic: reward valid skills, penalize invalid
+        let skills_score = TopicScoreParams {
+            topic_weight: 1.0,
+            time_in_mesh_weight: 0.5,
+            time_in_mesh_quantum: Duration::from_secs(1),
+            time_in_mesh_cap: 3600.0,
+            first_message_deliveries_weight: 1.0,
+            first_message_deliveries_decay: 0.5,
+            first_message_deliveries_cap: 50.0,
+            mesh_message_deliveries_weight: -1.0,
+            mesh_message_deliveries_decay: 0.5,
+            mesh_message_deliveries_threshold: 1.0,
+            mesh_message_deliveries_cap: 100.0,
+            mesh_message_deliveries_activation: Duration::from_secs(30),
+            mesh_message_deliveries_window: Duration::from_secs(5),
+            mesh_failure_penalty_weight: -1.0,
+            mesh_failure_penalty_decay: 0.5,
+            invalid_message_deliveries_weight: -10.0,
+            invalid_message_deliveries_decay: 0.3,
+        };
+        topic_params.insert(gossipsub::IdentTopic::new(SKILLS_TOPIC).hash(), skills_score);
+
+        let score_params = PeerScoreParams {
+            topics: topic_params,
+            // Application-specific score: will be updated with EigenTrust values
+            app_specific_weight: 5.0,
+            // IP colocation penalty — anti-Sybil
+            ip_colocation_factor_weight: -50.0,
+            ip_colocation_factor_threshold: 3.0, // penalize >3 peers from same /24
+            decay_interval: Duration::from_secs(60),
+            decay_to_zero: 0.01,
+            retain_score: Duration::from_secs(3600),
+            ..Default::default()
+        };
+
+        let thresholds = PeerScoreThresholds {
+            gossip_threshold: -100.0,
+            publish_threshold: -200.0,
+            graylist_threshold: -300.0,
+            accept_px_threshold: 10.0,
+            opportunistic_graft_threshold: 5.0,
+        };
+
+        gossipsub_behaviour
+            .with_peer_score(score_params, thresholds)
+            .map_err(|e| format!("gossipsub peer score error: {}", e))?;
+
+        info!("Gossipsub peer scoring enabled (IP colocation + app-specific EigenTrust)");
+    }
+
+    // Subscribe to topics
+    let skills_topic = gossipsub::IdentTopic::new(SKILLS_TOPIC);
+    let telemetry_topic = gossipsub::IdentTopic::new(TELEMETRY_TOPIC);
+    let weather_topic = gossipsub::IdentTopic::new(WEATHER_TOPIC);
+    let bounties_topic = gossipsub::IdentTopic::new(BOUNTIES_TOPIC);
+    let queries_topic = gossipsub::IdentTopic::new(QUERIES_TOPIC);
+    let census_topic = gossipsub::IdentTopic::new(CENSUS_TOPIC);
+    gossipsub_behaviour.subscribe(&skills_topic)?;
+    gossipsub_behaviour.subscribe(&telemetry_topic)?;
+    gossipsub_behaviour.subscribe(&weather_topic)?;
+    gossipsub_behaviour.subscribe(&bounties_topic)?;
+    gossipsub_behaviour.subscribe(&queries_topic)?;
+    gossipsub_behaviour.subscribe(&census_topic)?;
+    info!(
+        "Subscribed to topics: {}, {}, {}, {}, {}, {}",
+        SKILLS_TOPIC, TELEMETRY_TOPIC, WEATHER_TOPIC, BOUNTIES_TOPIC, QUERIES_TOPIC, CENSUS_TOPIC
+    );
+
+    // --- Kademlia configuration ---
+    let kademlia_store = MemoryStore::new(local_peer_id);
+    let kademlia_protocol = libp2p::StreamProtocol::new("/bitterbot/kad/1.0.0");
+    let mut kademlia_config = kad::Config::new(kademlia_protocol);
+    kademlia_config.set_query_timeout(Duration::from_secs(60));
+    let mut kademlia_behaviour =
+        kad::Behaviour::with_config(local_peer_id, kademlia_store, kademlia_config);
+    kademlia_behaviour.set_mode(Some(kad::Mode::Server));
+
+    // Add bootstrap peers to Kademlia
+    for peer_str in bootstrap_peers {
+        match peer_str.parse::<Multiaddr>() {
+            Ok(addr) => {
+                // Extract peer ID from the multiaddr if it contains /p2p/<peer_id>
+                if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) =
+                    addr.iter().find(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                {
+                    let addr_without_p2p: Multiaddr = addr
+                        .iter()
+                        .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                        .collect();
+                    kademlia_behaviour.add_address(&peer_id, addr_without_p2p);
+                    info!("Added bootstrap peer: {} at {}", peer_id, addr);
+                } else {
+                    warn!(
+                        "Bootstrap address {} missing /p2p/<peer_id> component, skipping",
+                        peer_str
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Invalid bootstrap address '{}': {}", peer_str, e);
+            }
+        }
+    }
+
+    // --- AutoNAT v2 client + server configuration ---
+    // Inline-constructed inside each behaviour closure below because the
+    // builder closures are FnOnce that move the value, and the match has
+    // three arms each constructing its own closure. Constructing inside
+    // sidesteps the Rust borrow rules around moving the same value into
+    // multiple closures.
+
+    // --- Identify configuration ---
+    let identify_config = identify::Config::new(
+        "/bitterbot/id/1.0.0".to_string(),
+        libp2p_keypair.public(),
+    )
+    .with_agent_version(format!("bitterbot-orchestrator/{}/{}", env!("CARGO_PKG_VERSION"), node_tier));
+
+    let identify_behaviour = identify::Behaviour::new(identify_config);
+
+    // --- Build swarm based on relay mode ---
+    let idle_timeout = if relay_mode == RelayMode::Client {
+        Duration::from_secs(120) // Longer timeout for relayed connections
+    } else {
+        Duration::from_secs(60)
+    };
+
+    let mut swarm = match relay_mode {
+        RelayMode::Client => {
+            info!("Building swarm with relay client + dcutr");
+            SwarmBuilder::with_existing_identity(libp2p_keypair)
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default().nodelay(true),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_dns()?
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(|key: &libp2p::identity::Keypair, relay_client_behaviour| {
+                    Ok(BitterbotBehaviour {
+                        gossipsub: gossipsub_behaviour,
+                        kademlia: kademlia_behaviour,
+                        autonat: autonat::v2::client::Behaviour::new(
+                            rand_core::OsRng,
+                            autonat::v2::client::Config::default(),
+                        ),
+                        autonat_server: autonat::v2::server::Behaviour::new(
+                            rand_core::OsRng,
+                        ),
+                        identify: identify_behaviour,
+                        relay_client: Toggle::from(Some(relay_client_behaviour)),
+                        relay_server: Toggle::from(None),
+                        dcutr: Toggle::from(Some(dcutr::Behaviour::new(key.public().to_peer_id()))),
+                        circle_rpc: new_circle_rpc_behaviour(),
+                    })
+                })?
+                .with_swarm_config(|cfg: libp2p::swarm::Config| {
+                    cfg.with_idle_connection_timeout(idle_timeout)
+                })
+                .build()
+        }
+        RelayMode::Server => {
+            info!("Building swarm with relay server");
+            let relay_server_config = relay::Config::default();
+            SwarmBuilder::with_existing_identity(libp2p_keypair)
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default().nodelay(true),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_dns()?
+                .with_behaviour(|_key| {
+                    Ok(BitterbotBehaviour {
+                        gossipsub: gossipsub_behaviour,
+                        kademlia: kademlia_behaviour,
+                        autonat: autonat::v2::client::Behaviour::new(
+                            rand_core::OsRng,
+                            autonat::v2::client::Config::default(),
+                        ),
+                        autonat_server: autonat::v2::server::Behaviour::new(
+                            rand_core::OsRng,
+                        ),
+                        identify: identify_behaviour,
+                        relay_client: Toggle::from(None),
+                        relay_server: Toggle::from(Some(relay::Behaviour::new(
+                            local_peer_id,
+                            relay_server_config,
+                        ))),
+                        dcutr: Toggle::from(None),
+                        circle_rpc: new_circle_rpc_behaviour(),
+                    })
+                })?
+                .with_swarm_config(|cfg: libp2p::swarm::Config| {
+                    cfg.with_idle_connection_timeout(idle_timeout)
+                })
+                .build()
+        }
+        RelayMode::Off | RelayMode::Auto => {
+            info!("Building swarm without relay");
+            SwarmBuilder::with_existing_identity(libp2p_keypair)
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default().nodelay(true),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_dns()?
+                .with_behaviour(|_key| {
+                    Ok(BitterbotBehaviour {
+                        gossipsub: gossipsub_behaviour,
+                        kademlia: kademlia_behaviour,
+                        autonat: autonat::v2::client::Behaviour::new(
+                            rand_core::OsRng,
+                            autonat::v2::client::Config::default(),
+                        ),
+                        autonat_server: autonat::v2::server::Behaviour::new(
+                            rand_core::OsRng,
+                        ),
+                        identify: identify_behaviour,
+                        relay_client: Toggle::from(None),
+                        relay_server: Toggle::from(None),
+                        dcutr: Toggle::from(None),
+                        circle_rpc: new_circle_rpc_behaviour(),
+                    })
+                })?
+                .with_swarm_config(|cfg: libp2p::swarm::Config| {
+                    cfg.with_idle_connection_timeout(idle_timeout)
+                })
+                .build()
+        }
+    };
+
+    // Listen on the specified address
+    let listen_multiaddr: Multiaddr = listen_addr.parse()?;
+    swarm.listen_on(listen_multiaddr)?;
+
+    // Trigger initial Kademlia bootstrap if we have bootstrap peers
+    if !bootstrap_peers.is_empty() {
+        if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+            warn!("Initial Kademlia bootstrap failed (no peers in routing table yet): {}", e);
+        }
+    }
+
+    let (ipc_event_tx, ipc_event_rx) = mpsc::unbounded_channel();
+
+    let stats = Arc::new(Mutex::new(SwarmStats {
+        peer_id: local_peer_id.to_string(),
+        connected_peers: 0,
+        skills_published: 0,
+        skills_received: 0,
+        skill_messages_received: 0,
+        uptime_secs: 0,
+        peer_details: HashMap::new(),
+        listen_addrs: vec![listen_addr.to_string()],
+        mesh_peers_count: 0,
+        subscribed_topics: vec![SKILLS_TOPIC.to_string(), TELEMETRY_TOPIC.to_string(), WEATHER_TOPIC.to_string(), BOUNTIES_TOPIC.to_string(), QUERIES_TOPIC.to_string()],
+        peak_concurrent_peers: 0,
+        lifetime_unique_peer_ids: 0,
+        peers_joined_total: 0,
+        peers_left_total: 0,
+        joins_per_minute: Vec::new(),
+        leaves_per_minute: Vec::new(),
+        mesh_peers_per_topic: HashMap::new(),
+        routing_table_size: 0,
+        time_to_first_peer_ms: None,
+        address_types: HashMap::new(),
+        relay_reservations_accepted: 0,
+        relay_circuits_established: 0,
+        hole_punches_succeeded: 0,
+        hole_punches_failed: 0,
+        nat_status: "unknown".to_string(),
+        bytes_received_per_topic: HashMap::new(),
+        bytes_published_per_topic: HashMap::new(),
+        skill_latency_p50_ms: None,
+        skill_latency_p95_ms: None,
+        skill_latency_samples: 0,
+    }));
+
+    let management_state = if node_tier == "management" {
+        info!("Management node: initializing aggregation state");
+        Some(Arc::new(Mutex::new(ManagementState::new())))
+    } else {
+        None
+    };
+
+    // Parse relay server addresses for client mode
+    let relay_server_addrs = if relay_mode == RelayMode::Client {
+        let mut addrs = parse_relay_servers(relay_servers);
+        // Also use bootstrap peers as relay servers if no explicit relay servers
+        if addrs.is_empty() {
+            info!("No explicit relay servers; using bootstrap peers as relay candidates");
+            addrs = parse_relay_servers(bootstrap_peers);
+        }
+        if !addrs.is_empty() {
+            info!("Relay servers configured: {} candidates", addrs.len());
+        }
+        addrs
+    } else {
+        vec![]
+    };
+
+    let bootnode_registry = match bootnode_state_path {
+        Some(path) => Arc::new(Mutex::new(BootnodeRegistry::load(path))),
+        None => Arc::new(Mutex::new(BootnodeRegistry::disabled())),
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let handle = SwarmHandle {
+        own_author_pubkey: crate::crypto::author_pubkey_b64(&keypair),
+        signing_key: keypair.clone(),
+        local_peer_id,
+        stats,
+        security: SecurityValidator::new(genesis_trust_list.clone()),
+        swarm,
+        skills_topic,
+        telemetry_topic,
+        weather_topic,
+        bounties_topic,
+        queries_topic,
+        census_topic,
+        ipc_event_tx,
+        genesis_trust_list,
+        node_tier: node_tier.to_string(),
+        management_state,
+        nat_status: NatStatus::Unknown,
+        relay_server_addrs,
+        has_relay_reservation: false,
+        relay_mode,
+        lifetime_peer_ids: HashSet::new(),
+        started_at: std::time::Instant::now(),
+        current_minute_start: now_secs - (now_secs % 60),
+        current_minute_joins: 0,
+        current_minute_leaves: 0,
+        latency_window_ms: std::collections::VecDeque::with_capacity(LATENCY_WINDOW),
+        skill_receipts: crate::skill_receipts::SkillReceiptTracker::default(),
+        bootnode_registry,
+        carried_circle_topics: std::collections::HashMap::new(),
+        inbound_circle_rpc: std::collections::HashMap::new(),
+        next_inbound_circle_rpc_id: 0,
+    };
+
+    info!(
+        "Swarm initialized for peer {} on {}",
+        local_peer_id, listen_addr
+    );
+
+    Ok((handle, ipc_event_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn compute_topic_allowlist_is_exact() {
+        assert!(is_gateway_topic(COMPUTE_TOPIC));
+        assert!(!is_gateway_topic("bitterbot/compute/v2"));
+        assert!(!is_gateway_topic("bitterbot/compute/v1/secret"));
+        assert!(!is_gateway_topic("bitterbot/skills/v1"));
+    }
+
+    #[test]
+    fn is_circle_topic_requires_exact_shape() {
+        let hex = "a".repeat(64);
+        assert!(is_circle_topic(&format!("bitterbot/circle/{hex}/v1")));
+        // Wrong length / charset / degenerate forms are all refused now (C4/C5).
+        assert!(!is_circle_topic("bitterbot/circle/v1"));
+        assert!(!is_circle_topic("bitterbot/circle//v1"));
+        assert!(!is_circle_topic(&format!("bitterbot/circle/{}/v1", "a".repeat(63))));
+        assert!(!is_circle_topic(&format!("bitterbot/circle/{}/v1", "a".repeat(65))));
+        assert!(!is_circle_topic(&format!("bitterbot/circle/{}/v1", "g".repeat(64)))); // non-hex
+        assert!(!is_circle_topic(&format!("bitterbot/circle/{}/v1", "A".repeat(64)))); // uppercase
+        assert!(!is_circle_topic(&format!("bitterbot/circle/{}/v2", hex)));
+        // A ~250KB monster (the old OOM vector) is rejected by the length gate.
+        assert!(!is_circle_topic(&format!("bitterbot/circle/{}/v1", "a".repeat(250_000))));
+    }
+
+    #[test]
+    fn classify_address_categorizes_common_multiaddrs() {
+        let public: Multiaddr = "/ip4/8.8.8.8/tcp/9100".parse().unwrap();
+        assert_eq!(classify_address(&public), "ipv4_public");
+
+        let private: Multiaddr = "/ip4/192.168.1.10/tcp/9100".parse().unwrap();
+        assert_eq!(classify_address(&private), "ipv4_private");
+
+        let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/9100".parse().unwrap();
+        assert_eq!(classify_address(&loopback), "ipv4_private");
+
+        let v6: Multiaddr = "/ip6/2001:db8::1/tcp/9100".parse().unwrap();
+        assert_eq!(classify_address(&v6), "ipv6");
+
+        let dns: Multiaddr = "/dns4/example.com/tcp/9100".parse().unwrap();
+        assert_eq!(classify_address(&dns), "dns");
+
+        let relay: Multiaddr =
+            "/ip4/8.8.8.8/tcp/9100/p2p/12D3KooWCwCCFMHCVv8eXZnAGMTUjTDPPePfYRTJ1fZvRpqcQXKt/p2p-circuit"
+                .parse()
+                .unwrap();
+        assert_eq!(classify_address(&relay), "relay");
+    }
+
+    #[test]
+    fn bootnode_registry_persists_and_aggregates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootnode-peers.json");
+
+        let mut reg = BootnodeRegistry::load(path.clone());
+        let now = 1_700_000_000u64;
+        reg.record_seen("pubkey-A", "peer-1", "edge", "ipv4_public", now);
+        reg.record_seen("pubkey-B", "peer-2", "management", "ipv4_public", now);
+        reg.record_seen("pubkey-A", "peer-1", "edge", "ipv4_public", now + 60);
+        reg.flush_if_dirty();
+
+        // Reload from disk and assert the registry survives a process restart.
+        let reloaded = BootnodeRegistry::load(path);
+        assert_eq!(reloaded.lifetime_unique(), 2);
+        let census = reloaded.census(now + 120);
+        assert_eq!(census["lifetime_unique_peers"], 2);
+        assert_eq!(census["active_last_24h"], 2);
+        assert_eq!(census["by_tier"]["edge"], 1);
+        assert_eq!(census["by_tier"]["management"], 1);
+        assert_eq!(census["by_address_type"]["ipv4_public"], 2);
+    }
+
+    #[test]
+    fn bootnode_registry_disabled_no_op() {
+        let mut reg = BootnodeRegistry::disabled();
+        reg.record_seen("pubkey", "peer", "edge", "ipv4_public", 1_700_000_000);
+        reg.flush_if_dirty();
+        assert!(!reg.enabled());
+        assert_eq!(reg.lifetime_unique(), 0);
+    }
+
+    /// Demonstrates the starvation bug the event loop shipped with, so the
+    /// reasoning behind the `stats_interval` comment is executable rather than
+    /// folklore.
+    ///
+    /// A `sleep` future constructed *inside* `select!` is rebuilt on every loop
+    /// iteration, restarting its timer whenever another branch completes first.
+    /// Against a faster sibling timer it therefore never elapses. In the
+    /// orchestrator the 5-second circle-RPC sweep starved a 10-second stats
+    /// refresh, leaving every derived stat frozen at its construction default
+    /// and the bootnode registry never flushed to disk.
+    #[tokio::test(start_paused = true)]
+    async fn inline_select_sleep_is_starved_by_a_faster_interval() {
+        // The broken shape: 10s sleep rebuilt each iteration vs a 5s interval.
+        let mut fast = tokio::time::interval(Duration::from_secs(5));
+        fast.tick().await; // skip immediate first tick
+        let mut slow_fired = 0u32;
+        for _ in 0..24 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(10)) => { slow_fired += 1; }
+                _ = fast.tick() => {}
+            }
+        }
+        assert_eq!(
+            slow_fired, 0,
+            "an inline select! sleep must never elapse against a faster interval"
+        );
+
+        // The fix: hoist the timer so it keeps its deadline across iterations.
+        let mut fast = tokio::time::interval(Duration::from_secs(5));
+        fast.tick().await;
+        let mut slow = tokio::time::interval(Duration::from_secs(10));
+        slow.tick().await;
+        let mut slow_fired = 0u32;
+        for _ in 0..24 {
+            tokio::select! {
+                _ = slow.tick() => { slow_fired += 1; }
+                _ = fast.tick() => {}
+            }
+        }
+        assert!(
+            slow_fired >= 4,
+            "a hoisted interval must keep firing; got {slow_fired}"
+        );
+    }
+
+    /// Structural guard against reintroducing the bug above. The stats-refresh
+    /// arm is not reachable from any unit test (it needs a live swarm), so the
+    /// shape is asserted against the source instead. The needle is built at
+    /// runtime so this test's own text cannot satisfy it.
+    #[test]
+    fn stats_refresh_arm_stays_a_hoisted_interval() {
+        let src = include_str!("mod.rs");
+        let inline_sleep = format!("tokio::time::{}(Duration::from_secs(10))", "sleep");
+        let occurrences = src.matches(inline_sleep.as_str()).count();
+        assert_eq!(
+            occurrences, 1,
+            "the only 10s inline sleep may be the one in the starvation test; \
+             the event loop's stats arm must tick a hoisted interval"
+        );
+        assert!(
+            src.contains("stats_interval.tick()"),
+            "the stats-refresh arm must drive a hoisted stats_interval"
+        );
+        assert!(
+            src.contains("let mut stats_interval = tokio::time::interval("),
+            "stats_interval must be constructed outside the event loop"
+        );
+    }
+}

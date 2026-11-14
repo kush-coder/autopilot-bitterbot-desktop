@@ -1,0 +1,585 @@
+import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, it, vi } from "vitest";
+import { mandateHash } from "../payments/ap2/mandate.js";
+import { canonicalizePaymentPayload } from "./a2a-client.js";
+
+// Mock viem before importing the module under test so we don't actually hit Base.
+vi.mock("viem", async () => {
+  const actual = await vi.importActual<typeof import("viem")>("viem");
+  return {
+    ...actual,
+    createPublicClient: () => ({
+      getTransactionReceipt: async ({ hash }: { hash: string }) => mockedReceipt(hash),
+    }),
+    recoverMessageAddress: async ({
+      message,
+      signature,
+    }: {
+      message: string;
+      signature: string;
+    }) => {
+      const { createHash } = await import("node:crypto");
+      // Fixture A: "valid:<addr>" recovers to <addr> regardless of the message
+      // (message-independent; used by the v1 signature tests).
+      const m = /^valid:(0x[a-fA-F0-9]{40})$/.exec(signature);
+      if (m) return m[1];
+      // Fixture B: "bound:<addr>:<sha256(message)>" models a REAL signature that
+      // covers the exact signed bytes — it recovers to <addr> only when the
+      // message hash matches, else to a wrong address. This lets the v2 tests
+      // prove the mandate hash is bound into the signed canonical string.
+      const b = /^bound:(0x[a-fA-F0-9]{40}):([0-9a-f]{64})$/.exec(signature);
+      if (b) {
+        const h = createHash("sha256").update(message).digest("hex");
+        return b[2] === h ? b[1] : "0x" + "de".repeat(20);
+      }
+      throw new Error("invalid signature");
+    },
+  };
+});
+
+vi.mock("viem/chains", () => ({
+  base: { id: 8453 },
+  baseSepolia: { id: 84532 },
+}));
+
+let mockedReceiptStore: Record<
+  string,
+  {
+    status: "success" | "reverted";
+    to: string;
+    logs: { address?: string; topics: string[]; data: string }[];
+  }
+> = {};
+function mockedReceipt(hash: string) {
+  const r = mockedReceiptStore[hash.toLowerCase()];
+  if (!r) throw new Error(`no mock receipt for ${hash}`);
+  return r;
+}
+
+import { verifyX402Payment } from "./x402-verify.js";
+
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+function topicForAddress(addr: string): string {
+  // ERC-20 Transfer indexed addresses are 32-byte left-padded
+  return "0x" + "0".repeat(24) + addr.replace(/^0x/, "").toLowerCase();
+}
+
+function encodeToken(payload: Record<string, unknown>): string {
+  return Buffer.from(JSON.stringify(payload)).toString("base64");
+}
+
+// Encode a USDC amount (human, e.g. 0.05) as a 32-byte big-endian hex string
+// in 6-decimal base units, matching the non-indexed `value` field of an
+// ERC-20 Transfer event.
+function encodeTransferValue(humanAmount: number): string {
+  const baseUnits = BigInt(Math.round(humanAmount * 1_000_000));
+  return "0x" + baseUnits.toString(16).padStart(64, "0");
+}
+
+describe("verifyX402Payment", () => {
+  const recipient = "0x" + "11".repeat(20);
+  const sender = "0x" + "22".repeat(20);
+  const usdcContract = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+  function setReceipt(
+    hash: string,
+    opts?: {
+      status?: "success" | "reverted";
+      to?: string;
+      transferTo?: string;
+      tokenAddress?: string;
+      transferValue?: number; // human USDC amount, defaults to 1 USDC (covers all test minimums)
+    },
+  ) {
+    mockedReceiptStore[hash.toLowerCase()] = {
+      status: opts?.status ?? "success",
+      to: opts?.to ?? usdcContract,
+      logs: [
+        {
+          address: opts?.tokenAddress ?? usdcContract,
+          topics: [
+            TRANSFER_TOPIC,
+            topicForAddress(sender),
+            topicForAddress(opts?.transferTo ?? recipient),
+          ],
+          data: encodeTransferValue(opts?.transferValue ?? 1),
+        },
+      ],
+    };
+  }
+
+  it("rejects token with missing txHash", async () => {
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({ amount: 0.05 }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/Missing txHash/);
+  });
+
+  it("rejects token with amount below minimum", async () => {
+    setReceipt("0xabc1");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({ txHash: "0xabc1", amount: 0.001 }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/below minimum/);
+  });
+
+  it("rejects token with timestamp older than 5 minutes", async () => {
+    const old = Date.now() - 6 * 60 * 1000;
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({ txHash: "0xabc2", amount: 0.05, timestamp: old }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/expired/);
+  });
+
+  it("rejects on-chain mismatch where Transfer.to is a DIFFERENT address (regression for substring bug)", async () => {
+    const otherRecipient = "0x" + "33".repeat(20);
+    setReceipt("0xabc3", { transferTo: otherRecipient });
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xabc3",
+        amount: 0.05,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/No USDC Transfer log to expected recipient/);
+  });
+
+  it("rejects an unsigned token by default: anyone watching the chain could redeem it", async () => {
+    setReceipt("0xabc5");
+    const r = await verifyX402Payment({
+      paymentToken: encodeToken({ txHash: "0xabc5", amount: 0.05, sender, timestamp: Date.now() }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/not signed by the payer/);
+  });
+
+  it("accepts an unsigned legacy token when the seller allows unsigned proofs", async () => {
+    setReceipt("0xabc4");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xabc4",
+        amount: 0.05,
+        sender,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(true);
+    expect(r.signatureVerified).toBe(false);
+  });
+
+  it("verifies a signed v1 token whose signature recovers to declared sender", async () => {
+    setReceipt("0xabc5");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        version: "v1",
+        txHash: "0xabc5",
+        amount: 0.05,
+        sender,
+        recipient,
+        timestamp: Date.now(),
+        signature: `valid:${sender}`,
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(true);
+    expect(r.signatureVerified).toBe(true);
+  });
+
+  it("rejects a signed v1 token whose signature recovers to a different address", async () => {
+    setReceipt("0xabc6");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        version: "v1",
+        txHash: "0xabc6",
+        amount: 0.05,
+        sender,
+        recipient,
+        timestamp: Date.now(),
+        signature: `valid:0x${"99".repeat(20)}`,
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/signature does not match declared sender/);
+  });
+
+  it("rejects a signed v1 token whose declared recipient does not match expected", async () => {
+    const otherRecipient = "0x" + "44".repeat(20);
+    setReceipt("0xabc7");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        version: "v1",
+        txHash: "0xabc7",
+        amount: 0.05,
+        sender,
+        recipient: otherRecipient,
+        timestamp: Date.now(),
+        signature: `valid:${sender}`,
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/recipient does not match expected/);
+  });
+
+  it("rejects when on-chain Transfer value is below declared amount (#38 inflation)", async () => {
+    // Declares 1.00 USDC but the on-chain Transfer only moved 0.0001 USDC.
+    // Pre-fix this would have passed and recorded amountUsdc: 1.00 in marketplace
+    // accounting, inflating revenue shares.
+    setReceipt("0xinflate", { transferValue: 0.0001 });
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xinflate",
+        amount: 1.0,
+        sender,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/below declared amount/);
+  });
+
+  it("accepts when on-chain Transfer value equals declared amount", async () => {
+    setReceipt("0xexact", { transferValue: 0.05 });
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xexact",
+        amount: 0.05,
+        sender,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(true);
+  });
+
+  it("accepts when on-chain Transfer value exceeds declared amount (overpayment)", async () => {
+    setReceipt("0xover", { transferValue: 0.5 });
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xover",
+        amount: 0.05,
+        sender,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(true);
+  });
+
+  it("rejects Transfer log emitted by a non-USDC contract (#38 fake-token)", async () => {
+    // Real Transfer to recipient with the right value, but emitted by an
+    // attacker-deployed contract instead of USDC. Pre-fix this would have
+    // passed because only the topic+recipient were checked.
+    const fakeToken = "0x" + "ff".repeat(20);
+    setReceipt("0xfake", { tokenAddress: fakeToken, transferValue: 1.0 });
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xfake",
+        amount: 0.05,
+        sender,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/No USDC Transfer log/);
+  });
+
+  // --- v2: AP2 mandate bound into the token signature (PLAN-48 Phase 5 / finding C) ---
+
+  // A minimal signed-mandate-shaped envelope; mandateHash only needs claims+signature.
+  const mandate = (n: number) => ({
+    claims: { transaction_id: `0x${n}`, payee: { id: recipient } },
+    signature: `0xsig${n}`,
+    signer: sender,
+  });
+  // A v2 signature that genuinely covers (fields + mandateHash), via fixture B.
+  function boundSig(fields: { txHash: string; amount: number; timestamp: number }, m: object) {
+    const canonical = canonicalizePaymentPayload({
+      txHash: fields.txHash,
+      amount: fields.amount,
+      sender,
+      recipient,
+      timestamp: fields.timestamp,
+      version: "v2",
+      mandateHash: mandateHash(m as never),
+    });
+    return `bound:${sender}:${createHash("sha256").update(canonical).digest("hex")}`;
+  }
+
+  it("verifies a v2 token whose signature is bound to the attached mandate", async () => {
+    setReceipt("0xv2ok");
+    const ts = Date.now();
+    const m = mandate(1);
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        version: "v2",
+        txHash: "0xv2ok",
+        amount: 0.05,
+        sender,
+        recipient,
+        timestamp: ts,
+        signature: boundSig({ txHash: "0xv2ok", amount: 0.05, timestamp: ts }, m),
+        ap2: { payment: m },
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(true);
+    expect(r.signatureVerified).toBe(true);
+  });
+
+  it("rejects a v2 token whose mandate was swapped after signing (binding holds)", async () => {
+    setReceipt("0xv2tamper");
+    const ts = Date.now();
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        version: "v2",
+        txHash: "0xv2tamper",
+        amount: 0.05,
+        sender,
+        recipient,
+        timestamp: ts,
+        // Signature was bound to mandate #1 ...
+        signature: boundSig({ txHash: "0xv2tamper", amount: 0.05, timestamp: ts }, mandate(1)),
+        // ... but a DIFFERENT mandate is shipped, so the recomputed hash differs.
+        ap2: { payment: mandate(2) },
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/signature does not match declared sender/);
+  });
+
+  it("rejects a v2 token with the mandate stripped entirely", async () => {
+    setReceipt("0xv2strip");
+    const ts = Date.now();
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        version: "v2",
+        txHash: "0xv2strip",
+        amount: 0.05,
+        sender,
+        recipient,
+        timestamp: ts,
+        signature: boundSig({ txHash: "0xv2strip", amount: 0.05, timestamp: ts }, mandate(1)),
+        // ap2 omitted — a v2 token must carry its bound mandate.
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/missing its bound AP2 mandate/);
+  });
+
+  it("rejects a v2 token downgraded to v1 to shed the binding", async () => {
+    setReceipt("0xv2down");
+    const ts = Date.now();
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        // Downgraded to v1 (so the verifier drops mandateHash from the canonical)
+        // and the mandate stripped — but the signature was bound over the v2
+        // canonical, so v1 recovery yields the wrong signer.
+        version: "v1",
+        txHash: "0xv2down",
+        amount: 0.05,
+        sender,
+        recipient,
+        timestamp: ts,
+        signature: boundSig({ txHash: "0xv2down", amount: 0.05, timestamp: ts }, mandate(1)),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/signature does not match declared sender/);
+  });
+
+  it("rejects a token whose tx_hash has already been consumed (replay)", async () => {
+    setReceipt("0xreplay");
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE x402_consumed_tx (
+        tx_hash TEXT PRIMARY KEY,
+        consumed_at INTEGER NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO x402_consumed_tx (tx_hash, consumed_at) VALUES (?, ?)").run(
+      "0xreplay",
+      Date.now(),
+    );
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xreplay",
+        amount: 0.05,
+        sender,
+        timestamp: Date.now(),
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+      db,
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/already consumed/);
+  });
+
+  it("requires a timestamp — token omitting it is rejected (F1: expiry bypass)", async () => {
+    setReceipt("0xnots");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      // No `timestamp` field at all. Pre-fix this skipped the expiry check and
+      // an unsigned token was accepted, allowing replay of an old transfer.
+      paymentToken: encodeToken({ txHash: "0xnots", amount: 0.05, sender }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/missing required timestamp/i);
+  });
+
+  it("rejects a token timestamped in the future (F1: pre-dating)", async () => {
+    setReceipt("0xfuture");
+    const r = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: encodeToken({
+        txHash: "0xfuture",
+        amount: 0.05,
+        sender,
+        timestamp: Date.now() + 10 * 60 * 1000,
+      }),
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+    });
+    expect(r.valid).toBe(false);
+    expect(r.error).toMatch(/future/i);
+  });
+
+  it("atomically consumes tx_hash on success — second verify is rejected (F2: TOCTOU)", async () => {
+    setReceipt("0xonce");
+    const db = new DatabaseSync(":memory:");
+    // The ledger table is provisioned by MarketplaceEconomics.ensureSchema() in
+    // production; create it here to mirror that schema for the test.
+    db.exec(
+      `CREATE TABLE x402_consumed_tx (tx_hash TEXT PRIMARY KEY, consumed_at INTEGER NOT NULL)`,
+    );
+    const token = encodeToken({
+      txHash: "0xonce",
+      amount: 0.05,
+      sender,
+      timestamp: Date.now(),
+    });
+    const first = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: token,
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+      db,
+    });
+    const second = await verifyX402Payment({
+      allowUnsigned: true,
+      paymentToken: token,
+      expectedRecipient: recipient,
+      minimumAmount: 0.01,
+      network: "base",
+      db,
+    });
+    expect(first.valid).toBe(true);
+    expect(second.valid).toBe(false);
+    expect(second.error).toMatch(/already consumed/);
+    const rows = db.prepare("SELECT COUNT(*) c FROM x402_consumed_tx").get() as { c: number };
+    expect(rows.c).toBe(1);
+  });
+
+  it("only one of N concurrent verifies of the same token wins (F2: atomic claim)", async () => {
+    setReceipt("0xrace");
+    const db = new DatabaseSync(":memory:");
+    db.exec(
+      `CREATE TABLE x402_consumed_tx (tx_hash TEXT PRIMARY KEY, consumed_at INTEGER NOT NULL)`,
+    );
+    const token = encodeToken({
+      txHash: "0xrace",
+      amount: 0.05,
+      sender,
+      timestamp: Date.now(),
+    });
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        verifyX402Payment({
+          allowUnsigned: true,
+          paymentToken: token,
+          expectedRecipient: recipient,
+          minimumAmount: 0.01,
+          network: "base",
+          db,
+        }),
+      ),
+    );
+    expect(results.filter((r) => r.valid).length).toBe(1);
+  });
+});

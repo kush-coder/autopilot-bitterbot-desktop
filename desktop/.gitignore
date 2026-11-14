@@ -1,0 +1,5 @@
+node_modules/
+dist-renderer/
+
+# Per-installation P2P node identity keypair
+keys/

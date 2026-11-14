@@ -1,0 +1,122 @@
+import { formatCliCommand } from "../cli/command-format.js";
+import { isTruthyEnvValue } from "../infra/env.js";
+import {
+  externalUpdateCommand,
+  resolveInstallKind,
+  TARBALL_UPDATE_COMMAND,
+} from "../infra/install-kind.js";
+import { runGatewayUpdate } from "../infra/update-runner.js";
+import { runCommandWithTimeout } from "../process/exec.js";
+import type { RuntimeEnv } from "../runtime.js";
+import { note } from "../terminal/note.js";
+import type { DoctorOptions } from "./doctor-prompter.js";
+
+async function detectBitterbotGitCheckout(root: string): Promise<"git" | "not-git" | "unknown"> {
+  const res = await runCommandWithTimeout(["git", "-C", root, "rev-parse", "--show-toplevel"], {
+    timeoutMs: 5000,
+  }).catch(() => null);
+  if (!res) {
+    return "unknown";
+  }
+  if (res.code !== 0) {
+    // Avoid noisy "Update via package manager" notes when git is missing/broken,
+    // but do show it when this is clearly not a git checkout.
+    if (res.stderr.toLowerCase().includes("not a git repository")) {
+      return "not-git";
+    }
+    return "unknown";
+  }
+  return res.stdout.trim() === root ? "git" : "not-git";
+}
+
+export async function maybeOfferUpdateBeforeDoctor(params: {
+  runtime: RuntimeEnv;
+  options: DoctorOptions;
+  root: string | null;
+  confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
+  outro: (message: string) => void;
+}) {
+  const updateInProgress = isTruthyEnvValue(process.env.BITTERBOT_UPDATE_IN_PROGRESS);
+  const canOfferUpdate =
+    !updateInProgress &&
+    params.options.nonInteractive !== true &&
+    params.options.yes !== true &&
+    params.options.repair !== true &&
+    Boolean(process.stdin.isTTY);
+  if (!canOfferUpdate || !params.root) {
+    return { updated: false };
+  }
+
+  const git = await detectBitterbotGitCheckout(params.root);
+  if (git === "git") {
+    const shouldUpdate = await params.confirm({
+      message: "Update Bitterbot from git before running doctor?",
+      initialValue: true,
+    });
+    if (!shouldUpdate) {
+      return { updated: false };
+    }
+    note("Running update (fetch/rebase/build/doctor)…", "Update");
+    const result = await runGatewayUpdate({
+      cwd: params.root,
+      argv1: process.argv[1],
+    });
+    note(
+      [
+        `Status: ${result.status}`,
+        `Mode: ${result.mode}`,
+        result.root ? `Root: ${result.root}` : null,
+        result.reason ? `Reason: ${result.reason}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "Update result",
+    );
+    if (result.status === "ok") {
+      params.outro("Update completed (doctor already ran as part of the update).");
+      return { updated: true, handled: true };
+    }
+    return { updated: true, handled: false };
+  }
+
+  if (git === "not-git") {
+    // Containers and release-tarball installs cannot update through a package
+    // manager: name the command that actually updates them (PLAN-56).
+    const kind = resolveInstallKind({ isGit: false, hasRoot: true, root: params.root });
+    const external = externalUpdateCommand(kind);
+    if (external) {
+      note(
+        [
+          "This Bitterbot runs in a container image. On the Docker host, update with:",
+          `  ${external}`,
+          "Then rerun doctor.",
+        ].join("\n"),
+        "Update",
+      );
+      return { updated: false };
+    }
+    if (kind === "tarball") {
+      // PLAN-56 Phase 3b: in place, verified, snapshotted, auto-rollback.
+      note(
+        [
+          "This Bitterbot was installed from a release tarball. Update it in place with:",
+          `  ${formatCliCommand(TARBALL_UPDATE_COMMAND)}`,
+          "It verifies the signed release, snapshots ~/.bitterbot data, keeps the current version",
+          `for rollback (${formatCliCommand("bitterbot update --rollback")}) and switches back automatically`,
+          "if the new version does not boot.",
+        ].join("\n"),
+        "Update",
+      );
+      return { updated: false };
+    }
+    note(
+      [
+        "This install is not a git checkout.",
+        `Run \`${formatCliCommand("bitterbot update")}\` to update via your package manager (npm/pnpm), then rerun doctor.`,
+      ].join("\n"),
+      "Update",
+    );
+  }
+
+  return { updated: false };
+}

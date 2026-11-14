@@ -1,0 +1,526 @@
+---
+summary: "Skills: managed vs workspace, gating rules, and config/env wiring"
+read_when:
+  - Adding or modifying skills
+  - Changing skill gating or load rules
+title: "Skills"
+---
+
+# Skills (Bitterbot)
+
+Bitterbot uses **[AgentSkills](https://agentskills.io)-compatible** skill folders to teach the agent how to use tools. Each skill is a directory containing a `SKILL.md` with YAML frontmatter and instructions. Bitterbot loads **bundled skills** plus optional local overrides, and filters them at load time based on environment, config, and binary presence.
+
+## Skill tiers (PLAN-20)
+
+Skills declare a `tier:` in their SKILL.md frontmatter:
+
+- **`executable`** — ships with one or more pre-action interceptors that deterministically modify, inject context, require prerequisites, or block tool calls. The behaviour is enforceable. See [Pre-Action Interceptors](../agents/interceptors.md).
+- **`advisory`** — markdown-only; the LLM may or may not follow the guidance. The legacy default.
+- **`data`** — assets, references, templates; no behavioral lift.
+
+In the marketplace, executable-tier listings carry the seller's execution statistics and validation verdict. Today those statistics are tool-level (a tool call that did not report an error), so treat them as a claim to re-measure locally, not proof. Advisory and data skills are still useful but priced like prose.
+
+## Locations and precedence
+
+Skills are loaded from **three** places:
+
+1. **Bundled skills**: shipped with the install (npm package)
+2. **Managed/local skills**: `~/.bitterbot/skills`
+3. **Workspace skills**: `<workspace>/skills`
+
+If a skill name conflicts, precedence is:
+
+`<workspace>/skills` (highest) → `~/.bitterbot/skills` → bundled skills (lowest)
+
+Additionally, you can configure extra skill folders (lowest precedence) via
+`skills.load.extraDirs` in `~/.bitterbot/bitterbot.json`.
+
+### Bundled guidance skills (progressive disclosure)
+
+Some bundled skills exist so the system prompt can stay short: the prompt keeps a one-line index entry and the agent reads the SKILL.md only when the situation applies. They are plain advisory skills (name + description frontmatter, no binaries) and can be overridden like any other bundled skill:
+
+| Skill                     | Holds                                                                                      |
+| ------------------------- | ------------------------------------------------------------------------------------------ |
+| `memory-architecture`     | Crystal lifecycle, ingestion, background pipeline, hormonal modulation, memory tools       |
+| `working-memory-protocol` | MEMORY.md sections, when to call `working_memory_note`, epistemic `type`, Crystal Pointers |
+| `curiosity-loop`          | Curiosity engine, `curiosity_state` / `curiosity_resolve`, `dream_search` / `dream_status` |
+| `pre-action-interceptors` | `INTERCEPTOR:` directives, the built-in interceptors, the Active Guards panel              |
+| `forage-economy`          | Economic identity, marketplace crystallization, the `forage` tool and its actions          |
+| `circles-protocol`        | `circles` reads, queue-only writes, untrusted-content and no-money invariants              |
+| `wallet-payments`         | HTTP 402 / x402 workflow, paid API tiers, micro-tolls, delegated purchases, spending rules |
+
+## Per-agent vs shared skills
+
+In **multi-agent** setups, each agent has its own workspace. That means:
+
+- **Per-agent skills** live in `<workspace>/skills` for that agent only.
+- **Shared skills** live in `~/.bitterbot/skills` (managed/local) and are visible
+  to **all agents** on the same machine.
+- **Shared folders** can also be added via `skills.load.extraDirs` (lowest
+  precedence) if you want a common skills pack used by multiple agents.
+
+If the same skill name exists in more than one place, the usual precedence
+applies: workspace wins, then managed/local, then bundled.
+
+## Plugins + skills
+
+Plugins can ship their own skills by listing `skills` directories in
+`bitterbot.plugin.json` (paths relative to the plugin root). Plugin skills load
+when the plugin is enabled and participate in the normal skill precedence rules.
+You can gate them via `metadata.bitterbot.requires.config` on the plugin’s config
+entry. See [Plugins](/tools/plugin) for discovery/config and [Tools](/tools) for the
+tool surface those skills teach.
+
+## Finding skills
+
+Browse community skills on [GitHub](https://github.com/Bitterbot-AI/bitterbot-desktop). Over the P2P network, only skills promoted by the evolution pass (held-out task validation) publish, after a maturity window and with a signed provenance trailer; receiving nodes quarantine them for review. As of 2026-09-05 no node has published one yet.
+
+Install a skill into your workspace:
+
+- `bitterbot skills install <skill-name>`
+
+Bitterbot picks up workspace skills from `<workspace>/skills` on the next session.
+
+## Importing from agentskills.io
+
+Bitterbot can pull skills from [agentskills.io](https://agentskills.io) — the community registry for AgentSkills-compatible skills. Imports arrive as signed quarantined skills by default, so the existing P2P review flow applies.
+
+```bash
+# Import by slug (resolved against skills.agentskills.registryBaseUrl)
+bitterbot skills import agentskills github-release
+
+# Import directly from a URL
+bitterbot skills import agentskills https://example.com/path/SKILL.md
+
+# Skip quarantine for trusted imports
+bitterbot skills import agentskills github-release --accept
+
+# Review the quarantine
+bitterbot skills incoming list
+bitterbot skills incoming accept <name>
+bitterbot skills incoming reject <name>
+bitterbot skills incoming reject-peer <peerId>   # everything held from one peer
+```
+
+Gating:
+
+- Must opt in via `skills.agentskills.enabled = true`.
+- Default trust level is `review` (quarantine); set `skills.agentskills.defaultTrust = "auto"` to skip.
+- Every imported skill is sha256-deduped against existing installs.
+- Origin metadata is written to `<skill>/.provenance.json` and the SKILL.md frontmatter.
+- Every incoming skill is assessed for **routing** (PLAN-44): the agent finds a skill only
+  through its `description` in the prompt index, so a description with no "when" clause and
+  no scope-out, or one that overlaps a local skill's, is held for review with the reason
+  shown by `skills incoming list` (`held for review: description contract: …`). Accepting it anyway is your call; the routing-repair pass (`bitterbot skills routing repair`, also run automatically in housekeeping) rewrites such descriptions into routable form through the staging gate, archiving the previous version.
+
+### Origin provenance (`bitterbot.origin`)
+
+Imported skills carry an `origin` block that downstream machinery uses to decide marketplace promotion:
+
+```markdown
+---
+name: github-release
+description: ...
+metadata:
+  {
+    "bitterbot":
+      {
+        "origin":
+          {
+            "registry": "agentskills.io",
+            "slug": "github-release",
+            "version": "1.2.0",
+            "license": "MIT",
+            "upstreamUrl": "https://agentskills.io/skills/github-release/SKILL.md",
+          },
+      },
+  }
+---
+```
+
+When the crystallizer later produces a derivative of an origin-bearing skill, it checks `skills.agentskills.transformThreshold` (default `0.5`): derivatives below the threshold stay local and free; derivatives above it can be published to the paid marketplace with upstream attribution intact.
+
+See [Skills config](/tools/skills-config) for the full `skills.agentskills.*` surface.
+
+## Security notes
+
+- Treat third-party skills as **untrusted code**. Read them before enabling.
+- Prefer sandboxed runs for untrusted inputs and risky tools. See [Sandboxing](/gateway/sandboxing).
+- `skills.entries.*.env` and `skills.entries.*.apiKey` inject secrets into the **host** process
+  for that agent turn (not the sandbox). Keep secrets out of prompts and logs.
+- For a broader threat model and checklists, see [Security](/gateway/security).
+
+## Format (AgentSkills + Pi-compatible)
+
+`SKILL.md` must include at least:
+
+```markdown
+---
+name: nano-banana-pro
+description: Generate or edit images via Gemini 3 Pro Image
+---
+```
+
+Notes:
+
+- We follow the AgentSkills spec for layout/intent.
+- The parser used by the embedded agent supports **single-line** frontmatter keys only.
+- `metadata` should be a **single-line JSON object**.
+- Use `{baseDir}` in instructions to reference the skill folder path.
+- Optional frontmatter keys:
+  - `homepage` — URL surfaced as “Website” in the Skills UI (also supported via `metadata.bitterbot.homepage`).
+  - `user-invocable` — `true|false` (default: `true`). When `true`, the skill is exposed as a user slash command.
+  - `disable-model-invocation` — `true|false` (default: `false`). When `true`, the skill is excluded from the model prompt (still available via user invocation).
+  - `command-dispatch` — `tool` (optional). When set to `tool`, the slash command bypasses the model and dispatches directly to a tool.
+  - `command-tool` — tool name to invoke when `command-dispatch: tool` is set.
+  - `command-arg-mode` — `raw` (default). For tool dispatch, forwards the raw args string to the tool (no core parsing).
+
+    The tool is invoked with params:
+    `{ command: "<raw args>", commandName: "<slash command>", skillName: "<skill name>" }`.
+
+## Gating (load-time filters)
+
+Bitterbot **filters skills at load time** using `metadata` (single-line JSON):
+
+```markdown
+---
+name: nano-banana-pro
+description: Generate or edit images via Gemini 3 Pro Image
+metadata:
+  {
+    "bitterbot":
+      {
+        "requires": { "bins": ["uv"], "env": ["GEMINI_API_KEY"], "config": ["browser.enabled"] },
+        "primaryEnv": "GEMINI_API_KEY",
+      },
+  }
+---
+```
+
+Fields under `metadata.bitterbot`:
+
+- `always: true` — always include the skill (skip other gates).
+- `emoji` — optional emoji used by the Skills UI.
+- `homepage` — optional URL shown as “Website” in the Skills UI.
+- `os` — optional list of platforms (`darwin`, `linux`, `win32`). If set, the skill is only eligible on those OSes.
+- `requires.bins` — list; each must exist on `PATH`.
+- `requires.anyBins` — list; at least one must exist on `PATH`.
+- `requires.env` — list; env var must exist **or** be provided in config.
+- `requires.config` — list of `bitterbot.json` paths that must be truthy.
+- `primaryEnv` — env var name associated with `skills.entries.<name>.apiKey`.
+- `install` — optional array of installer specs used by the Skills UI (brew/node/go/uv/download).
+- `origin` — provenance for imported/derived skills (see [Importing from agentskills.io](#importing-from-agentskills-io)).
+
+Note on sandboxing:
+
+- `requires.bins` is checked on the **host** at skill load time.
+- If an agent is sandboxed, the binary must also exist **inside the container**.
+  Install it via `agents.defaults.sandbox.docker.setupCommand` (or a custom image).
+  `setupCommand` runs once after the container is created.
+  Package installs also require network egress, a writable root FS, and a root user in the sandbox.
+  Example: the `summarize` skill (`skills/summarize/SKILL.md`) needs the `summarize` CLI
+  in the sandbox container to run there.
+
+Installer example:
+
+```markdown
+---
+name: gemini
+description: Use Gemini CLI for coding assistance and Google search lookups.
+metadata:
+  {
+    "bitterbot":
+      {
+        "emoji": "♊️",
+        "requires": { "bins": ["gemini"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "gemini-cli",
+              "bins": ["gemini"],
+              "label": "Install Gemini CLI (brew)",
+            },
+          ],
+      },
+  }
+---
+```
+
+Notes:
+
+- If multiple installers are listed, the gateway picks a **single** preferred option (brew when available, otherwise node).
+- If all installers are `download`, Bitterbot lists each entry so you can see the available artifacts.
+- Installer specs can include `os: ["darwin"|"linux"|"win32"]` to filter options by platform.
+- Node installs honor `skills.install.nodeManager` in `bitterbot.json` (default: npm; options: npm/pnpm/yarn/bun).
+  This only affects **skill installs**; the Gateway runtime should still be Node
+  (Bun is not recommended for WhatsApp/Telegram).
+- Go installs: if `go` is missing and `brew` is available, the gateway installs Go via Homebrew first and sets `GOBIN` to Homebrew’s `bin` when possible.
+- Download installs: `url` (required), `archive` (`tar.gz` | `tar.bz2` | `zip`), `extract` (default: auto when archive detected), `stripComponents`, `targetDir` (default: `~/.bitterbot/tools/<skillKey>`).
+
+If no `metadata.bitterbot` is present, the skill is always eligible (unless
+disabled in config or blocked by `skills.allowBundled` for bundled skills).
+
+## Config overrides (`~/.bitterbot/bitterbot.json`)
+
+Bundled/managed skills can be toggled and supplied with env values:
+
+```json5
+{
+  skills: {
+    entries: {
+      "nano-banana-pro": {
+        enabled: true,
+        apiKey: "GEMINI_KEY_HERE",
+        env: {
+          GEMINI_API_KEY: "GEMINI_KEY_HERE",
+        },
+        config: {
+          endpoint: "https://example.invalid",
+          model: "nano-pro",
+        },
+      },
+
+      sag: { enabled: false },
+    },
+  },
+}
+```
+
+Note: if the skill name contains hyphens, quote the key (JSON5 allows quoted keys).
+
+Config keys match the **skill name** by default. If a skill defines
+`metadata.bitterbot.skillKey`, use that key under `skills.entries`.
+
+Rules:
+
+- `enabled: false` disables the skill even if it’s bundled/installed.
+- `env`: injected **only if** the variable isn’t already set in the process.
+- `apiKey`: convenience for skills that declare `metadata.bitterbot.primaryEnv`.
+- `config`: optional bag for custom per-skill fields; custom keys must live here.
+- `allowBundled`: optional allowlist for **bundled** skills only. If set, only
+  bundled skills in the list are eligible (managed/workspace skills unaffected).
+
+## Environment injection (per agent run)
+
+When an agent run starts, Bitterbot:
+
+1. Reads skill metadata.
+2. Applies any `skills.entries.<key>.env` or `skills.entries.<key>.apiKey` to
+   `process.env`.
+3. Builds the system prompt with **eligible** skills.
+4. Restores the original environment after the run ends.
+
+This is **scoped to the agent run**, not a global shell environment.
+
+## Session snapshot + hot reload
+
+Bitterbot snapshots eligible skills **when a session starts** and caches them for subsequent turns. The snapshot carries a `version` field that is bumped whenever the skill graph changes:
+
+- a user toggles a skill (`skills.update`)
+- a marketplace skill is accepted or rejected (`skills.incoming.accept` / `.reject`)
+- a P2P or `agentskills.io` import lands
+- a new skill is created via `skills.create` (or saved through the in-app editor)
+- the file watcher detects a `SKILL.md` add/change/unlink
+
+When the global version exceeds the cached version, the **next agent turn rebuilds the snapshot** automatically. The agent also receives a one-line diff like `[Skills change since last turn] Now available: foo. No longer available: bar.` so it can react in conversation. No session restart is needed.
+
+Cron jobs and other background runs go through the same path, so they always pick up the **fire-time** skill state, not whatever was current when the schedule was created.
+
+### `skills.changed` gateway event
+
+The gateway broadcasts `skills.changed` events to every connected client whenever the version bumps. The event payload is `{ reason, workspaceDir?, changedPath?, version }`. UI surfaces (the Skills view, Incoming queue, and any custom subscriber) refresh on this event without polling.
+
+## Two-tier prompt (agent self-awareness)
+
+The system prompt now includes two tiers of skill information:
+
+- **Tier A — eligible + enabled**: full skill metadata (name, description, location), exactly as before. The agent can invoke these directly.
+- **Tier B — soft-disabled but otherwise eligible**: skills the user has toggled off but that are installed and compatible with the current OS. The agent sees only `name: description` plus a strict policy:
+  - it MAY suggest enabling one only when it directly addresses the user's current task
+  - at most one suggestion per turn
+  - it must wait for explicit user approval before assuming the skill is available
+  - it must NOT enable skills on its own
+
+OS-incompatible skills, missing-requirement skills, and allowlist-blocked skills stay invisible to the agent (hard-disabled). This keeps the model from proposing things the user physically cannot run.
+
+The `description` is the whole routing key: the agent opens a SKILL.md only when exactly one description clearly applies to the task. Skills the node synthesizes itself (evolution proposals, crystallized sequences) are therefore held to a description contract (a "when" clause naming the triggering situation, a "not for / never for / unless / except when / only when" clause, 40–240 characters, no URLs or emoji) and refused when their description overlaps another live skill's. Whether a skill is actually opened is measured from the run journal and reported per skill in `skills.evolution.status` (`skillReads`, 14-day window).
+
+## Remote nodes (cross-platform skills)
+
+If the Gateway is running on one platform but a **remote node** on a different platform is connected **with `system.run` allowed** (Exec approvals security not set to `deny`), Bitterbot can treat platform-specific skills as eligible when the required binaries are present on that node. The agent should execute those skills via the `nodes` tool (typically `nodes.run`).
+
+This relies on the node reporting its command support and on a bin probe via `system.run`. If the remote node goes offline later, the skills remain visible; invocations may fail until the node reconnects.
+
+## Skills UI (desktop app)
+
+The desktop app's **Skills** view is the primary surface for managing skills:
+
+- **Installed tab**: every skill the agent can see, grouped by source. Each card shows a typed `state` badge (Ready / Disabled / Incompatible OS / Needs install / Needs API key / Needs config / Allowlisted off) plus reasons on hover. Filter tabs across the top scope to All / Ready / Disabled / Needs setup / Incompatible (Incompatible defaults to hidden inside the All tab).
+- **Incoming tab**: skills queued for review (P2P and agentskills.io imports). Shows author peer, signature status, injection-scan severity, content hash, and provenance. Accept moves the skill to `~/.bitterbot/skills` (still disabled until you toggle it on); Reject removes it from quarantine; Reject-all-from-peer bulk-cleans a compromised peer.
+- **Import from agentskills.io**: an inline form at the top of the Incoming tab takes a slug or full https URL and routes through the configured trust policy.
+- **Agent selector**: when more than one agent is configured, a dropdown scopes the view (and the underlying `skills.status` lookup) to that agent's workspace.
+- **+ New skill**: opens an in-app editor with three starter templates (basic / API-backed / shell-tool). Frontmatter is validated client-side. New skills land in `~/.bitterbot/skills` (or the active agent's workspace) and are immediately visible to the agent on its next turn.
+
+All UI surfaces subscribe to `skills.changed` and refresh automatically — no manual refresh required after a CLI command, P2P delivery, or another client's edit.
+
+## Skills watcher (auto-refresh)
+
+By default, Bitterbot watches skill folders and bumps the skills snapshot when `SKILL.md` files change. Configure this under `skills.load`:
+
+```json5
+{
+  skills: {
+    load: {
+      watch: true,
+      watchDebounceMs: 250,
+    },
+  },
+}
+```
+
+## Token impact (skills list)
+
+When skills are eligible, Bitterbot injects a compact XML list of available skills into the system prompt (via `formatSkillsForPrompt` in `src/agents/skills/skill-loader.ts`). The cost is deterministic:
+
+- **Base overhead (only when ≥1 skill):** 195 characters.
+- **Per skill:** 97 characters + the length of the XML-escaped `<name>`, `<description>`, and `<location>` values.
+
+Formula (characters):
+
+```
+total = 195 + Σ (97 + len(name_escaped) + len(description_escaped) + len(location_escaped))
+```
+
+Notes:
+
+- XML escaping expands `& < > " '` into entities (`&amp;`, `&lt;`, etc.), increasing length.
+- Token counts vary by model tokenizer. A rough OpenAI-style estimate is ~4 chars/token, so **97 chars ≈ 24 tokens** per skill plus your actual field lengths.
+
+That is the raw list. Before it reaches the system prompt, `src/agents/system-prompt-skills.ts` compacts it (the `<skill><name>...</name></skill>` shape is preserved for the canary registry and the evolution validators):
+
+- Every description becomes its first sentence, stepping down 160 -> 80 -> 40 chars, then names only, until the whole index fits `SKILLS_PROMPT_BUDGET_CHARS` (4,000 chars, ~1k tokens). Skills are never dropped.
+- Skills located at `<root>/<name>/SKILL.md` under the dominant root share one `Default location: <root>/<name>/SKILL.md` line instead of a per-skill `<location>`; any other location stays inline.
+- The P2P `## Skill content trust notice` (present when an active skill carries `.provenance.json`) is compacted to its operative rule (~110 tokens), and the two preamble sentences the `## Skills (mandatory)` rules already state are dropped.
+
+## Managed skills lifecycle
+
+Bitterbot ships a baseline set of skills as **bundled skills** as part of the
+install (npm package). `~/.bitterbot/skills` exists for local
+overrides (for example, pinning/patching a skill without changing the bundled
+copy). Workspace skills are user-owned and override both on name conflicts.
+
+## Staging-gate pipeline (PLAN-15)
+
+Every mutation to a managed SKILL.md routes through a SICA-style staging gate
+before reaching the live directory the agent loads from. This applies to
+mutations driven by the desktop UI, the gateway RPC, and the agent's own
+`skill_manage` tool.
+
+### On-disk layout
+
+```
+~/.bitterbot/
+├── skills/<name>/SKILL.md                  # live, agent-visible
+├── skills-staging/<name>/SKILL.md          # staged edit, not yet live
+├── skills-staging/<name>/.staging-meta.json
+├── skills-archive/<name>/v<N>/SKILL.md     # historical snapshots
+├── skills-archive/<name>/v<N>/.archive-meta.json
+└── skills-archive/<name>/.next-version     # monotonic counter
+```
+
+Atomic writes (temp + rename) everywhere. The archive counter is monotonic
+across the lifetime of a skill — rolling back to an old version still creates
+a new archive entry for the prior live, so the archive grows linearly and
+never loses history.
+
+### Behavioural gate
+
+Three layers, run synchronously on every staged content payload:
+
+1. **Schema** — YAML frontmatter parses, `name` and `description` present,
+   body non-empty.
+2. **Injection scan** — re-runs the same `scanSkillForInjection` used on
+   inbound P2P skills. Severity `critical` blocks; `low` / `medium` surface
+   as a warn that does not block.
+3. **Regression risk** — if the previous live version has empirical
+   success rate ≥ 80% over ≥ 5 runs (from `skill_lifecycle`) and the staged
+   body shares < 50% of live's non-empty lines, the gate blocks. The caller
+   can override with `acceptHighRiskDiff=true` if the rewrite is
+   intentional.
+
+Implementation: `src/agents/skills/skill-gate.ts`.
+
+### Gateway methods
+
+The gateway exposes three RPCs against this pipeline. All three are schema-
+validated via TypeBox.
+
+#### `skills.manage`
+
+Stages a typed mutation. The `action` field is a discriminator:
+
+| action        | params                                          | result                                                       |
+| ------------- | ----------------------------------------------- | ------------------------------------------------------------ |
+| `create`      | `content`, optional `overwriteLive`             | Refuses to clobber live unless `overwriteLive=true`.         |
+| `edit`        | `content`, optional `acceptHighRiskDiff`        | Requires an existing live skill.                             |
+| `patch`       | `oldString`, `newString`, optional `replaceAll` | First-match wins; ambiguous matches error.                   |
+| `delete`      | optional `note`                                 | Stages a tombstone; publish removes the live copy from disk. |
+| `consolidate` | `into`                                          | Stages a manifest pointing at an existing live target.       |
+
+Every mutation lands in `skills-staging/<name>/` and runs the behavioural
+gate. The result carries `gateOutcome` (`pass` / `warn` / `fail`),
+`gateIssues`, and the baseline metrics that drove the regression check.
+
+#### `skills.promote`
+
+Moves a staged payload to live. Refuses to promote when
+`gateStatus !== "passed"` unless the caller passes `forceGate: true`.
+Three promotion paths, dispatched on the staged content's discriminator:
+
+- **Regular content** — archives the current live (if any), atomic-renames
+  staged → live.
+- **Tombstone** — archives the current live, removes it from disk,
+  flips the lifecycle state to `archived`.
+- **Consolidate manifest** — archives the source, removes it from disk,
+  calls `SkillLifecycleStore.consolidateInto(source, target)`. The target
+  is left untouched.
+
+#### `skills.rollback`
+
+Restores a specific archived version to live. The current live is
+snapshotted to a new archive entry first, so a rollback is itself
+rollback-able.
+
+### `skill_manage` agent tool
+
+The agent can drive the same pipeline through a registered tool. Single
+tool, seven actions: the five staging actions plus `promote` and `rollback`.
+Returns the gate outcome and baseline metrics so the agent can decide
+whether to follow up with a `promote` call or surface the gate failure to
+the user.
+
+The tool is registered in `src/agents/bitterbot-tools.ts` and the schema
+lives in `src/agents/tools/skill-manage-tool.ts`. The system prompt does
+not need to teach the agent about it explicitly — tools are surfaced
+through the tool list, and the tool's description explains the workflow.
+
+### Lifecycle store binding
+
+Gateway and tool entry points open a short-lived WAL-mode connection to
+the per-agent memory DB via `withSkillLifecycleStore` so the
+regression-baseline branch of the gate fires from every surface. When the
+DB is unavailable (missing, unwritable, schema mismatch), the helper
+returns `null` and the gate degrades to schema + injection checks only,
+rather than failing the request.
+
+## Config reference
+
+See [Skills config](/tools/skills-config) for the full configuration schema.
+
+## Looking for more skills?
+
+Browse skills on [GitHub](https://github.com/Bitterbot-AI/bitterbot-desktop).
+
+---

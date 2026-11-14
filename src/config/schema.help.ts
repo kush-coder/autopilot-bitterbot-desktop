@@ -1,0 +1,558 @@
+export const FIELD_HELP: Record<string, string> = {
+  "memory.proceduralLearning.mode":
+    "Default shadow: enable the per-agent evidence store, host-only strategy lab, and automatic failure-experiment coordinator. Off disables this service and its idle lane; active is for explicit host adapters. Production skill evolution remains separately controlled by skills.evolution.enabled. Research candidates are never activated by this setting.",
+  "memory.proceduralLearning.automation.enabled":
+    "Default on in shadow mode: idle dream ticks run failure-driven skill experiments on the default agent, using the existing evolution cadence, usage budgets, task gates and canary rollback. Disable to retain the lab and the legacy full-dream evolution hook without the idle coordinator. Restart to apply.",
+  "memory.proceduralLearning.automation.maxLlmCalls":
+    "Maximum model callback dispatches per automatic learning cycle (default 64). Reserved before dispatch, including failed calls. Not a token, dollar, or provider-request count; existing usage budgets still apply.",
+  "memory.proceduralLearning.automation.maxAgentTurns":
+    "Maximum trial agent turns per automatic learning cycle (default 240). A turn can make multiple provider requests. Exhaustion holds the candidate instead of scoring a failure.",
+  "memory.proceduralLearning.automation.maxWallMinutes":
+    "Stop dispatching work and hold promotion after this many minutes (default 60). An in-flight request finishes under its existing timeout; shutdown drains it before closing the evidence store.",
+  "memory.proceduralLearning.experienceMemory.enabled":
+    "Capture redacted experience from settled, independently checked acquisition runs when a registered host adapter supplies an extractor. On by default. Held-out runs are excluded; shadow-mode recall requires explicit shadow evaluation. Does not capture ordinary conversations.",
+  "p2p.enabled":
+    "Join the libp2p mesh (skill sharing, circles transport, census). Off = fully local node.",
+  "circles.enabled":
+    "Shared agent spaces with end-to-end signed membership. Serves circle verbs over P2P and HTTP.",
+  "circles.sandbox.enabled": "Collaborative canvas sandbox inside circles.",
+  "a2a.enabled":
+    "Serve the Agent Card and message/tasks verbs so other agents can hire this node. Off by default for V1; circle delivery does not need it.",
+  "a2a.marketplace.enabled": "List and price this node's skills for other agents to buy.",
+  "forage.nightShift.enabled":
+    "Autonomously claim and work monitoring bounties from the mesh while idle. Earns USDC; dials bounty posters.",
+  "forage.audit.enabled":
+    "Probabilistically re-verify accepted forage check-ins (outbound fetches).",
+  "skills.evolution.enabled":
+    "Learn from execution traces: consolidate recurring failures/successes into a local knowledge wiki and propose gated skill improvements (PLAN-42). On by default; uses background LLM calls when a model is available, no-ops otherwise.",
+  "skills.evolution.propagate":
+    "Publish validation-gated, matured evolved skills to the P2P network with their evidence attached. On by default; requires P2P to be running.",
+  "skills.evolution.cadenceHours":
+    "Minimum hours between evolution iterations (one iteration = sample traces, consolidate the wiki, propose at most one skill change, settle the gate). Default 24; floor 1.",
+  "skills.evolution.validationMode":
+    "How a proposed skill is validated before promotion. 'tasks' runs real agent turns over the canonical regression + capability suites plus reviewed capability tasks and gates on an exact sign test with alpha spending (the gate). 'records' is deprecated: the LLM judge over held-out traces is kept as a diagnostic and can neither promote nor reject. Default 'tasks'.",
+  "skills.evolution.trialsPerTask":
+    "Tasks-mode trials per task per arm; per-task scores are fractional pass rates. Minimum 2, maximum 10. Default 3.",
+  "skills.evolution.maxTokenDelta":
+    "Cost gate: a candidate whose capability-suite tokens exceed the incumbent's by more than this ratio (candidate/incumbent - 1) is held as cost-exceeded even when it wins. Default 0.5.",
+  "skills.evolution.maxProposerTurns":
+    "ReAct turn cap for the Skill Proposer (read wiki, read traces, finish). Default 24.",
+  "skills.evolution.maxActiveEvolved":
+    "Cap on concurrently active evolved skills. Creates that pass the gate at cap are held. Default 5.",
+  "skills.evolution.judgeModel":
+    "Model spec 'provider/model' for the wiki maintainer, trace labeler, and records-mode judge. Default: the dream model, else the cheapest configured model.",
+  "skills.evolution.proposerModel":
+    "Model spec 'provider/model' for the Skill Proposer. It must hold a strict JSON tool protocol for many turns. Default: judgeModel if set, else the agent's primary model.",
+  "skills.evolution.wikiMaxPatterns":
+    "Wiki pattern-page count at which the lint pass archives least-recently-updated pages. Default 100.",
+  "skills.evolution.semanticLintCadenceDays":
+    "Days between LLM-backed wiki lint passes (contradictions, stale claims, near-duplicates). 0 disables. Default 7.",
+  "skills.evolution.maturityDays":
+    "Days a validated evolved skill must survive locally before P2P publish. Default 3.",
+  "skills.evolution.requireCrossModel":
+    "Publish over P2P only a skill validated on at least two models. Default false: a single-model skill publishes tagged singleModel on its provenance trailer, and receivers apply the strict canary to it.",
+  "skills.evolution.applicabilityProfile.enabled":
+    "Rebuild each live skill's applicability profile (models, platform, declared requirements, run shape, outcome depth; names, hashes and counts only) every housekeeping pass. Default true.",
+  "skills.evolution.applicabilityProfile.publish":
+    "Ship the applicability profile inside the signed provenance trailer when a skill is published to the mesh. Receivers use it only to order evaluation and tighten the canary. Default true.",
+  "skills.evolution.applicabilityProfile.windowDays":
+    "Days of read evidence the applicability profile summarises. Default 14.",
+  "skills.evolution.validationTools.exec":
+    "Give skill-validation rollouts a shell (exec/process) with approvals off, a scrubbed environment (HOME/TMPDIR inside the scratch workspace), a workdir confined to it and a validation-specific binary allowlist with no network clients. On by default (PLAN-45 D-2) so the gate measures the pathway the runtime uses; set false to keep validation shell-less.",
+  "skills.evolution.validationBudgetMinutes":
+    "Wall-clock budget for one tasks-mode validation run (real agent turns over the corpus). Past it the proposal is held and retried next iteration, reusing cached incumbent results. Default 45.",
+  "skills.evolution.descriptionRepair":
+    "When a proposal is held because the agent never opened it on its capability tasks, reword its description (the runtime's routing key) and re-measure on the next pass; at most 2 repairs per proposal. Default true.",
+  "skills.evolution.routingRepair":
+    "Rewrite the description of harvested or received live skills that the agent could never route to (repository taglines) into a 'use when … not for …' form, through the staging gate; up to 5 per housekeeping pass. Default true.",
+  "skills.skillSeekers.enabled":
+    "Generate skills by scraping documentation sites on demand. Off by default: dials external sites.",
+  "skills.skillSeekers.trending.enabled":
+    "Scheduled GitHub-trending sweep feeding Skill Seekers. Dials api.github.com on an interval.",
+  "skills.marketability.predictor.enabled":
+    "LLM-scored marketplace pricing for crystallized skills (token spend when a model is configured).",
+  "agents.defaults.harnessEvolve.enabled":
+    "Let dream cycles propose harness-policy overlays (PLAN-25). Experimental.",
+  "memory.architectEvolution.enabled":
+    "Learn extraction rules from failures and inject them into future extractions (HORMA). Experimental.",
+  "memory.curiosity.enabled":
+    "The curiosity engine: novelty detection, knowledge gaps and the questions that drive dream exploration and research (default: true).",
+  "memory.curiosity.research.enabled":
+    "Let the agent research its own open questions on a schedule: the question is rewritten as a generic topic phrase (checked for names and fragments) before anything leaves the node, then searched, read, and remembered with sources. Everything it does is on the Curiosity page, where it can be paused. Default on when web search is configured.",
+  "memory.curiosity.autoResearch.enabled":
+    "Let the dream engine run the Skill Seekers research step on its curiosity targets (needs skills.skillSeekers.enabled). Separate from Curiosity Research (memory.curiosity.research.enabled); setting this to false also turns Curiosity Research off unless that key is explicitly true. Default off.",
+  "memory.curiosity.research.maxPerDay":
+    "How many questions the agent may research per day (default 10). Dopamine adds up to 2, cortisol removes up to 2.",
+  "memory.curiosity.research.intervalMinutes": "Minutes between research passes (default 240).",
+  "memory.correction.enabled":
+    "After each of your turns whose message looks like a correction or a standing instruction, one cheap model call pins what you said as a settled fact at your authority (usage feature memory/correction). Off: corrections reach the facts ledger only when the agent pins them or when the dream-time extractor reads the transcript.",
+  "memory.correction.confirm":
+    'Append one "Memory updated: ..." line to the reply whenever a settled fact was written during the turn. Values are shown in direct chats only.',
+  "session.memory":
+    '"off" is incognito: conversation transcripts are not indexed into memory, the session extractor does not read them, and corrections are not captured. Replies still work. Default "on".',
+  "memory.curiosity.research.strictEgress":
+    "When true, no capitalized term from a question may appear in the outgoing search phrase, even a public one like libp2p; most technical questions then cannot be searched. Default false: public subjects the model declares pass, while the owner's name, people, organizations and projects from the knowledge graph, and copied fragments never do.",
+  "tools.wallet.enabled":
+    "Expose the USDC wallet tool to the agent (x402 payments, transfers). Off by default; requires CDP credentials to transact.",
+  "tools.wallet.network": 'USDC network: "base" (mainnet) or "base-sepolia" (testnet).',
+  "tools.wallet.perTransactionCapUsd":
+    'Hard ceiling on a single wallet transaction, in US dollars. Applies even when review.spend is "allow" or a spend grant matches.',
+  "tools.wallet.sessionSpendCapUsd":
+    "Hard ceiling on what one agent session may spend from the wallet, in US dollars.",
+  "tools.wallet.dailySpendLimitUsd":
+    "Hard ceiling on wallet spend per UTC day, in US dollars, across all sessions.",
+  "tools.wallet.x402.enabled":
+    "Let the agent pay HTTP 402 paywalls automatically with USDC (default: false). Each payment still passes review.spend and the wallet caps.",
+  "tools.wallet.x402.maxCostPerRequestUsd":
+    "Most a single x402 paywall may charge, in US dollars; dearer pages are refused.",
+  "models.liveDiscovery.enabled":
+    "Query configured providers' /models endpoints at catalog build so the picker reflects what they actually serve.",
+  "meta.lastTouchedVersion": "Auto-set when Bitterbot writes the config.",
+  "meta.lastTouchedAt": "ISO timestamp of the last config write (auto-set).",
+  "update.channel":
+    'Update channel for git + npm installs ("stable", "beta", or "dev"). Unset: stable for npm installs, containers and git checkouts on a release tag; dev for git checkouts on a branch. Containers follow their image tag and update with `docker compose pull && docker compose up -d`.',
+  "update.autoRollback.enabled":
+    "If a freshly updated gateway never confirms a healthy boot, roll back once: git installs reset to the pre-update commit (clean worktree only; config and memory untouched); installer (tarball) installs switch back to the previous version and restore a changed config, plus memory databases only if the new version migrated them past what the old one knows (default: true).",
+  "update.checkOnStart":
+    "Automatic update checks at gateway start and every 6 hours (default: true).",
+  "update.promptBehindCommits":
+    "Git installs: prompt the Control UI to update when the node is at least this many commits behind upstream (default: 20).",
+  "gateway.remote.url": "Remote Gateway WebSocket URL (ws:// or wss://).",
+  "gateway.remote.tlsFingerprint":
+    "Expected sha256 TLS fingerprint for the remote gateway (pin to avoid MITM).",
+  "gateway.remote.sshTarget":
+    "Remote gateway over SSH (tunnels the gateway port to localhost). Format: user@host or user@host:port.",
+  "gateway.remote.sshIdentity": "Optional SSH identity file path (passed to ssh -i).",
+  "agents.defaults.sandbox.mode":
+    'Run tool calls in a Docker sandbox: "off" (default, tools run on the host), "non-main" (every session except the main one) or "all". See LIMITATIONS.md, "Execution and isolation".',
+  "agents.defaults.sandbox.workspaceAccess":
+    'What the sandbox sees of the agent workspace: "none" (default: a scratch workspace), "ro" (read-only) or "rw".',
+  "agents.list[].skills":
+    "Optional allowlist of skills for this agent (omit = all skills; empty = no skills).",
+  "agents.list[].identity.avatar":
+    "Avatar image path (relative to the agent workspace only) or a remote URL/data URL.",
+  "gateway.auth.token":
+    "Required by default for gateway access (unless using Tailscale Serve identity); required for non-loopback binds.",
+  "gateway.auth.password": "Required for Tailscale funnel.",
+  "gateway.controlUi.basePath":
+    "Optional URL prefix where the Control UI is served (e.g. /bitterbot).",
+  "gateway.controlUi.root":
+    "Optional filesystem root for Control UI assets (defaults to dist/control-ui).",
+  "gateway.controlUi.allowedOrigins":
+    "Allowed browser origins for Control UI/WebChat websocket connections (full origins only, e.g. https://control.example.com).",
+  "gateway.controlUi.bootstrapPairing":
+    "Pair the first Control UI device that proves the gateway token, once, while no device is paired, so a cloud-hosted gateway can be set up from the browser alone. Later devices still need approval (default: off, unless BITTERBOT_BOOTSTRAP_PAIRING=1, which the deploy templates set).",
+  "gateway.controlUi.allowInsecureAuth":
+    "Allow Control UI auth over insecure HTTP (token-only; not recommended).",
+  "gateway.controlUi.dangerouslyDisableDeviceAuth":
+    "DANGEROUS. Disable Control UI device identity checks (token/password only).",
+  "gateway.http.endpoints.chatCompletions.enabled":
+    "Enable the OpenAI-compatible `POST /v1/chat/completions` endpoint (default: false).",
+  "gateway.reload.mode": 'Hot reload strategy for config changes ("hybrid" recommended).',
+  "gateway.reload.debounceMs": "Debounce window (ms) before applying config changes.",
+  "gateway.nodes.browser.mode":
+    'Node browser routing ("auto" = pick single connected browser node, "manual" = require node param, "off" = disable).',
+  "gateway.nodes.browser.node": "Pin browser routing to a specific node id or name (optional).",
+  "payments.link.enabled":
+    "Let the agent buy things with a one-time card from your Stripe Link account. You approve each purchase in the Link app (default: false).",
+  "payments.privacy.enabled":
+    "Let the agent buy things with single-use cards from your Privacy.com account. You approve each purchase in Bitterbot first; the card is created only then, capped at that amount (default: false).",
+  "payments.privacy.apiKey":
+    "Privacy.com API key (privacy.com/account; needs a plan with API access). Or set PRIVACY_API_KEY.",
+  "payments.privacy.perPurchaseCapUsd":
+    "Most one Privacy purchase may be, in US dollars (default: 100).",
+  "payments.privacy.sandbox":
+    "Use Privacy.com's sandbox, which issues no real cards (default: false).",
+  "payments.link.perPurchaseCapUsd": "Most one Link purchase may be, in US dollars (default: 100).",
+  "payments.link.command":
+    'How to run Stripe\'s Link CLI (default: ["npx", "-y", "@stripe/link-cli@0.26.0"]).',
+  "payments.link.authFile": "Where the Link login is kept (default: ~/.bitterbot/link/auth.json).",
+  "shop.enabled":
+    "Let the agent shop on stores that support agent shopping (most Shopify stores): search, build a cart, and send you the checkout link. It never pays (default: true).",
+  "shop.ucpProfileUrl":
+    "The public agent profile stores fetch to identify this agent. Defaults to the profile published in the Bitterbot repository.",
+  "monitors.enabled":
+    "Run monitors: watches on a page or API that are checked with a plain fetch and wake the agent only when something changes (default: true).",
+  "compute.enabled":
+    "Give the agent the `compute` tool and a short prompt section about compute pools (default: true). It only takes effect when the Soapbox compute plugin is loaded, and the agent can never fund a paid job itself.",
+  "compute.awareness.stateBlock":
+    "Put a short compute-state block at the end of the prompt when something is actionable: a job in flight, a job waiting on you, a completion the agent has not seen, low credits (default: true). Omitted entirely when nothing is happening, so an idle node pays nothing for it.",
+  "compute.awareness.maxTokens":
+    "Upper bound for the compute-state block, in tokens (default 120). Lower-value lines are clipped first.",
+  "compute.awareness.creditFloor":
+    "When available compute credits fall below this, the state block says so (default 10).",
+  "compute.awareness.wakeBudgetPerHour":
+    "How many times per hour a finished compute job may wake the agent (default 20). Over the budget, completions are queued and shown as waiting; none are lost.",
+  "compute.awareness.nudges":
+    "Small hormonal nudges from compute (default: on): a dopamine lift when a job you can see succeeds on the pool, a cortisol rise when a worker drops out, the coordinator goes unreachable or memory embeddings keep falling back to local. Recall-sized (0.05), at most one per kind every thirty minutes and four per hour, too small and too spaced to start a dream. The node's own batches never lift; their one setback is the sustained-fallback event. Off means no sink is registered at all.",
+  "compute.embeddings.provider":
+    "Where memory embedding batches may run (default: pool). A pool worker is used only when its pinned model digest, dimensions and processing rules equal the local embedding profile and the content's governance class allows that pool; everything else runs locally. `local` turns pool routing off. Queries always run locally.",
+  "compute.embeddings.marginMs":
+    "A pool worker must be estimated faster than local by at least this many milliseconds to be chosen (default 500). Estimates come from measured batches, never from a model.",
+  "compute.embeddings.cooldownMs":
+    "After a timeout, a digest or dimension mismatch, or a policy violation, the worker is skipped for this long (default 300000, five minutes).",
+  "compute.embeddings.timeoutMs":
+    "A pool batch that has not finished within this many milliseconds is cancelled and run locally instead (default 60000).",
+  "compute.embeddings.modelDigest":
+    "Override the local embedding model digest used for pool parity checks. Only for providers that cannot report one; a wrong value makes the pool produce vectors that are never written, not corrupt ones.",
+  "compute.egress.transcriptsDefaultClass":
+    "Governance class for session transcript chunks that carry no higher tag (default: personal, which keeps them on this machine or trusted pools). `normal` allows untrusted pools; `confidential` keeps them local.",
+  "compute.paid.enabled":
+    "Let the agent submit paid (USDC) compute jobs (default: off). A paid job waits at awaiting_payment; nothing is funded until you approve it in the Control UI or with `bitterbot compute approve`. The agent can never fund one.",
+  "compute.paid.maxUsdcPerJob":
+    "Most USDC a single compute job may be funded for (default: 5). A quote above it is refused at the signer, whoever approved it.",
+  "compute.paid.maxUsdcPerDay":
+    "Most USDC compute funding may total in a rolling 24 hours (default: 20), counted from the compute ledger.",
+  "notifications.owner.channel":
+    "Channel to push gateway notices to (a failed or turned-off scheduled job, a stranded task). Without it, notices go where the heartbeat would deliver. Every notice is also kept in the main session.",
+  "notifications.owner.to": "Recipient on that channel for gateway notices.",
+  "notifications.quietHours.start":
+    'Start of the window with no pushed notices, 24-hour "HH:MM". Notices raised in the window wait in the main session.',
+  "notifications.quietHours.end":
+    'End of the quiet window, 24-hour "HH:MM". May be earlier than the start to run past midnight.',
+  "notifications.quietHours.timezone":
+    "IANA timezone for quiet hours (default: the gateway host's).",
+  "notifications.maxPerHour":
+    "Most notices pushed to a channel in any hour (default: 6). The rest wait in the main session.",
+  "cron.autoDisableAfterErrors":
+    "Turn a recurring job off after this many failed runs in a row and tell the owner (default: 8; 0 never turns a job off).",
+  "review.spend":
+    'Money leaving the wallet (send_usdc, send_to_peer, x402). "ask" (default) holds the call until you approve it in the Control UI or with /approve; a standing spend grant covering the payee and amount passes without asking. "allow" keeps only the wallet caps.',
+  "review.publish":
+    'Public posts on the X channel. "ask" (default) holds the post for your approval; "allow" posts straight away.',
+  "review.contact":
+    'Messages the agent addresses to a named recipient. "first" (default) holds only a message to someone it has never dealt with; "ask" holds every one; "allow" holds none. Replies in the current conversation are never held.',
+  "review.connector":
+    'Connector (MCP) tools that change something: "ask" (default) holds them for your approval; "allow" runs them. Read-only tools always run.',
+  "review.ttlHours": "How long a held action waits for a decision before it expires (default: 24).",
+  "browser.replay.enabled":
+    "Keep a low-rate screenshot record of the agent's browser after each page action, stored only on this machine, so you can see later what it did (default: true).",
+  "browser.replay.retentionDays":
+    "Days to keep a session's browser recording after its last frame (default: 7).",
+  "browser.perAgentProfiles":
+    "Give each agent other than the default one its own browser profile (agent-<id>), so agents never share cookies or logins (default: true).",
+  "browser.liveView.enabled":
+    "Stream the agent's browser to the Control UI's computer pane while it is open (default: true). Set false to turn the stream off.",
+  "browser.liveView.maxFps":
+    "Upper bound on live view frames per second (1-30, default: 8). Lower it for remote or metered connections.",
+  "browser.liveView.quality": "JPEG quality of the live view stream (10-95, default: 60).",
+  "gateway.nodes.allowCommands":
+    "Extra node.invoke commands to allow beyond the gateway defaults (array of command strings).",
+  "gateway.nodes.denyCommands":
+    "Commands to block even if present in node claims or default allowlist.",
+  "nodeHost.browserProxy.enabled": "Expose the local browser control server via node proxy.",
+  "nodeHost.browserProxy.allowProfiles":
+    "Optional allowlist of browser profile names exposed via the node proxy.",
+  "diagnostics.flags":
+    'Enable targeted diagnostics logs by flag (e.g. ["telegram.http"]). Supports wildcards like "telegram.*" or "*".',
+  "diagnostics.cacheTrace.enabled":
+    "Log cache trace snapshots for embedded agent runs (default: false).",
+  "diagnostics.cacheTrace.filePath":
+    "JSONL output path for cache trace logs (default: $BITTERBOT_STATE_DIR/logs/cache-trace.jsonl).",
+  "diagnostics.cacheTrace.includeMessages":
+    "Include full message payloads in trace output (default: true).",
+  "diagnostics.cacheTrace.includePrompt": "Include prompt text in trace output (default: true).",
+  "diagnostics.cacheTrace.includeSystem": "Include system prompt in trace output (default: true).",
+  "tools.exec.applyPatch.enabled":
+    "Experimental. Enables apply_patch for OpenAI models when allowed by tool policy.",
+  "tools.exec.applyPatch.workspaceOnly":
+    "Restrict apply_patch paths to the workspace directory (default: true). Set false to allow writing outside the workspace (dangerous).",
+  "tools.exec.applyPatch.allowModels":
+    'Optional allowlist of model ids (e.g. "gpt-5.2" or "openai/gpt-5.2").',
+  "tools.exec.notifyOnExit":
+    "When true (default), backgrounded exec sessions enqueue a system event and request a heartbeat on exit.",
+  "tools.exec.notifyOnExitEmptySuccess":
+    "When true, successful backgrounded exec exits with empty output still enqueue a completion system event (default: false).",
+  "tools.exec.pathPrepend": "Directories to prepend to PATH for exec runs (gateway/sandbox).",
+  "tools.exec.safeBins":
+    "Allow stdin-only safe binaries to run without explicit allowlist entries.",
+  "tools.fs.workspaceOnly":
+    "Restrict filesystem tools (read/write/edit/apply_patch) to the workspace directory (default: false).",
+  "tools.sessions.visibility":
+    'Controls which sessions can be targeted by sessions_list/sessions_history/sessions_send. ("tree" default = current session + spawned subagent sessions; "self" = only current; "agent" = any session in the current agent id; "all" = any session; cross-agent still requires tools.agentToAgent).',
+  "tools.message.allowCrossContextSend":
+    "Legacy override: allow cross-context sends across all providers.",
+  "tools.message.crossContext.allowWithinProvider":
+    "Allow sends to other channels within the same provider (default: true).",
+  "tools.message.crossContext.allowAcrossProviders":
+    "Allow sends across different providers (default: false).",
+  "tools.message.crossContext.marker.enabled":
+    "Add a visible origin marker when sending cross-context (default: true).",
+  "tools.message.crossContext.marker.prefix":
+    'Text prefix for cross-context markers (supports "{channel}").',
+  "tools.message.crossContext.marker.suffix":
+    'Text suffix for cross-context markers (supports "{channel}").',
+  "tools.message.broadcast.enabled": "Enable broadcast action (default: true).",
+  "tools.web.search.enabled": "Enable the web_search tool (requires a provider API key).",
+  "tools.web.search.provider":
+    'Search provider ("brave", "perplexity", "grok", "tavily", "parallel", or "serply").',
+  "tools.web.search.apiKey": "Brave Search API key (fallback: BRAVE_API_KEY env var).",
+  "tools.web.search.maxResults": "Default number of results to return (1-10).",
+  "tools.web.search.timeoutSeconds": "Timeout in seconds for web_search requests.",
+  "tools.web.search.cacheTtlMinutes": "Cache TTL in minutes for web_search results.",
+  "tools.web.search.perplexity.apiKey":
+    "Perplexity or OpenRouter API key (fallback: PERPLEXITY_API_KEY or OPENROUTER_API_KEY env var).",
+  "tools.web.search.perplexity.baseUrl":
+    "Perplexity base URL override (default: https://openrouter.ai/api/v1 or https://api.perplexity.ai).",
+  "tools.web.search.perplexity.model":
+    'Perplexity model override (default: "perplexity/sonar-pro").',
+  "tools.web.search.tavily.apiKey": "Tavily API key (fallback: TAVILY_API_KEY env var).",
+  "tools.web.search.tavily.searchDepth":
+    'Tavily search depth ("basic" or "advanced"; default: "basic").',
+  "tools.web.search.serply.apiKey": "Serply API key (fallback: SERPLY_API_KEY env var).",
+  "tools.web.fetch.enabled": "Enable the web_fetch tool (lightweight HTTP fetch).",
+  "tools.web.fetch.maxChars": "Max characters returned by web_fetch (truncated).",
+  "tools.web.fetch.maxCharsCap":
+    "Hard cap for web_fetch maxChars (applies to config and tool calls).",
+  "tools.web.fetch.timeoutSeconds": "Timeout in seconds for web_fetch requests.",
+  "tools.web.fetch.cacheTtlMinutes": "Cache TTL in minutes for web_fetch results.",
+  "tools.web.fetch.maxRedirects": "Maximum redirects allowed for web_fetch (default: 3).",
+  "tools.web.fetch.userAgent": "Override User-Agent header for web_fetch requests.",
+  "tools.web.fetch.readability":
+    "Use Readability to extract main content from HTML (fallbacks to basic HTML cleanup).",
+  "tools.web.fetch.firecrawl.enabled": "Enable Firecrawl fallback for web_fetch (if configured).",
+  "tools.web.fetch.firecrawl.apiKey": "Firecrawl API key (fallback: FIRECRAWL_API_KEY env var).",
+  "tools.web.fetch.firecrawl.baseUrl":
+    "Firecrawl base URL (e.g. https://api.firecrawl.dev or custom endpoint).",
+  "tools.web.fetch.firecrawl.onlyMainContent":
+    "When true, Firecrawl returns only the main content (default: true).",
+  "tools.web.fetch.firecrawl.maxAgeMs":
+    "Firecrawl maxAge (ms) for cached results when supported by the API.",
+  "tools.web.fetch.firecrawl.timeoutSeconds": "Timeout in seconds for Firecrawl requests.",
+  "channels.slack.allowBots":
+    "Allow bot-authored messages to trigger Slack replies (default: false).",
+  "channels.slack.thread.historyScope":
+    'Scope for Slack thread history context ("thread" isolates per thread; "channel" reuses channel history).',
+  "channels.slack.thread.inheritParent":
+    "If true, Slack thread sessions inherit the parent channel transcript (default: false).",
+  "channels.slack.thread.initialHistoryLimit":
+    "Maximum number of existing Slack thread messages to fetch when starting a new thread session (default: 20, set to 0 to disable).",
+  "auth.profiles": "Named auth profiles (provider + mode + optional email).",
+  "auth.order": "Ordered auth profile IDs per provider (used for automatic failover).",
+  "auth.cooldowns.billingBackoffHours":
+    "Base backoff (hours) when a profile fails due to billing/insufficient credits (default: 5).",
+  "auth.cooldowns.billingBackoffHoursByProvider":
+    "Optional per-provider overrides for billing backoff (hours).",
+  "auth.cooldowns.billingMaxHours": "Cap (hours) for billing backoff (default: 24).",
+  "auth.cooldowns.failureWindowHours": "Failure window (hours) for backoff counters (default: 24).",
+  "agents.defaults.bootstrapMaxChars":
+    "Max characters of each workspace bootstrap file injected into the system prompt before truncation (default: 20000).",
+  "agents.defaults.bootstrapTotalMaxChars":
+    "Max total characters across all injected workspace bootstrap files (default: 24000).",
+  "agents.defaults.repoRoot":
+    "Optional repository root shown in the system prompt runtime line (overrides auto-detect).",
+  "agents.defaults.envelopeTimezone":
+    'Timezone for message envelopes ("utc", "local", "user", or an IANA timezone string).',
+  "agents.defaults.envelopeTimestamp":
+    'Include absolute timestamps in message envelopes ("on" or "off").',
+  "agents.defaults.envelopeElapsed": 'Include elapsed time in message envelopes ("on" or "off").',
+  "agents.defaults.models": "Configured model catalog (keys are full provider/model IDs).",
+  "agents.defaults.memorySearch":
+    "Vector search over MEMORY.md and memory/*.md (per-agent overrides supported).",
+  "agents.defaults.memorySearch.sources":
+    'Sources to index for memory search (default: ["memory"]; add "sessions" to include session transcripts).',
+  "agents.defaults.memorySearch.extraPaths":
+    "Extra paths to include in memory search (directories or .md files; relative paths resolved from workspace).",
+  "agents.defaults.memorySearch.experimental.sessionMemory":
+    "Enable experimental session transcript indexing for memory search (default: true).",
+  "agents.defaults.memorySearch.provider":
+    'Embedding provider ("openai", "gemini", "voyage", or "local").',
+  "agents.defaults.memorySearch.remote.baseUrl":
+    "Custom base URL for remote embeddings (OpenAI-compatible proxies or Gemini overrides).",
+  "agents.defaults.memorySearch.remote.apiKey": "Custom API key for the remote embedding provider.",
+  "agents.defaults.memorySearch.remote.headers":
+    "Extra headers for remote embeddings (merged; remote overrides OpenAI headers).",
+  "agents.defaults.memorySearch.remote.batch.enabled":
+    "Enable batch API for memory embeddings (OpenAI/Gemini; default: true).",
+  "agents.defaults.memorySearch.remote.batch.wait":
+    "Wait for batch completion when indexing (default: true).",
+  "agents.defaults.memorySearch.remote.batch.concurrency":
+    "Max concurrent embedding batch jobs for memory indexing (default: 2).",
+  "agents.defaults.memorySearch.remote.batch.pollIntervalMs":
+    "Polling interval in ms for batch status (default: 2000).",
+  "agents.defaults.memorySearch.remote.batch.timeoutMinutes":
+    "Timeout in minutes for batch indexing (default: 60).",
+  "agents.defaults.memorySearch.local.modelPath":
+    "Local GGUF model path or hf: URI (node-llama-cpp).",
+  "agents.defaults.memorySearch.fallback":
+    'Fallback provider when embeddings fail ("openai", "gemini", "local", or "none").',
+  "agents.defaults.memorySearch.store.path":
+    "SQLite index path (default: ~/.bitterbot/memory/{agentId}.sqlite).",
+  "agents.defaults.memorySearch.store.vector.enabled":
+    "Enable sqlite-vec extension for vector search (default: true).",
+  "agents.defaults.memorySearch.store.vector.extensionPath":
+    "Optional override path to sqlite-vec extension library (.dylib/.so/.dll).",
+  "agents.defaults.memorySearch.query.hybrid.enabled":
+    "Enable hybrid BM25 + vector search for memory (default: true).",
+  "agents.defaults.memorySearch.query.hybrid.vectorWeight":
+    "Weight for vector similarity when merging results (0-1).",
+  "agents.defaults.memorySearch.query.hybrid.textWeight":
+    "Weight for BM25 text relevance when merging results (0-1).",
+  "agents.defaults.memorySearch.query.hybrid.candidateMultiplier":
+    "Multiplier for candidate pool size (default: 4).",
+  "agents.defaults.memorySearch.query.hybrid.rrfWeights.vector":
+    "RRF weight of the vector (embedding) channel: it contributes weight / (k + rank) per result (default: 1, unweighted RRF). 0 silences the channel; 0.25 and 0.1 were measured 2026-10-29, see docs/research/fusion-weights-2026-10-29.md.",
+  "agents.defaults.memorySearch.query.hybrid.rrfWeights.keyword":
+    "RRF weight of the keyword (BM25) channel (default: 1). 0 silences the channel.",
+  "agents.defaults.memorySearch.query.hybrid.rrfWeights.graph":
+    "RRF weight of the knowledge-graph channel (default: 1). 0 silences the channel.",
+  "agents.defaults.memorySearch.query.hybrid.rrfK":
+    "RRF smoothing constant k in weight / (k + rank) (default: 60). Lower rewards top ranks more sharply.",
+  "agents.defaults.memorySearch.query.channelDiagnostics":
+    "Per-channel retrieval detail shown to the model on memory_search results: ranks (default), full (ranks + native scores), or off.",
+  "agents.defaults.memorySearch.query.postFusionBoostScale":
+    "How much of the recency, emotional, mood and temporal boosts reaches a rank-fused (RRF) score: 0.1 = tie-breaking strength (default), 1 = full legacy boosts, 0 = pure fusion order.",
+  "agents.defaults.memorySearch.cache.enabled":
+    "Cache chunk embeddings in SQLite to speed up reindexing and frequent updates (default: true).",
+  memory: "Memory system configuration (global).",
+  "memory.citations": 'Default citation behavior ("auto", "on", or "off").',
+  "agents.defaults.memorySearch.cache.maxEntries":
+    "Optional cap on cached embeddings (best-effort).",
+  "agents.defaults.memorySearch.sync.onSearch":
+    "Lazy sync: schedule a reindex on search after changes.",
+  "agents.defaults.memorySearch.sync.watch": "Watch memory files for changes (chokidar).",
+  "agents.defaults.memorySearch.sync.sessions.deltaBytes":
+    "Minimum appended bytes before session transcripts trigger reindex (default: 100000).",
+  "agents.defaults.memorySearch.sync.sessions.deltaMessages":
+    "Minimum appended JSONL lines before session transcripts trigger reindex (default: 50).",
+  "plugins.enabled": "Enable plugin/extension loading (default: true).",
+  "plugins.allow": "Optional allowlist of plugin ids; when set, only listed plugins load.",
+  "plugins.deny": "Optional denylist of plugin ids; deny wins over allowlist.",
+  "plugins.load.paths": "Additional plugin files or directories to load.",
+  "plugins.slots": "Select which plugins own exclusive slots (memory, etc.).",
+  "plugins.slots.memory":
+    'Select the active memory plugin by id, or "none" to disable memory plugins.',
+  "plugins.entries": "Per-plugin settings keyed by plugin id (enable/disable + config payloads).",
+  "plugins.entries.*.enabled": "Overrides plugin enable/disable for this entry (restart required).",
+  "plugins.entries.*.config": "Plugin-defined config payload (schema is provided by the plugin).",
+  "plugins.installs":
+    "CLI-managed install metadata (used by `bitterbot plugins update` to locate install sources).",
+  "plugins.installs.*.source": 'Install source ("npm", "archive", or "path").',
+  "plugins.installs.*.spec": "Original npm spec used for install (if source is npm).",
+  "plugins.installs.*.sourcePath": "Original archive/path used for install (if any).",
+  "plugins.installs.*.installPath":
+    "Resolved install directory (usually ~/.bitterbot/extensions/<id>).",
+  "plugins.installs.*.version": "Version recorded at install time (if available).",
+  "plugins.installs.*.installedAt": "ISO timestamp of last install/update.",
+  "agents.defaults.model.primary": "Primary model (provider/model).",
+  "agents.defaults.model.fallbacks":
+    "Ordered fallback models (provider/model). Used when the primary model fails.",
+  "agents.defaults.imageModel.primary":
+    "Optional image model (provider/model) used when the primary model lacks image input.",
+  "agents.defaults.imageModel.fallbacks": "Ordered fallback image models (provider/model).",
+  "agents.defaults.cliBackends": "Optional CLI backends for text-only fallback (claude-cli, etc.).",
+  "agents.defaults.humanDelay.mode": 'Delay style for block replies ("off", "natural", "custom").',
+  "agents.defaults.humanDelay.minMs": "Minimum delay in ms for custom humanDelay (default: 800).",
+  "agents.defaults.humanDelay.maxMs": "Maximum delay in ms for custom humanDelay (default: 2500).",
+  "commands.native":
+    "Register native commands with channels that support it (Discord/Slack/Telegram).",
+  "commands.nativeSkills":
+    "Register native skill commands (user-invocable skills) with channels that support it.",
+  "commands.text": "Allow text command parsing (slash commands only).",
+  "commands.bash":
+    "Allow bash chat command (`!`; `/bash` alias) to run host shell commands (default: false; requires tools.elevated).",
+  "commands.bashForegroundMs":
+    "How long bash waits before backgrounding (default: 2000; 0 backgrounds immediately).",
+  "commands.config": "Allow /config chat command to read/write config on disk (default: false).",
+  "commands.debug": "Allow /debug chat command for runtime-only overrides (default: false).",
+  "commands.restart": "Allow /restart and gateway restart tool actions (default: false).",
+  "commands.useAccessGroups": "Enforce access-group allowlists/policies for commands.",
+  "commands.ownerAllowFrom":
+    "Explicit owner allowlist for owner-only tools/commands. Use channel-native IDs (optionally prefixed like \"whatsapp:+15551234567\"). '*' is ignored.",
+  "session.dmScope":
+    'DM session scoping: "main" keeps continuity; "per-peer", "per-channel-peer", or "per-account-channel-peer" isolates DM history (recommended for shared inboxes/multi-account).',
+  "session.identityLinks":
+    "Map canonical identities to provider-prefixed peer IDs for DM session linking (example: telegram:123456).",
+  "channels.telegram.configWrites":
+    "Allow Telegram to write config in response to channel events/commands (default: true).",
+  "channels.slack.configWrites":
+    "Allow Slack to write config in response to channel events/commands (default: true).",
+  "channels.discord.configWrites":
+    "Allow Discord to write config in response to channel events/commands (default: true).",
+  "channels.discord.proxy":
+    "Proxy URL for Discord gateway WebSocket connections. Set per account via channels.discord.accounts.<id>.proxy.",
+  "channels.whatsapp.configWrites":
+    "Allow WhatsApp to write config in response to channel events/commands (default: true).",
+  "channels.signal.configWrites":
+    "Allow Signal to write config in response to channel events/commands (default: true).",
+  "channels.imessage.configWrites":
+    "Allow iMessage to write config in response to channel events/commands (default: true).",
+  "channels.discord.commands.native": 'Override native commands for Discord (bool or "auto").',
+  "channels.discord.commands.nativeSkills":
+    'Override native skill commands for Discord (bool or "auto").',
+  "channels.telegram.commands.native": 'Override native commands for Telegram (bool or "auto").',
+  "channels.telegram.commands.nativeSkills":
+    'Override native skill commands for Telegram (bool or "auto").',
+  "channels.slack.commands.native": 'Override native commands for Slack (bool or "auto").',
+  "channels.slack.commands.nativeSkills":
+    'Override native skill commands for Slack (bool or "auto").',
+  "session.agentToAgent.maxPingPongTurns":
+    "Max reply-back turns between requester and target (0–5).",
+  "channels.telegram.customCommands":
+    "Additional Telegram bot menu commands (merged with native; conflicts ignored).",
+  "messages.suppressToolErrors":
+    "When true, suppress ⚠️ tool-error warnings from being shown to the user. The agent already sees errors in context and can retry. Default: false.",
+  "messages.ackReaction": "Emoji reaction used to acknowledge inbound messages (empty disables).",
+  "messages.ackReactionScope":
+    'When to send ack reactions ("group-mentions", "group-all", "direct", "all").',
+  "messages.inbound.debounceMs":
+    "Debounce window (ms) for batching rapid inbound messages from the same sender (0 to disable).",
+  "channels.telegram.dmPolicy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.telegram.allowFrom=["*"].',
+  "channels.telegram.streamMode":
+    "Live stream preview mode for Telegram replies (off | partial | block). Separate from block streaming; uses sendMessage + editMessageText.",
+  "channels.telegram.draftChunk.minChars":
+    'Minimum chars before emitting a Telegram stream preview update when channels.telegram.streamMode="block" (default: 200).',
+  "channels.telegram.draftChunk.maxChars":
+    'Target max size for a Telegram stream preview chunk when channels.telegram.streamMode="block" (default: 800; clamped to channels.telegram.textChunkLimit).',
+  "channels.telegram.draftChunk.breakPreference":
+    "Preferred breakpoints for Telegram draft chunks (paragraph | newline | sentence). Default: paragraph.",
+  "channels.telegram.retry.attempts":
+    "Max retry attempts for outbound Telegram API calls (default: 3).",
+  "channels.telegram.retry.minDelayMs": "Minimum retry delay in ms for Telegram outbound calls.",
+  "channels.telegram.retry.maxDelayMs":
+    "Maximum retry delay cap in ms for Telegram outbound calls.",
+  "channels.telegram.retry.jitter": "Jitter factor (0-1) applied to Telegram retry delays.",
+  "channels.telegram.network.autoSelectFamily":
+    "Override Node autoSelectFamily for Telegram (true=enable, false=disable).",
+  "channels.telegram.timeoutSeconds":
+    "Max seconds before Telegram API requests are aborted (default: 500 per grammY).",
+  "channels.whatsapp.dmPolicy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.whatsapp.allowFrom=["*"].',
+  "channels.whatsapp.selfChatMode": "Same-phone setup (bot uses your personal WhatsApp number).",
+  "channels.whatsapp.debounceMs":
+    "Debounce window (ms) for batching rapid consecutive messages from the same sender (0 to disable).",
+  "channels.signal.dmPolicy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.signal.allowFrom=["*"].',
+  "channels.imessage.dmPolicy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.imessage.allowFrom=["*"].',
+  "channels.discord.dmPolicy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.discord.allowFrom=["*"].',
+  "channels.discord.dm.policy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.discord.allowFrom=["*"] (legacy: channels.discord.dm.allowFrom).',
+  "channels.discord.retry.attempts":
+    "Max retry attempts for outbound Discord API calls (default: 3).",
+  "channels.discord.retry.minDelayMs": "Minimum retry delay in ms for Discord outbound calls.",
+  "channels.discord.retry.maxDelayMs": "Maximum retry delay cap in ms for Discord outbound calls.",
+  "channels.discord.retry.jitter": "Jitter factor (0-1) applied to Discord retry delays.",
+  "channels.discord.maxLinesPerMessage": "Soft max line count per Discord message (default: 17).",
+  "channels.discord.ui.components.accentColor":
+    "Accent color for Discord component containers (hex). Set per account via channels.discord.accounts.<id>.ui.components.accentColor.",
+  "channels.discord.intents.presence":
+    "Enable the Guild Presences privileged intent. Must also be enabled in the Discord Developer Portal. Allows tracking user activities (e.g. Spotify). Default: false.",
+  "channels.discord.intents.guildMembers":
+    "Enable the Guild Members privileged intent. Must also be enabled in the Discord Developer Portal. Default: false.",
+  "channels.discord.pluralkit.enabled":
+    "Resolve PluralKit proxied messages and treat system members as distinct senders.",
+  "channels.discord.pluralkit.token":
+    "Optional PluralKit token for resolving private systems or members.",
+  "channels.discord.activity": "Discord presence activity text (defaults to custom status).",
+  "channels.discord.status": "Discord presence status (online, dnd, idle, invisible).",
+  "channels.discord.activityType":
+    "Discord presence activity type (0=Playing,1=Streaming,2=Listening,3=Watching,4=Custom,5=Competing).",
+  "channels.discord.activityUrl": "Discord presence streaming URL (required for activityType=1).",
+  "channels.slack.dm.policy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.slack.allowFrom=["*"] (legacy: channels.slack.dm.allowFrom).',
+  "channels.slack.dmPolicy":
+    'Direct message access control ("pairing" recommended). "open" requires channels.slack.allowFrom=["*"].',
+};

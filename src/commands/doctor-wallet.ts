@@ -1,0 +1,239 @@
+/**
+ * Top-level Wallet doctor section.
+ *
+ * Verifies the agent's USDC wallet is reachable and configured. The actual
+ * balance / on-chain calls happen via the wallet service at runtime; this
+ * doctor section is config + reachability only — never spends gas, never
+ * touches the seed, never opens an outbound RPC.
+ *
+ * What we check:
+ *   1. Wallet config block exists and `tools.wallet.enabled !== false`
+ *   2. Network is one we recognize (base / base-sepolia)
+ *   3. Spend caps are sane (positive, per-tx ≤ daily ≤ session)
+ *   4. Wallet store directory is writable
+ *   5. CDP keys present (config or env vars) — required for actual signing
+ *   6. x402 + Stripe sub-block sanity (if enabled)
+ *
+ * What we deliberately don't check:
+ *   - Live RPC connectivity to Base (would surface noisy network failures
+ *     during dev; runtime checks handle this)
+ *   - On-chain balance (would require RPC + risk metrics)
+ *   - Key material integrity: the wallet is a single CDP Server Wallet (MPC
+ *     EOA) keyed off CDP_WALLET_SECRET — there is no local seed file to check;
+ *     the CDP triple-secret presence check below is the relevant gate.
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { BitterbotConfig } from "../config/config.js";
+import {
+  assertAddressContinuity,
+  type SmartAccountRecord,
+} from "../payments/wallet/smart-account.js";
+import { renderSectionQuietIfAllInfo, type CheckResult, ok, warn, info } from "./doctor-check.js";
+
+const KNOWN_NETWORKS = new Set(["base", "base-sepolia"]);
+const DEFAULT_WALLET_STORE = path.join(os.homedir(), ".bitterbot", "wallet");
+
+export async function runWalletChecks(params: { config: BitterbotConfig }): Promise<void> {
+  const { config } = params;
+  const wallet = config.tools?.wallet;
+  const results: CheckResult[] = [];
+
+  // ── Enabled? ──
+  // Opt-in per the V1 default flips: the wallet tool mounts only on an
+  // explicit tools.wallet.enabled === true, so anything else is "off" here
+  // too — a wallet block holding only spend caps must not read as enabled.
+  if (wallet?.enabled !== true) {
+    results.push(
+      info(
+        "Wallet is not enabled (tools.wallet.enabled). Agent can publish " +
+          "skills but cannot earn or pay for paywalled APIs.",
+      ),
+    );
+    renderSection(results);
+    return;
+  }
+  results.push(ok("Wallet is enabled"));
+
+  // ── Network ──
+  const network = wallet.network ?? "base-sepolia";
+  if (!KNOWN_NETWORKS.has(network)) {
+    results.push(warn(`Unknown network: ${network} (expected base or base-sepolia)`));
+  } else if (network === "base-sepolia") {
+    results.push(info(`Network: ${network} (testnet — switch to 'base' for mainnet earnings)`));
+  } else {
+    results.push(ok(`Network: ${network} (mainnet)`));
+  }
+
+  // ── Spend caps ──
+  const perTx = wallet.perTransactionCapUsd;
+  const daily = wallet.dailySpendLimitUsd;
+  const session = wallet.sessionSpendCapUsd;
+
+  if (perTx !== undefined && perTx <= 0) {
+    results.push(warn(`Per-transaction cap must be positive (got ${perTx})`));
+  } else if (daily !== undefined && daily <= 0) {
+    results.push(warn(`Daily spend limit must be positive (got ${daily})`));
+  } else if (session !== undefined && session <= 0) {
+    results.push(warn(`Session spend cap must be positive (got ${session})`));
+  } else if (perTx !== undefined && daily !== undefined && perTx > daily) {
+    results.push(
+      warn(
+        `Per-tx cap ($${perTx}) exceeds daily limit ($${daily}) — single tx could blow the daily budget`,
+      ),
+    );
+  } else {
+    results.push(
+      ok(`Spend caps: $${perTx ?? 25}/tx · $${daily ?? 50}/day · $${session ?? 50}/session`),
+    );
+  }
+
+  // ── Wallet store directory ──
+  const storePath = wallet.walletStorePath ?? DEFAULT_WALLET_STORE;
+  try {
+    fs.mkdirSync(storePath, { recursive: true });
+    fs.accessSync(storePath, fs.constants.W_OK);
+    results.push(ok(`Wallet store: ${storePath} (writable)`));
+  } catch (err) {
+    results.push(
+      warn(
+        `Wallet store ${storePath} not writable: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    );
+  }
+
+  // ── CDP credentials (config or env) ──
+  // CDP SDK v2 requires THREE secrets, not two:
+  //   - CDP_API_KEY_ID     (identifies the API key)
+  //   - CDP_API_KEY_SECRET (authenticates API calls)
+  //   - CDP_WALLET_SECRET  (authenticates wallet operations)
+  // The wallet secret is deliberately env-only (no config-file path) to
+  // keep it out of serialized JSON.
+  const cdpKeyId = wallet.cdpApiKeyId || process.env.CDP_API_KEY_ID;
+  const cdpKeySecret = wallet.cdpApiKeySecret || process.env.CDP_API_KEY_SECRET;
+  const cdpWalletSecret = process.env.CDP_WALLET_SECRET;
+  const haveAll = Boolean(cdpKeyId && cdpKeySecret && cdpWalletSecret);
+  const haveSome = Boolean(cdpKeyId || cdpKeySecret || cdpWalletSecret);
+  if (haveAll) {
+    results.push(ok("CDP credentials present (API key + wallet secret — signing will work)"));
+  } else if (haveSome) {
+    const missing = [
+      !cdpKeyId && "CDP_API_KEY_ID",
+      !cdpKeySecret && "CDP_API_KEY_SECRET",
+      !cdpWalletSecret && "CDP_WALLET_SECRET",
+    ]
+      .filter(Boolean)
+      .join(", ");
+    results.push(
+      warn(
+        `CDP credentials partially configured — missing: ${missing}. ` +
+          "Run `bitterbot configure --section wallet` to finish setup.",
+      ),
+    );
+  } else {
+    results.push(
+      warn(
+        "CDP credentials missing. Easiest: run `bitterbot configure --section wallet` — " +
+          "the wizard opens the CDP portal and walks you through both keys. " +
+          "Manual: set CDP_API_KEY_ID, CDP_API_KEY_SECRET (portal.cdp.coinbase.com → API Keys) " +
+          "and CDP_WALLET_SECRET (portal.cdp.coinbase.com → Wallets → Wallet Secret).",
+      ),
+    );
+  }
+
+  // ── Smart Account (PLAN-48 Phase 4) ──
+  // The live upgrade (creating the ERC-4337 CDP Smart Account + routing sends
+  // through it) is an operator step; here we only sanity-check the allowance
+  // config and, if the upgrade has been run and its record persisted, assert
+  // the I5 address/balance continuity invariant from disk (no on-chain call).
+  const sa = wallet.smartAccount;
+  if (sa?.enabled) {
+    if (sa.allowanceUsd !== undefined && !(sa.allowanceUsd > 0)) {
+      results.push(warn(`Smart Account allowanceUsd must be positive (got ${sa.allowanceUsd})`));
+    } else if (sa.periodSeconds !== undefined && !(sa.periodSeconds > 0)) {
+      results.push(warn(`Smart Account periodSeconds must be positive (got ${sa.periodSeconds})`));
+    } else {
+      results.push(
+        ok(
+          `Smart Account routing enabled ($${sa.allowanceUsd ?? "?"}/` +
+            `${sa.periodSeconds ?? 86_400}s allowance)`,
+        ),
+      );
+    }
+    // I5 continuity, if the upgrade record exists (written by the operator step).
+    const recordPath = path.join(storePath, "smart-account.json");
+    if (fs.existsSync(recordPath)) {
+      try {
+        const record = JSON.parse(fs.readFileSync(recordPath, "utf-8")) as SmartAccountRecord;
+        const walletData = JSON.parse(
+          fs.readFileSync(path.join(storePath, "wallet-data.json"), "utf-8"),
+        ) as { address?: string; ownerAddress?: string };
+        const eoa = walletData.ownerAddress ?? walletData.address ?? "";
+        const cont = assertAddressContinuity({
+          eoaAddress: eoa,
+          smartAccountAddress: record.smartAccountAddress,
+          smartAccountOwner: record.ownerAddress,
+        });
+        if (cont.ok) {
+          results.push(ok(`Smart Account I5 continuity holds (${record.smartAccountAddress})`));
+        } else {
+          results.push(warn(`Smart Account I5 continuity failed: ${cont.issues.join("; ")}`));
+        }
+      } catch (err) {
+        results.push(
+          warn(
+            `Smart Account record present but unreadable: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+      }
+    } else {
+      results.push(
+        info(
+          "Smart Account enabled but not yet upgraded — the on-chain create + routing is an " +
+            "operator step (run on testnet first). Sends still use the plain EOA until then.",
+        ),
+      );
+    }
+  }
+
+  // ── x402 sub-config ──
+  if (wallet.x402?.enabled) {
+    const maxCost = wallet.x402.maxCostPerRequestUsd ?? 1;
+    if (maxCost <= 0) {
+      results.push(warn(`x402 maxCostPerRequestUsd must be positive (got ${maxCost})`));
+    } else if (perTx !== undefined && maxCost > perTx) {
+      results.push(
+        warn(
+          `x402 max-per-request ($${maxCost}) exceeds per-tx cap ($${perTx}) — x402 calls will be capped at $${perTx}`,
+        ),
+      );
+    } else {
+      results.push(ok(`x402 enabled, max $${maxCost} per request`));
+    }
+  } else {
+    results.push(info("x402 disabled — agent will see 402 responses on paywalled APIs"));
+  }
+
+  // ── Stripe onramp sub-config ──
+  if (wallet.stripe?.enabled) {
+    const stripeSecret = wallet.stripe.secretKey || process.env.STRIPE_SECRET_KEY;
+    const stripePub = wallet.stripe.publishableKey || process.env.STRIPE_PUBLISHABLE_KEY;
+    if (stripeSecret && stripePub) {
+      results.push(ok("Stripe onramp enabled (Tier 2: local keys)"));
+    } else if (wallet.onrampUrl) {
+      results.push(ok(`Stripe onramp enabled (Tier 3: custom URL ${wallet.onrampUrl})`));
+    } else {
+      results.push(info("Stripe onramp enabled (Tier 1: hosted onramp.bitterbot.ai)"));
+    }
+  }
+
+  renderSection(results);
+}
+
+function renderSection(results: CheckResult[]): void {
+  // Quiet when posture-only (wallet not enabled): recorded, not printed
+  // (PLAN-41 p0-28).
+  renderSectionQuietIfAllInfo("Wallet (USDC on Base)", results);
+}

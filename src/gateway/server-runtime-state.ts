@@ -1,0 +1,238 @@
+import type { Server as HttpServer } from "node:http";
+import { WebSocketServer } from "ws";
+import { CANVAS_HOST_PATH } from "../canvas-host/a2ui.js";
+import { type CanvasHostHandler, createCanvasHostHandler } from "../canvas-host/server.js";
+import type { CliDeps } from "../cli/deps.js";
+import { setCronBroadcast } from "../cron/runtime.js";
+import { setOwnerNoticeBroadcast } from "../infra/owner-notify.js";
+import type { createSubsystemLogger } from "../logging/subsystem.js";
+import { setMonitorBroadcast } from "../monitors/runtime.js";
+import type { PluginRegistry } from "../plugins/registry.js";
+import { setReviewBroadcast } from "../review/runtime.js";
+import type { RuntimeEnv } from "../runtime.js";
+import { createA2aHttpHandler } from "./a2a/a2a-http.js";
+import type { AuthRateLimiter } from "./auth-rate-limit.js";
+import type { ResolvedGatewayAuth } from "./auth.js";
+import type { ChatAbortControllerEntry } from "./chat-abort.js";
+import type { HooksConfigResolved } from "./hooks.js";
+import { resolveGatewayListenHosts } from "./net.js";
+import {
+  createGatewayBroadcaster,
+  type GatewayBroadcastFn,
+  type GatewayBroadcastToConnIdsFn,
+} from "./server-broadcast.js";
+import {
+  type ChatRunEntry,
+  createChatRunState,
+  createToolEventRecipientRegistry,
+} from "./server-chat.js";
+import { MAX_PAYLOAD_BYTES } from "./server-constants.js";
+import { attachGatewayUpgradeHandler, createGatewayHttpServer } from "./server-http.js";
+import type { DedupeEntry } from "./server-shared.js";
+import { createGatewayHooksRequestHandler } from "./server/hooks.js";
+import { listenGatewayHttpServer } from "./server/http-listen.js";
+import { createGatewayPluginRequestHandler } from "./server/plugins-http.js";
+import type { GatewayTlsRuntime } from "./server/tls.js";
+import type { GatewayWsClient } from "./server/ws-types.js";
+
+export async function createGatewayRuntimeState(params: {
+  cfg: import("../config/config.js").BitterbotConfig;
+  bindHost: string;
+  port: number;
+  avatarBasePath: string;
+  openAiChatCompletionsEnabled: boolean;
+  openResponsesEnabled: boolean;
+  openResponsesConfig?: import("../config/types.gateway.js").GatewayHttpResponsesConfig;
+  resolvedAuth: ResolvedGatewayAuth;
+  /** Optional rate limiter for auth brute-force protection. */
+  rateLimiter?: AuthRateLimiter;
+  gatewayTls?: GatewayTlsRuntime;
+  hooksConfig: () => HooksConfigResolved | null;
+  pluginRegistry: PluginRegistry;
+  deps: CliDeps;
+  canvasRuntime: RuntimeEnv;
+  canvasHostEnabled: boolean;
+  allowCanvasHostInTests?: boolean;
+  logCanvas: { info: (msg: string) => void; warn: (msg: string) => void };
+  log: { info: (msg: string) => void; warn: (msg: string) => void };
+  logHooks: ReturnType<typeof createSubsystemLogger>;
+  logPlugins: ReturnType<typeof createSubsystemLogger>;
+  /** Optional: provide installed skills for A2A Agent Card. */
+  getSkills?: () => import("../agents/skills/types.js").SkillEntry[];
+  /** Optional: provide skills snapshot version for A2A Agent Card cache invalidation. */
+  getSkillsVersion?: () => number;
+}): Promise<{
+  canvasHost: CanvasHostHandler | null;
+  httpServer: HttpServer;
+  httpServers: HttpServer[];
+  httpBindHosts: string[];
+  wss: WebSocketServer;
+  clients: Set<GatewayWsClient>;
+  broadcast: GatewayBroadcastFn;
+  broadcastToConnIds: GatewayBroadcastToConnIdsFn;
+  agentRunSeq: Map<string, number>;
+  dedupe: Map<string, DedupeEntry>;
+  chatRunState: ReturnType<typeof createChatRunState>;
+  chatRunBuffers: Map<string, string>;
+  chatDeltaSentAt: Map<string, number>;
+  addChatRun: (sessionId: string, entry: ChatRunEntry) => void;
+  removeChatRun: (
+    sessionId: string,
+    clientRunId: string,
+    sessionKey?: string,
+  ) => ChatRunEntry | undefined;
+  chatAbortControllers: Map<string, ChatAbortControllerEntry>;
+  toolEventRecipients: ReturnType<typeof createToolEventRecipientRegistry>;
+  /** Release the A2A SQLite handle. No-op when A2A is disabled. */
+  closeA2a: () => void;
+}> {
+  let canvasHost: CanvasHostHandler | null = null;
+  if (params.canvasHostEnabled) {
+    try {
+      const handler = await createCanvasHostHandler({
+        runtime: params.canvasRuntime,
+        rootDir: params.cfg.canvasHost?.root,
+        basePath: CANVAS_HOST_PATH,
+        allowInTests: params.allowCanvasHostInTests,
+        liveReload: params.cfg.canvasHost?.liveReload,
+      });
+      if (handler.rootDir) {
+        canvasHost = handler;
+        params.logCanvas.info(
+          `canvas host mounted at http://${params.bindHost}:${params.port}${CANVAS_HOST_PATH}/ (root ${handler.rootDir})`,
+        );
+      }
+    } catch (err) {
+      params.logCanvas.warn(`canvas host failed to start: ${String(err)}`);
+    }
+  }
+
+  const clients = new Set<GatewayWsClient>();
+  const { broadcast, broadcastToConnIds } = createGatewayBroadcaster({ clients });
+  // PLAN-53 Track B: held actions and their decisions reach every approvals-scoped window.
+  setReviewBroadcast((event, payload) => broadcast(event, payload));
+  // PLAN-53 Track E: scheduled-job runs and gateway notices for the owner.
+  setCronBroadcast((payload) => broadcast("cron", payload, { dropIfSlow: true }));
+  setOwnerNoticeBroadcast((payload) => broadcast("owner.notice", payload));
+  setMonitorBroadcast((payload) => broadcast("monitor", payload, { dropIfSlow: true }));
+
+  const handleHooksRequest = createGatewayHooksRequestHandler({
+    deps: params.deps,
+    getHooksConfig: params.hooksConfig,
+    bindHost: params.bindHost,
+    port: params.port,
+    logHooks: params.logHooks,
+  });
+
+  const handlePluginRequest = createGatewayPluginRequestHandler({
+    registry: params.pluginRegistry,
+    log: params.logPlugins,
+  });
+
+  // Mounted while EITHER a2a or circles is enabled: circle/mailbox verbs
+  // ride /a2a as circles' HTTP fallback transport (P2P dial -> HTTP ->
+  // mailbox). The handler gates each verb family on its own flag.
+  const a2aHandler =
+    (params.cfg.a2a?.enabled ?? false) || (params.cfg.circles?.enabled ?? false)
+      ? createA2aHttpHandler({
+          getConfig: () => params.cfg,
+          getSkills: params.getSkills ?? (() => []),
+          getGatewayUrl: () =>
+            `http://${params.bindHost === "0.0.0.0" ? "127.0.0.1" : params.bindHost}:${params.port}`,
+          getSkillsVersion: params.getSkillsVersion ?? (() => 0),
+          // PLAN-36 Phase 0: push inbound circle messages to the UI (direct-dial
+          // path). The mailbox-drain path emits the same event from the fast
+          // scheduler in server-maintenance.
+          onCircleInbound: (info) =>
+            broadcast("circles", { source: "direct", ...info }, { dropIfSlow: true }),
+        })
+      : undefined;
+  const handleA2aRequest = a2aHandler?.handle;
+
+  const bindHosts = await resolveGatewayListenHosts(params.bindHost);
+  const httpServers: HttpServer[] = [];
+  const httpBindHosts: string[] = [];
+  for (const host of bindHosts) {
+    const httpServer = createGatewayHttpServer({
+      canvasHost,
+      clients,
+      avatarBasePath: params.avatarBasePath,
+      openAiChatCompletionsEnabled: params.openAiChatCompletionsEnabled,
+      openResponsesEnabled: params.openResponsesEnabled,
+      openResponsesConfig: params.openResponsesConfig,
+      handleHooksRequest,
+      handlePluginRequest,
+      handleA2aRequest,
+      resolvedAuth: params.resolvedAuth,
+      rateLimiter: params.rateLimiter,
+      tlsOptions: params.gatewayTls?.enabled ? params.gatewayTls.tlsOptions : undefined,
+    });
+    try {
+      await listenGatewayHttpServer({
+        httpServer,
+        bindHost: host,
+        port: params.port,
+      });
+      httpServers.push(httpServer);
+      httpBindHosts.push(host);
+    } catch (err) {
+      if (host === bindHosts[0]) {
+        throw err;
+      }
+      params.log.warn(
+        `gateway: failed to bind loopback alias ${host}:${params.port} (${String(err)})`,
+      );
+    }
+  }
+  const httpServer = httpServers[0];
+  if (!httpServer) {
+    throw new Error("Gateway HTTP server failed to start");
+  }
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: MAX_PAYLOAD_BYTES,
+  });
+  for (const server of httpServers) {
+    attachGatewayUpgradeHandler({
+      httpServer: server,
+      wss,
+      canvasHost,
+      clients,
+      resolvedAuth: params.resolvedAuth,
+      rateLimiter: params.rateLimiter,
+    });
+  }
+
+  const agentRunSeq = new Map<string, number>();
+  const dedupe = new Map<string, DedupeEntry>();
+  const chatRunState = createChatRunState();
+  const chatRunRegistry = chatRunState.registry;
+  const chatRunBuffers = chatRunState.buffers;
+  const chatDeltaSentAt = chatRunState.deltaSentAt;
+  const addChatRun = chatRunRegistry.add;
+  const removeChatRun = chatRunRegistry.remove;
+  const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
+  const toolEventRecipients = createToolEventRecipientRegistry();
+
+  return {
+    canvasHost,
+    httpServer,
+    httpServers,
+    httpBindHosts,
+    wss,
+    clients,
+    broadcast,
+    broadcastToConnIds,
+    agentRunSeq,
+    dedupe,
+    chatRunState,
+    chatRunBuffers,
+    chatDeltaSentAt,
+    addChatRun,
+    removeChatRun,
+    chatAbortControllers,
+    toolEventRecipients,
+    closeA2a: () => a2aHandler?.close(),
+  };
+}

@@ -1,0 +1,112 @@
+# Security Policy
+
+If you believe you've found a security issue in Bitterbot, please report it privately.
+
+## Reporting
+
+Report vulnerabilities directly to the repository where the issue lives:
+
+- **Core CLI, gateway, and desktop app** — [Bitterbot-AI/bitterbot-desktop](https://github.com/Bitterbot-AI/bitterbot-desktop)
+
+For issues that don't fit a specific repo, or if you're unsure, email **security@bitterbot.net** and we'll route it.
+
+### Required in Reports
+
+1. **Title**
+2. **Severity Assessment**
+3. **Impact**
+4. **Affected Component**
+5. **Technical Reproduction**
+6. **Demonstrated Impact**
+7. **Environment**
+8. **Remediation Advice**
+
+Reports without reproduction steps, demonstrated impact, and remediation advice will be deprioritized. Given the volume of AI-generated scanner findings, we must ensure we're receiving vetted reports from researchers who understand the issues.
+
+## Bug Bounties
+
+Bitterbot is a labor of love. There is no bug bounty program and no budget for paid reports. Please still disclose responsibly so we can fix issues quickly.
+The best way to help the project right now is by sending PRs.
+
+## Maintainers: GHSA Updates via CLI
+
+When patching a GHSA via `gh api`, include `X-GitHub-Api-Version: 2022-11-28` (or newer). Without it, some fields (notably CVSS) may not persist even if the request returns 200.
+
+## Out of Scope
+
+- Public Internet Exposure
+- Using Bitterbot in ways that the docs recommend not to
+- Prompt injection that only influences the model's OUTPUT (tone, content,
+  hallucinated claims). Injection that ESCAPES a containment boundary — runs
+  tools it shouldn't reach, exfiltrates secrets or memory, breaks out of the
+  sandbox or skill quarantine — IS in scope; please report it.
+
+## Operational Guidance
+
+For threat model + hardening guidance (including `bitterbot security audit --deep` and `--fix`), see:
+
+- `docs/cli/security.md` in this repository
+
+### Tool filesystem hardening
+
+- `tools.exec.applyPatch.workspaceOnly: true` (recommended): keeps `apply_patch` writes/deletes within the configured workspace directory.
+- `tools.fs.workspaceOnly: true` (optional): restricts `read`/`write`/`edit`/`apply_patch` paths to the workspace directory.
+- Avoid setting `tools.exec.applyPatch.workspaceOnly: false` unless you fully trust who can trigger tool execution.
+
+### Web Interface Safety
+
+Bitterbot's web interface (Gateway Control UI + HTTP endpoints) is intended for **local use only**.
+
+- Recommended: keep the Gateway **loopback-only** (`127.0.0.1` / `::1`).
+  - Config: `gateway.bind="loopback"` (default).
+  - CLI: `bitterbot gateway run --bind loopback`.
+- Do **not** expose it to the public internet (no direct bind to `0.0.0.0`, no public reverse proxy). It is not hardened for public exposure.
+- If you need remote access, prefer an SSH tunnel or Tailscale serve/funnel (so the Gateway still binds to loopback), plus strong Gateway auth.
+- The Gateway HTTP surface includes the canvas host (`/__bitterbot__/canvas/`, `/__bitterbot__/a2ui/`). Treat canvas content as sensitive/untrusted and avoid exposing it beyond loopback unless you understand the risk.
+
+## Runtime Requirements
+
+### Node.js Version
+
+Bitterbot requires **Node.js 22 or later** (LTS).
+
+```bash
+node --version  # Should be v22.x or later
+```
+
+### Docker Security
+
+When running Bitterbot in Docker:
+
+1. The official image runs the gateway as a non-root user (`node`, uid 1000). The
+   release `docker-compose.yml` starts the container as root only so the
+   entrypoint can hand root-owned files in the data folder to `node`; it then
+   drops to `node` before running anything else
+2. Limit container capabilities with `--cap-drop=ALL`
+
+Example secure Docker run:
+
+```bash
+# Published image (1.5.0 or later); runs as `node` when started without --user.
+# A fresh named volume inherits node ownership from the image (CI runs this).
+docker run -d --cap-drop=ALL \
+  -v bitterbot-data:/home/node/.bitterbot \
+  -e BITTERBOT_GATEWAY_TOKEN=change-me \
+  ghcr.io/bitterbot-ai/bitterbot-desktop:1
+```
+
+A bind-mounted host folder instead of a named volume must be writable by uid
+1000, or start the way the release `docker-compose.yml` does (`-u 0:0`; the
+entrypoint hands root-owned files to `node`, then drops to it).
+
+## Security Scanning
+
+This project uses `detect-secrets` as a pre-commit hook (it is not currently
+run in CI). See `.secrets.baseline` for the baseline.
+
+Run locally:
+
+```bash
+pip install detect-secrets==1.5.0
+detect-secrets scan --baseline .secrets.baseline
+```
